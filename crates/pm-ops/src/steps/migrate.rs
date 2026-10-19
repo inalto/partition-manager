@@ -1,6 +1,7 @@
 //! Disk clone and OS migration, with the optional boot repair of the copy.
 
-use super::clone::{copy_partition, grow_after_clone};
+use super::clone::{copy_partition, grow_after_clone, prepare_copies};
+use super::table_ops::zero_table_areas;
 use super::{locate_volume, with_session, Ctx};
 use crate::operation::{BootFix, CloneMode, Sizing};
 use crate::sizing::{plan_disk_clone, windows_partition, TargetLayout};
@@ -43,6 +44,9 @@ pub(crate) fn clone_disk(
         }
     }
     let copies = mapped(src, &layout)?;
+    // every fit / shrink / refuse decision happens here, before the target is touched
+    let items: Vec<_> = copies.iter().map(|(sp, e)| (src_disk, *sp, e.len)).collect();
+    let plans = prepare_copies(ctx, &items, mode)?;
 
     let platform = ctx.platform;
     with_session(platform, dst_disk, |s| {
@@ -52,9 +56,14 @@ pub(crate) fn clone_disk(
         };
         ctx.step("clear the partition table");
         s.commit_table(&Table::empty(table.kind, len, ss))?;
-        for (sp, e) in &copies {
+        if table.kind == TableKind::Mbr {
+            // a former GPT would otherwise survive behind the new MBR; cleared before the
+            // copies, which may legitimately cover the last sectors of the disk
+            zero_table_areas(s.device(), true)?;
+        }
+        for ((sp, e), plan) in copies.iter().zip(&plans) {
             let sink = ctx.step(&format!("copy partition {} to partition {}", sp.number, e.number));
-            copy_partition(ctx, s, (src_disk, sp), (e.start, e.len), mode, &sink)?;
+            copy_partition(ctx, s, plan, e.start, &sink)?;
         }
         ctx.step("write partition table");
         s.commit_table(&table)

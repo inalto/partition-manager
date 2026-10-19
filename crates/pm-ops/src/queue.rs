@@ -19,9 +19,10 @@ impl OpQueue {
         OpQueue { preview: base.clone(), base, ops: Vec::new() }
     }
 
-    /// Validate `op` on the current preview ([`Planner::simulate`]) and append it. A rejected
-    /// operation leaves the queue unchanged.
+    /// Validate `op` on the current preview ([`crate::precheck`], then
+    /// [`Planner::simulate`]) and append it. A rejected operation leaves the queue unchanged.
     pub fn push(&mut self, op: Operation) -> Result<()> {
+        crate::precheck(&self.preview, &op)?;
         self.preview = Planner::simulate(&self.preview, &op)?;
         self.ops.push(op);
         Ok(())

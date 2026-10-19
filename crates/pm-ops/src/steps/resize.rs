@@ -7,8 +7,26 @@
 //! * A move copies the data to the new start inside the write session (overlap-safe), then
 //!   writes the table; any filesystem can be moved as long as its length is kept.
 
-use super::{entry_mut, move_data, volume_of, with_session, Ctx};
-use pm_core::{Error, FsKind, Result};
+use super::{entry_mut, locate_volume, move_data, volume_of, with_session, Ctx};
+use pm_core::{Error, FsKind, PartitionInfo, Result};
+
+/// Whether changing the length of `p` (partition `number` of `disk`) to `new_len` is possible:
+/// `Ok(true)` when the filesystem must follow through the platform (NTFS/ReFS), `Ok(false)`
+/// for a table-only change (same length, or no recognised filesystem), `Unsupported`
+/// otherwise. Shared by the executor and [`crate::precheck`].
+pub(crate) fn check_resize(p: &PartitionInfo, disk: u32, number: u32, new_len: u64) -> Result<bool> {
+    if new_len == p.len {
+        return Ok(false);
+    }
+    match p.fs {
+        None => Ok(false),
+        Some(FsKind::Ntfs | FsKind::ReFs) => Ok(true),
+        Some(fs) => Err(Error::Unsupported(format!(
+            "resize of {} is not supported (partition {number} on Disk {disk})",
+            fs.display_name()
+        ))),
+    }
+}
 
 pub(crate) fn resize_move(
     ctx: &mut Ctx,
@@ -20,21 +38,11 @@ pub(crate) fn resize_move(
     let p = ctx.live_partition(disk, number)?;
     let (old_start, old_len) = (p.start, p.len);
     let moving = new_start != old_start;
-    let resizing = new_len != old_len;
-    let via_platform = matches!(p.fs, Some(FsKind::Ntfs | FsKind::ReFs));
-    if resizing {
-        if let Some(fs) = p.fs.filter(|_| !via_platform) {
-            return Err(Error::Unsupported(format!(
-                "resize of {} is not supported (partition {number} on Disk {disk})",
-                fs.display_name()
-            )));
-        }
-    }
-    let vol = if resizing && via_platform { Some(volume_of(ctx, disk, p)?) } else { None };
-
-    if let (Some(vol), true) = (&vol, new_len < old_len) {
+    let via_platform = check_resize(p, disk, number, new_len)?;
+    if via_platform && new_len < old_len {
+        let vol = volume_of(ctx, disk, p)?;
         ctx.step("shrink the filesystem");
-        ctx.platform.shrink_volume(vol, new_len)?;
+        ctx.platform.shrink_volume(&vol, new_len)?;
     }
     let platform = ctx.platform;
     with_session(platform, disk, |s| {
@@ -56,9 +64,12 @@ pub(crate) fn resize_move(
         s.commit_table(&t)
     })?;
     ctx.rescan(disk)?;
-    if let (Some(vol), true) = (&vol, new_len > old_len) {
+    if via_platform && new_len > old_len {
+        // look the volume up at its new position: after a move its identity may change
+        // (MBR volume ids follow the partition offset)
+        let vol = locate_volume(ctx.platform, disk, new_start, ctx.cancel)?;
         ctx.step("extend the filesystem");
-        ctx.platform.extend_volume(vol, new_len)?;
+        ctx.platform.extend_volume(&vol, new_len)?;
     }
     Ok(())
 }

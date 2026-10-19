@@ -56,6 +56,70 @@ pub struct ExecReport {
     pub rescue_stats: Vec<RescueStats>,
 }
 
+/// The executor's static refusals, checked on `model` (the state the operation will run
+/// against) without touching any device. [`execute`] runs it before every operation (dry run
+/// included) and [`crate::OpQueue::push`] at queue time, so an operation the executor would
+/// always refuse is never accepted into the queue. The planner's own validation
+/// ([`Planner::simulate`]) is separate; missing disks/partitions are left to it.
+///
+/// Refused:
+/// * `SetLabel` (no platform support yet);
+/// * a length change of a partition whose filesystem is neither NTFS nor ReFS (and not
+///   unrecognised);
+/// * an alignment that would shrink such a partition;
+/// * a clone / migration that puts a source partition into a smaller target unless the source
+///   is an NTFS/ReFS volume that can be shrunk online. (Conservative: a filesystem smaller
+///   than its partition would fit, but the model does not know filesystem sizes.)
+pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
+    match op {
+        Operation::SetLabel { .. } => Err(Error::Unsupported(
+            "set label requires platform support (planned)".into(),
+        )),
+        Operation::ResizeMove { disk, number, new_len, .. } => {
+            if let Some(p) = model.partition(*disk, *number) {
+                steps::resize::check_resize(p, *disk, *number, *new_len)?;
+            }
+            Ok(())
+        }
+        Operation::AlignPartitions { disk } => {
+            if let Some(d) = model.disk(*disk) {
+                steps::table_ops::align_changes(d)?;
+            }
+            Ok(())
+        }
+        _ => {
+            for (src_disk, p, _) in steps::clone::smaller_targets(model, op) {
+                if !steps::clone::shrinkable(p) {
+                    return Err(steps::clone::must_shrink_first(src_disk, p));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Operation {
+    /// Source volumes this clone / migration will shrink (NTFS/ReFS sources whose planned
+    /// target on `model` is smaller), one human-readable line each, for the confirmation
+    /// dialog. Empty for every other operation.
+    pub fn shrinks_source(&self, model: &Model) -> Vec<String> {
+        steps::clone::smaller_targets(model, self)
+            .into_iter()
+            .filter(|(_, p, _)| steps::clone::shrinkable(p))
+            .map(|(d, p, len)| {
+                let fs = p.fs.map_or("unknown filesystem", |f| f.display_name());
+                let at = p.mount_points.first().map(|m| format!(", {m}")).unwrap_or_default();
+                format!(
+                    "partition {} ({fs}{at}) on Disk {d}: the source volume will be shrunk from                      {} to {}",
+                    p.number,
+                    pm_core::format_size(p.len),
+                    pm_core::format_size(len)
+                )
+            })
+            .collect()
+    }
+}
+
 /// Operations that `allow_system_disk` may let through on the running system disk.
 fn relaxed(op: &Operation) -> bool {
     matches!(
@@ -120,6 +184,7 @@ pub fn execute(
             .and_then(|_| Model::from_platform(platform))
             .and_then(|live| {
                 guard_system_disk(&live, op, opts.allow_system_disk)?;
+                precheck(&live, op)?;
                 let after = Planner::simulate(&live, op)?;
                 let mut ctx = Ctx::new(
                     platform,
@@ -157,6 +222,7 @@ fn dry_run(platform: &dyn Platform, ops: &[Operation], opts: &ExecOpts, report: 
     };
     for (i, op) in ops.iter().enumerate() {
         let r = guard_system_disk(&model, op, opts.allow_system_disk)
+            .and_then(|_| precheck(&model, op))
             .and_then(|_| Planner::simulate(&model, op));
         match r {
             Ok(m) => {
@@ -190,9 +256,7 @@ fn run_op(ctx: &mut Ctx, op: &Operation) -> Result<()> {
             resize::resize_move(ctx, *disk, *number, *new_start, *new_len)
         }
         SetActive { disk, number } => table_ops::set_active(ctx, *disk, *number),
-        SetLabel { .. } => Err(Error::Unsupported(
-            "set label requires platform support (planned)".into(),
-        )),
+        SetLabel { .. } => precheck(ctx.live, op),
         SetLetter { disk, number, letter } => format::set_letter(ctx, *disk, *number, *letter),
         SetType { disk, number, ptype } => table_ops::set_type(ctx, *disk, *number, *ptype),
         Mount { volume, at } => format::mount(ctx, volume, at),

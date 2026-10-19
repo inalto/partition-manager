@@ -124,11 +124,17 @@ impl<'a> Ctx<'a> {
             .after
             .disk(d)
             .ok_or_else(|| Error::Invalid(format!("Disk {d} does not exist")))?;
-        new.partitions
-            .iter()
-            .find(|p| !old.partitions.iter().any(|o| o.number == p.number && o.start == p.start))
+        added_partition(old, new)
             .ok_or_else(|| Error::Invalid(format!("the planner added no partition to Disk {d}")))
     }
+}
+
+/// The partition of `after` that `before` does not have (same number and start).
+pub(crate) fn added_partition<'m>(before: &DiskInfo, after: &'m DiskInfo) -> Option<&'m PartitionInfo> {
+    after
+        .partitions
+        .iter()
+        .find(|p| !before.partitions.iter().any(|o| o.number == p.number && o.start == p.start))
 }
 
 /// Progress adapter for one step: rewrites every report's phase to

@@ -17,5 +17,5 @@ pub use model::{table_from_disk, Model};
 pub use operation::{BootFix, CloneMode, Operation, Sizing, WipeMethod};
 pub use planner::Planner;
 pub use sizing::{plan_disk_clone, windows_partition, TargetLayout};
-pub use executor::{execute, ExecOpts, ExecReport, StepEvent};
+pub use executor::{execute, precheck, ExecOpts, ExecReport, StepEvent};
 pub use queue::OpQueue;

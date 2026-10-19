@@ -5,7 +5,7 @@
 use crate::operation::table_name;
 use super::{entry_mut, entry_of, format, move_data, with_session, Ctx};
 use pm_core::units::MIB;
-use pm_core::{Error, FsKind, PartitionType, Result, TableKind};
+use pm_core::{DiskInfo, Error, FsKind, PartitionType, Result, TableKind};
 use pm_parttable::{align_table, gpt_to_mbr, mbr_to_gpt, Table};
 
 /// Sectors at the start of a disk that hold the MBR, the GPT header and its entry array.
@@ -38,7 +38,13 @@ pub(crate) fn initialize(ctx: &mut Ctx, disk: u32, kind: TableKind) -> Result<()
     with_session(ctx.platform, disk, |s| {
         let dev = s.device();
         let t = Table::empty(kind, dev.len(), dev.sector_size());
-        s.commit_table(&t)
+        s.commit_table(&t)?;
+        if kind == TableKind::Mbr {
+            // a former GPT would otherwise survive behind the new MBR
+            zero_table_areas(s.device(), true)?;
+            s.device().flush()?;
+        }
+        Ok(())
     })?;
     ctx.rescan(disk)
 }
@@ -143,23 +149,27 @@ fn check_shrink(fs: Option<FsKind>, disk: u32, number: u32, old: u64, new: u64) 
         None => Ok(false),
         Some(FsKind::Ntfs | FsKind::ReFs) => Ok(true),
         Some(other) => Err(Error::Unsupported(format!(
-            "partition {number} on Disk {disk}: resize of {} is not supported (aligning it would \
-             shrink it by {} bytes)",
+            "partition {number} on Disk {disk}: resize of {} is not supported (aligning it would              shrink it by {} bytes)",
             other.display_name(),
             old - new
         ))),
     }
 }
 
-/// Align every partition to 1 MiB. Partitions only shrink (start up, end down), so each new
-/// range lies inside its old one: NTFS/ReFS filesystems are shrunk first, then the data of
-/// every moved partition is copied to its new start inside the session, then the table is
-/// written.
-pub(crate) fn align(ctx: &mut Ctx, disk: u32) -> Result<()> {
-    let d = ctx.live_disk(disk)?;
+/// One partition that alignment changes.
+pub(crate) struct AlignChange {
+    pub number: u32,
+    pub old: (u64, u64),
+    pub new: (u64, u64),
+    /// Its NTFS/ReFS filesystem must be shrunk first.
+    pub shrink_fs: bool,
+}
+
+/// What aligning `d` to 1 MiB changes, refusing (without side effects) partitions whose
+/// filesystem cannot follow a shrink. Shared by the executor and [`crate::precheck`].
+pub(crate) fn align_changes(d: &DiskInfo) -> Result<Vec<AlignChange>> {
     let target = align_table(&crate::model::table_from_disk(d), MIB);
-    // (number, old start, old len, new start, new len)
-    let mut changes = Vec::new();
+    let mut out = Vec::new();
     for e in &target.entries {
         let Some(p) = d.partitions.iter().find(|p| p.number == e.number) else {
             continue;
@@ -167,37 +177,58 @@ pub(crate) fn align(ctx: &mut Ctx, disk: u32) -> Result<()> {
         if (p.start, p.len) == (e.start, e.len) {
             continue;
         }
-        if check_shrink(p.fs, disk, p.number, p.len, e.len)? {
-            let vol = super::volume_of(ctx, disk, p)?;
-            ctx.step(&format!("shrink the filesystem of partition {}", p.number));
-            ctx.platform.shrink_volume(&vol, e.len)?;
-        }
-        changes.push((p.number, p.start, p.len, e.start, e.len));
+        let shrink_fs = check_shrink(p.fs, d.index, p.number, p.len, e.len)?;
+        out.push(AlignChange { number: p.number, old: (p.start, p.len), new: (e.start, e.len), shrink_fs });
     }
+    Ok(out)
+}
+
+/// Align every partition to 1 MiB. Partitions only shrink (start up, end down), so each new
+/// range lies inside its old one.
+///
+/// Every decision is taken first (nothing is written if a partition cannot be aligned), then
+/// NTFS/ReFS filesystems that shrink are shrunk through the platform, then, inside one
+/// session, each partition in turn has its data copied to its new start and **the table is
+/// committed right after that partition** — so the table on disk always matches the data, even
+/// when a later move fails or the run is cancelled. Cancellation is honoured between
+/// partitions only: a single move is not cancellable once started.
+pub(crate) fn align(ctx: &mut Ctx, disk: u32) -> Result<()> {
+    let d = ctx.live_disk(disk)?;
+    let changes = align_changes(d)?;
     if changes.is_empty() {
         ctx.note("nothing to align");
         return Ok(());
     }
+    for c in changes.iter().filter(|c| c.shrink_fs) {
+        let p = ctx.live_partition(disk, c.number)?;
+        let vol = super::volume_of(ctx, disk, p)?;
+        ctx.step(&format!("shrink the filesystem of partition {}", c.number));
+        ctx.platform.shrink_volume(&vol, c.new.1)?;
+    }
     let platform = ctx.platform;
     with_session(platform, disk, |s| {
         let mut t = s.read_table()?;
-        for &(n, old_start, old_len, ..) in &changes {
-            let e = entry_mut(&mut t, disk, n)?;
-            if (e.start, e.len) != (old_start, old_len) {
+        for c in &changes {
+            let e = entry_mut(&mut t, disk, c.number)?;
+            if (e.start, e.len) != c.old {
                 return Err(Error::Invalid(format!(
-                    "partition {n} on Disk {disk} changed on the device"
+                    "partition {} on Disk {disk} changed on the device",
+                    c.number
                 )));
             }
         }
-        for &(n, old_start, old_len, new_start, new_len) in &changes {
-            let sink = ctx.step(&format!("move the data of partition {n}"));
+        for c in &changes {
+            let ((old_start, old_len), (new_start, new_len)) = (c.old, c.new);
+            ctx.cancel.check()?;
+            let sink = ctx.step(&format!("move the data of partition {}", c.number));
             move_data(s.device(), old_start, new_start, new_len.min(old_len), &sink, ctx.cancel)?;
-            let e = entry_mut(&mut t, disk, n)?;
+            ctx.step(&format!("write partition table (partition {})", c.number));
+            let e = entry_mut(&mut t, disk, c.number)?;
             e.start = new_start;
             e.len = new_len;
+            s.commit_table(&t)?;
         }
-        ctx.step("write partition table");
-        s.commit_table(&t)
+        Ok(())
     })?;
     ctx.rescan(disk)
 }

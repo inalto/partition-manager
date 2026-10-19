@@ -776,3 +776,219 @@ fn execute_table_ops_initialize_convert_active_type_delete() {
     assert_sessions_finished(&p);
     assert_eq!(p.write_sessions_log().len(), 10, "one session per table operation");
 }
+
+// ---------------------------------------------------------------- fix round 1
+
+#[test]
+fn execute_align_cancel_keeps_table_consistent() {
+    let legacy = 63 * 512;
+    let (p1, p2, len) = (legacy, 10 * MIB + legacy, 8 * MIB);
+    let mut dev = gpt_dev(DISK_LEN, 0, None);
+    let mut t = Table::empty(TableKind::Gpt, DISK_LEN, 512);
+    t.gpt_first_usable = 34 * 512;
+    t.entries = vec![
+        entry(1, p1, len, gpt_types::BASIC_DATA, 0),
+        entry(2, p2, len, gpt_types::BASIC_DATA, 0),
+    ];
+    write_table(&mut dev, &t).unwrap();
+    let (d1, d2) = (pattern(len as usize, 1), pattern(len as usize, 2));
+    dev.write_at(p1, &d1).unwrap();
+    dev.write_at(p2, &d2).unwrap();
+    let p = MockPlatform::new();
+    p.add_disk(1, dev, meta(1));
+    p.set_system_disk(ELSEWHERE);
+
+    // cancel once the data of the first partition has been moved
+    let cancel = CancelToken::new();
+    let c2 = cancel.clone();
+    let sink = FnProgress(|r: &ProgressReport| {
+        if r.phase.contains("move the data of partition 1") && r.total > 0 {
+            c2.cancel();
+        }
+    });
+    let r = execute(&p, &[Operation::AlignPartitions { disk: 1 }], &opts(), &sink, &cancel).unwrap();
+    let (_, msg) = r.failed.expect("cancelled");
+    assert!(msg.contains("cancel"), "{msg}");
+    let t = table_of(&p, 1);
+    let spans: Vec<(u64, u64)> = t.entries.iter().map(|e| (e.start, e.len)).collect();
+    assert_eq!(spans, vec![(MIB, 7 * MIB), (p2, len)], "table matches the data on disk");
+    let b = p.disk_bytes(1);
+    assert!(b[MIB as usize..(8 * MIB) as usize] == d1[..(7 * MIB) as usize], "partition 1 moved");
+    assert!(b[p2 as usize..(p2 + len) as usize] == d2[..], "partition 2 untouched");
+    assert_sessions_finished(&p);
+
+    // a second run finishes the job
+    let r = run(&p, &[Operation::AlignPartitions { disk: 1 }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let t = table_of(&p, 1);
+    let spans: Vec<(u64, u64)> = t.entries.iter().map(|e| (e.start, e.len)).collect();
+    assert_eq!(spans, vec![(MIB, 7 * MIB), (11 * MIB, 7 * MIB)]);
+    let b = p.disk_bytes(1);
+    assert!(b[(11 * MIB) as usize..(18 * MIB) as usize] == d2[..(7 * MIB) as usize]);
+    assert!(b[MIB as usize..(8 * MIB) as usize] == d1[..(7 * MIB) as usize]);
+}
+
+/// Disk 0 (64 MiB): one 56 MiB partition backed by volume `vol`; disk 1: a 32 MiB raw target.
+fn shrink_fixture(fs: FsKind, vol: &str) -> (MockPlatform, Vec<u8>) {
+    let (start, len) = (MIB, 56 * MIB);
+    let mut src = gpt_dev(64 * MIB, 0, Some(vec![entry(1, start, len, gpt_types::BASIC_DATA, 0)]));
+    let data = pattern(len as usize, 5);
+    src.write_at(start, &data).unwrap();
+    if fs == FsKind::Fat32 {
+        format_fat(&mut src, start, len, "SRC");
+    }
+    let p = MockPlatform::new();
+    p.add_disk(0, src, meta(0));
+    p.add_disk(1, MemDevice::from_vec(vec![0xAA; (32 * MIB) as usize]), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume(vol, Some(fs), &["F:\\"], len, len - 6 * MIB), 0, start, len);
+    (p, data)
+}
+
+fn fit_clone() -> Operation {
+    Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Fit,
+        mode: CloneMode::Smart,
+        boot_fix: BootFix::None,
+    }
+}
+
+#[test]
+fn execute_clone_to_smaller_disk_shrinks_ntfs_source_first() {
+    let (p, data) = shrink_fixture(FsKind::Ntfs, "src-ntfs");
+    let model = Model::from_platform(&p).unwrap();
+    let warn = fit_clone().shrinks_source(&model);
+    assert_eq!(warn.len(), 1, "{warn:?}");
+    assert!(warn[0].contains("partition 1"), "{warn:?}");
+
+    let r = run(&p, &[fit_clone()]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let e = table_of(&p, 1).entries[0].clone();
+    assert!(e.len < 56 * MIB);
+    assert!(p.calls().contains(&format!("shrink src-ntfs {}", e.len)), "{:?}", p.calls());
+    assert!(r.log.iter().any(|l| l.contains("will be shrunk")), "{:?}", r.log);
+    assert!(r.log.iter().any(|l| l.contains("shrinking source volume src-ntfs")), "{:?}", r.log);
+    let b = p.disk_bytes(1);
+    assert!(b[e.start as usize..(e.start + e.len) as usize] == data[..e.len as usize]);
+    assert_eq!(p.write_sessions_log(), vec![1]);
+    assert_sessions_finished(&p);
+
+    // the shrink happens before anything is written to the target
+    let (p, _) = shrink_fixture(FsKind::Ntfs, "src-ntfs");
+    p.fail_calls_matching("shrink");
+    let before = p.disk_bytes(1);
+    let r = run(&p, &[fit_clone()]);
+    assert!(r.failed.is_some());
+    assert!(p.write_sessions_log().is_empty(), "no session on the target");
+    assert_eq!(p.disk_bytes(1), before);
+}
+
+#[test]
+fn execute_clone_refusal_writes_nothing() {
+    let (p, _) = shrink_fixture(FsKind::Fat32, "src-fat");
+    let before = p.disk_bytes(1);
+    let r = run(&p, &[fit_clone()]);
+    let (i, msg) = r.failed.clone().expect("refused");
+    assert_eq!(i, 0);
+    assert!(msg.contains("must be shrunk first"), "{msg}");
+    assert!(p.write_sessions_log().is_empty());
+    assert_eq!(p.disk_bytes(1), before, "the target is untouched");
+    assert!(p.calls().is_empty(), "{:?}", p.calls());
+
+    let mut q = OpQueue::new(Model::from_platform(&p).unwrap());
+    assert!(q.push(fit_clone()).is_err(), "refused at queue time too");
+}
+
+#[test]
+fn precheck_rejects_what_the_executor_refuses() {
+    let p = MockPlatform::new();
+    let legacy = 63 * 512;
+    let mut dev = gpt_dev(DISK_LEN, 0, None);
+    let mut t = Table::empty(TableKind::Gpt, DISK_LEN, 512);
+    t.gpt_first_usable = 34 * 512;
+    t.entries = vec![entry(1, legacy, 8 * MIB, gpt_types::BASIC_DATA, 0)];
+    write_table(&mut dev, &t).unwrap();
+    p.add_disk(1, dev, meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("v1", Some(FsKind::Fat32), &[], 8 * MIB, 4 * MIB), 1, legacy, 8 * MIB);
+    let model = Model::from_platform(&p).unwrap();
+    let mut q = OpQueue::new(model.clone());
+
+    let label = Operation::SetLabel { disk: 1, number: 1, label: "X".into() };
+    let resize = Operation::ResizeMove { disk: 1, number: 1, new_start: legacy, new_len: 12 * MIB };
+    let align = Operation::AlignPartitions { disk: 1 };
+    for op in [&label, &resize, &align] {
+        assert!(pm_ops::precheck(&model, op).is_err(), "{op:?}");
+        assert!(q.push(op.clone()).is_err(), "{op:?}");
+    }
+    assert!(q.is_empty());
+    // what the executor can do still passes
+    assert!(pm_ops::precheck(&model, &Operation::DeletePartition { disk: 1, number: 1 }).is_ok());
+
+    let dry = ExecOpts { dry_run: true, allow_system_disk: false };
+    let r = execute(&p, &[resize], &dry, &NullProgress, &CancelToken::new()).unwrap();
+    let (i, msg) = r.failed.expect("dry run refuses a FAT32 resize");
+    assert_eq!(i, 0);
+    assert!(msg.contains("resize of FAT32 is not supported"), "{msg}");
+}
+
+#[test]
+fn execute_mbr_over_gpt_clears_stale_gpt() {
+    let tail = DISK_LEN as usize - 512;
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let r = run(&p, &[Operation::InitializeDisk { disk: 1, kind: TableKind::Mbr }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let b = p.disk_bytes(1);
+    assert_eq!(table_of(&p, 1).kind, TableKind::Mbr);
+    assert!(b[512..1024].iter().all(|&x| x == 0), "primary GPT header cleared");
+    assert!(b[tail..].iter().all(|&x| x == 0), "backup GPT header cleared");
+
+    // an MBR disk cloned onto a former GPT disk
+    let mut src = MemDevice::new(DISK_LEN);
+    let mut t = Table::empty(TableKind::Mbr, DISK_LEN, 512);
+    t.entries = vec![Entry {
+        number: 1,
+        start: MIB,
+        len: 8 * MIB,
+        ptype: PartitionType::Mbr(0x07),
+        guid: None,
+        name: String::new(),
+        attrs: 1,
+        logical: false,
+    }];
+    write_table(&mut src, &t).unwrap();
+    let p = MockPlatform::new();
+    p.add_disk(0, src, meta(0));
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let op = Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Exact,
+        mode: CloneMode::Sector,
+        boot_fix: BootFix::None,
+    };
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let b = p.disk_bytes(1);
+    assert_eq!(table_of(&p, 1).kind, TableKind::Mbr);
+    assert!(b[512..1024].iter().all(|&x| x == 0), "primary GPT header cleared");
+    assert!(b[tail..].iter().all(|&x| x == 0), "backup GPT header cleared");
+}
+
+#[test]
+fn execute_move_and_grow_extends_the_relocated_volume() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 8 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("v1", Some(FsKind::Ntfs), &[], 8 * MIB, 6 * MIB), 1, MIB, 8 * MIB);
+    // the volume the OS exposes at the new position (MBR volume ids follow the offset)
+    p.add_volume(volume("v1-moved", Some(FsKind::Ntfs), &[], 8 * MIB, 6 * MIB), 1, 10 * MIB, 12 * MIB);
+    let r = run(&p, &[Operation::ResizeMove { disk: 1, number: 1, new_start: 10 * MIB, new_len: 12 * MIB }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(p.calls().contains(&format!("extend v1-moved {}", 12 * MIB)), "{:?}", p.calls());
+}
