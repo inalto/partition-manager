@@ -54,12 +54,9 @@ fn model() -> Model {
     win.fs = Some(FsKind::Ntfs);
     win.label = "Windows".into();
     win.used = Some(25 * GIB);
+    // GPT "required" attribute (kept by clones); not used to recognise Windows
+    win.flags.required = true;
     win.mount_points = vec!["C:\\".into()];
-    win.flags = PartFlags {
-        required: true,
-        boot: true,
-        ..Default::default()
-    };
     win.volume = Some(VolumeId(WIN_VOL.into()));
     let mut re = part(4, 117 * MIB + 60 * GIB, GIB, gpt(gpt_types::WINDOWS_RECOVERY));
     re.fs = Some(FsKind::Ntfs);
@@ -83,6 +80,7 @@ fn model() -> Model {
             free: 35 * GIB,
         }],
         system_disk: Some(0),
+        windows_found: Vec::new(),
     }
 }
 
@@ -258,14 +256,14 @@ fn plan_clone_rejects_small_target() {
     let m = model();
     let src = m.disk(0).unwrap();
     // 25 GiB used + 10 % does not fit on 20 GiB.
-    let err = plan_disk_clone(src, 20 * GIB, 512, Sizing::Fit, false, &used_or_len);
+    let err = plan_disk_clone(src, 20 * GIB, 512, Sizing::Fit, false, &used_or_len, None);
     let msg = invalid_msg(err);
     assert!(msg.contains("partition 3"), "{msg}");
-    let err = plan_disk_clone(src, 20 * GIB, 512, Sizing::Proportional, true, &used_or_len);
+    let err = plan_disk_clone(src, 20 * GIB, 512, Sizing::Proportional, true, &used_or_len, None);
     let msg = invalid_msg(err);
     assert!(msg.contains("partition 3"), "{msg}");
     // Exact needs the whole source layout.
-    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, Sizing::Exact, false, &used_or_len));
+    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, Sizing::Exact, false, &used_or_len, None));
     assert!(msg.contains("partition 3"), "{msg}");
 
     // Through the planner.
@@ -419,7 +417,7 @@ fn plan_disk_clone_proportional_keeps_efi_msr() {
     let m = model();
     let src = m.disk(0).unwrap();
     let layout =
-        plan_disk_clone(src, 200 * GIB, 512, Sizing::Proportional, false, &used_or_len).unwrap();
+        plan_disk_clone(src, 200 * GIB, 512, Sizing::Proportional, false, &used_or_len, None).unwrap();
     let t = &layout.table;
     assert_eq!(t.kind, TableKind::Gpt);
     assert_eq!(t.entries.len(), 4);
@@ -446,7 +444,7 @@ fn plan_disk_clone_proportional_keeps_efi_msr() {
 
     // Shrinking proportionally to 50 GiB keeps the fixed partitions too.
     let layout =
-        plan_disk_clone(src, 50 * GIB, 512, Sizing::Proportional, false, &used_or_len).unwrap();
+        plan_disk_clone(src, 50 * GIB, 512, Sizing::Proportional, false, &used_or_len, None).unwrap();
     let t = &layout.table;
     assert_eq!(t.entries.iter().find(|e| e.ptype.is_efi()).unwrap().len, 100 * MIB);
     let win = t.entries.iter().find(|e| e.number == 3).unwrap();
@@ -461,17 +459,17 @@ fn plan_disk_clone_proportional_keeps_efi_msr() {
     data.mount_points = vec!["D:\\".into()];
     src2.partitions.push(data);
     let all =
-        plan_disk_clone(&src2, 200 * GIB, 512, Sizing::Proportional, false, &used_or_len).unwrap();
+        plan_disk_clone(&src2, 200 * GIB, 512, Sizing::Proportional, false, &used_or_len, None).unwrap();
     assert_eq!(all.table.entries.len(), 5);
     let sys =
-        plan_disk_clone(&src2, 200 * GIB, 512, Sizing::Proportional, true, &used_or_len).unwrap();
+        plan_disk_clone(&src2, 200 * GIB, 512, Sizing::Proportional, true, &used_or_len, None).unwrap();
     assert_eq!(sys.table.entries.len(), 4);
     assert!(sys.map.iter().all(|(s, _)| *s != 5));
     assert_layout_sane(&all.table);
     assert_layout_sane(&sys.table);
 
     // Exact keeps starts and lengths.
-    let exact = plan_disk_clone(src, 200 * GIB, 512, Sizing::Exact, false, &used_or_len).unwrap();
+    let exact = plan_disk_clone(src, 200 * GIB, 512, Sizing::Exact, false, &used_or_len, None).unwrap();
     for p in &src.partitions {
         let e = exact.table.entries.iter().find(|e| e.number == p.number).unwrap();
         assert_eq!((e.start, e.len), (p.start, p.len));
@@ -483,7 +481,7 @@ fn plan_disk_clone_fit_uses_used_sizes() {
     let m = model();
     let src = m.disk(0).unwrap();
     let fixed = 100 * MIB + 16 * MIB + GIB;
-    let layout = plan_disk_clone(src, 50 * GIB, 512, Sizing::Fit, false, &used_or_len).unwrap();
+    let layout = plan_disk_clone(src, 50 * GIB, 512, Sizing::Fit, false, &used_or_len, None).unwrap();
     let t = &layout.table;
     let win = t.entries.iter().find(|e| e.number == 3).unwrap();
     let min = 25 * GIB + 25 * GIB / 10; // used + 10 %
@@ -496,7 +494,7 @@ fn plan_disk_clone_fit_uses_used_sizes() {
     assert_layout_sane(t);
 
     // A bigger target: every partition keeps at least its source size, leftover to Windows.
-    let big = plan_disk_clone(src, 200 * GIB, 512, Sizing::Fit, false, &used_or_len).unwrap();
+    let big = plan_disk_clone(src, 200 * GIB, 512, Sizing::Fit, false, &used_or_len, None).unwrap();
     let win = big.table.entries.iter().find(|e| e.number == 3).unwrap();
     assert!(win.len > 60 * GIB);
     assert_layout_sane(&big.table);
@@ -891,7 +889,7 @@ fn mbr_logicals_need_ebr_room() {
     // Exact clone of a legacy (63-sector gap) MBR layout cannot be written.
     let legacy = model_with_mbr(true);
     let src = legacy.disk(4).unwrap();
-    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, Sizing::Exact, false, &used_or_len));
+    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, Sizing::Exact, false, &used_or_len, None));
     assert!(msg.contains("Disk 4") && msg.contains("Fit or Proportional"), "{msg}");
     let op = Operation::CloneDisk {
         src_disk: 4,
@@ -904,7 +902,7 @@ fn mbr_logicals_need_ebr_room() {
     assert!(msg.contains("Fit or Proportional"), "{msg}");
     // Proportional / Fit rebuild the container with 1 MiB EBR slots.
     for sizing in [Sizing::Proportional, Sizing::Fit] {
-        let layout = plan_disk_clone(src, 50 * GIB, 512, sizing, false, &used_or_len).unwrap();
+        let layout = plan_disk_clone(src, 50 * GIB, 512, sizing, false, &used_or_len, None).unwrap();
         let t = &layout.table;
         t.validate().unwrap();
         let ext = t.entries.iter().find(|e| e.ptype.is_extended_mbr()).unwrap();
@@ -1046,52 +1044,62 @@ fn move_and_restore_are_mib_aligned() {
 
 #[test]
 fn windows_partition_detection_order() {
-    // Disk 0 with an OEM utility partition (NTFS, required bit) placed before Windows.
-    let with_oem = |win_flags: PartFlags, win_c: bool| {
+    // Disk 0 with a 30 GiB NTFS data partition (flagged required + boot, as some OEM utility
+    // partitions are) after a 10 GiB Windows partition.
+    let with_data = |win_c: bool| {
         let mut m = model();
         let d0 = &mut m.disks[0];
-        d0.partitions[2].flags = win_flags;
+        d0.partitions[2].len = 10 * GIB;
+        d0.partitions[2].used = Some(5 * GIB);
         if !win_c {
             d0.partitions[2].mount_points.clear();
         }
-        let mut oem = part(5, 117 * MIB + 61 * GIB, GIB, gpt(gpt_types::BASIC_DATA));
-        oem.fs = Some(FsKind::Ntfs);
-        oem.used = Some(100 * MIB);
-        oem.flags.required = true;
-        d0.partitions.insert(2, oem);
-        if !win_c {
-            m.volumes.clear();
-        }
+        let mut data = part(5, 117 * MIB + 11 * GIB, 30 * GIB, gpt(gpt_types::BASIC_DATA));
+        data.fs = Some(FsKind::Ntfs);
+        data.used = Some(GIB);
+        data.flags = PartFlags { required: true, boot: true, ..Default::default() };
+        d0.partitions.insert(3, data);
+        m.volumes.clear();
         m
     };
-    let none = PartFlags::default();
-    let boot = PartFlags { boot: true, ..Default::default() };
+    let win_start = 117 * MIB;
+    let says_windows = |_: u32, p: &PartitionInfo| p.start == win_start;
 
-    // Rule 1: C:\ wins over the OEM required bit.
-    let m = with_oem(none, true);
-    assert_eq!(pm_ops::windows_partition(m.disk(0).unwrap()), Some(3));
+    // Rule 1: mounted at C:\ (the probe is not even asked).
+    let m = with_data(true);
+    let d = m.disk(0).unwrap();
+    assert_eq!(pm_ops::windows_partition(d, None), Some(3));
+    let never = |_: u32, _: &PartitionInfo| -> bool { panic!("rule 1 decides") };
+    assert_eq!(pm_ops::windows_partition(d, Some(&never)), Some(3));
     invalid_msg(Planner::simulate(&m, &Operation::DeletePartition { disk: 0, number: 3 }));
     Planner::simulate(&m, &Operation::DeletePartition { disk: 0, number: 5 }).unwrap();
-    // Rule 2: boot wins over required.
-    let m = with_oem(boot, false);
-    assert_eq!(pm_ops::windows_partition(m.disk(0).unwrap()), Some(3));
+
+    // Rule 2: no C:\, the filesystem holding \Windows\System32 wins over the larger,
+    // flagged data partition.
+    let mut m = with_data(false);
+    assert_eq!(pm_ops::windows_partition(m.disk(0).unwrap(), Some(&says_windows)), Some(3));
+    m.probe_windows(&says_windows);
+    assert_eq!(m.windows_found, vec![(0, win_start)]);
+    assert_eq!(m.windows_partition_of(0), Some(3));
     invalid_msg(Planner::simulate(&m, &Operation::DeletePartition { disk: 0, number: 3 }));
     Planner::simulate(&m, &Operation::DeletePartition { disk: 0, number: 5 }).unwrap();
-    // Rule 3: only the required bit is left.
-    let m = with_oem(none, false);
-    assert_eq!(pm_ops::windows_partition(m.disk(0).unwrap()), Some(5));
-    // Rule 4: nothing flagged at all: the largest NTFS data partition.
-    let mut d = m.disk(0).unwrap().clone();
-    for p in &mut d.partitions {
-        p.flags = none;
+    // the probe answer survives serialization of the model
+    let back: Model = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    assert_eq!(back.windows_partition_of(0), Some(3));
+
+    // Rule 3: nothing found: the largest NTFS data partition; the flags do not count.
+    let mut m = with_data(false);
+    m.probe_windows(&|_, _| false);
+    assert!(m.windows_found.is_empty());
+    assert_eq!(m.windows_partition_of(0), Some(5));
+    assert_eq!(pm_ops::windows_partition(m.disk(0).unwrap(), None), Some(5));
+
+    // Sizing uses the same rule: with only_system the data partition is dropped when C:\ or
+    // the probe identifies Windows.
+    for (m, probe) in [(with_data(true), None), (with_data(false), Some(&says_windows as &dyn Fn(u32, &PartitionInfo) -> bool))] {
+        let sys = plan_disk_clone(m.disk(0).unwrap(), 200 * GIB, 512, Sizing::Fit, true, &used_or_len, probe)
+            .unwrap();
+        assert!(sys.map.iter().any(|(s, _)| *s == 3));
+        assert!(sys.map.iter().all(|(s, _)| *s != 5));
     }
-    assert_eq!(pm_ops::windows_partition(&d), Some(3));
-
-    // Sizing uses the same rule: with only_system the OEM partition is dropped when C:\
-    // identifies Windows.
-    let m = with_oem(none, true);
-    let sys = plan_disk_clone(m.disk(0).unwrap(), 200 * GIB, 512, Sizing::Fit, true, &used_or_len)
-        .unwrap();
-    assert!(sys.map.iter().any(|(s, _)| *s == 3));
-    assert!(sys.map.iter().all(|(s, _)| *s != 5));
 }

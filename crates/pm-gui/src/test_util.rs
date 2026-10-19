@@ -72,5 +72,5 @@ pub fn mbr_disk(index: u32) -> DiskInfo {
 }
 
 pub fn model_of(disks: Vec<DiskInfo>) -> Model {
-    Model { disks, volumes: Vec::new(), system_disk: None }
+    Model { disks, volumes: Vec::new(), system_disk: None, windows_found: Vec::new() }
 }

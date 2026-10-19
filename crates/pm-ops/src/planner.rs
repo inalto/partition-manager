@@ -887,7 +887,10 @@ fn clone_disk(
         CloneMode::Smart => p.used.unwrap_or(p.len),
         CloneMode::Sector => p.len,
     };
-    let layout = plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of)
+    let probe = m.windows_probe();
+    let planned = plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of, Some(&probe));
+    drop(probe);
+    let layout = planned
         .map_err(|e| {
             Error::Invalid(format!(
                 "Cannot clone Disk {src_disk} to Disk {dst_disk}: {}",

@@ -113,6 +113,12 @@ fn format_fat(dev: &mut MemDevice, start: u64, len: u64, label: &str) {
 /// Minimal FAT32 writer: a file `name83` (8.3, space padded) in the root directory, stored in
 /// the first free clusters. Enough for the readers in pm-fs.
 fn fat_add_file(dev: &mut MemDevice, part: u64, name83: &[u8; 11], data: &[u8]) {
+    fat_add_entry(dev, part, name83, data, 0x20);
+}
+
+/// [`fat_add_file`] with directory-entry attribute `attr` (0x10: a directory whose content,
+/// `data`, is its raw entries).
+fn fat_add_entry(dev: &mut MemDevice, part: u64, name83: &[u8; 11], data: &[u8], attr: u8) {
     let mut bs = [0u8; 512];
     dev.read_at(part, &mut bs).unwrap();
     let u16_at = |o: usize| u16::from_le_bytes([bs[o], bs[o + 1]]) as u64;
@@ -149,7 +155,7 @@ fn fat_add_file(dev: &mut MemDevice, part: u64, name83: &[u8; 11], data: &[u8]) 
     let slot = (0..dir.len() / 32).find(|i| dir[i * 32] == 0).expect("free root slot");
     let mut de = [0u8; 32];
     de[..11].copy_from_slice(name83);
-    de[11] = 0x20;
+    de[11] = attr;
     de[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
     de[26..28].copy_from_slice(&(first as u16).to_le_bytes());
     de[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1261,4 +1267,31 @@ fn converting_a_4kn_gpt_to_mbr_keeps_data_at_the_end_of_the_disk() {
     let t = table_of(&p, 1);
     assert_eq!(t.kind, TableKind::Mbr);
     assert_eq!(t.entries.len(), 1);
+}
+
+#[test]
+fn model_from_platform_finds_windows_by_its_system32_folder() {
+    // Disk 1 (no C:): partition 1 a plain FAT32 data volume, partition 2 a FAT32 volume with
+    // \WINDOWS\SYSTEM32 (no partition is mounted, so the filesystems are unknown to the list)
+    let mut dev = gpt_dev(
+        128 * MIB,
+        0,
+        Some(vec![
+            entry(1, MIB, 40 * MIB, gpt_types::BASIC_DATA, 0),
+            entry(2, 41 * MIB, 40 * MIB, gpt_types::BASIC_DATA, 0),
+        ]),
+    );
+    format_fat(&mut dev, MIB, 40 * MIB, "DATA");
+    fat_add_file(&mut dev, MIB, b"README  TXT", b"hello");
+    format_fat(&mut dev, 41 * MIB, 40 * MIB, "WIN");
+    let mut system32 = [0u8; 32];
+    system32[..11].copy_from_slice(b"SYSTEM32   ");
+    system32[11] = 0x10;
+    fat_add_entry(&mut dev, 41 * MIB, b"WINDOWS    ", &system32, 0x10);
+    let p = MockPlatform::new();
+    p.add_disk(1, dev, meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let m = Model::from_platform(&p).unwrap();
+    assert_eq!(m.windows_found, vec![(1, 41 * MIB)]);
+    assert_eq!(m.windows_partition_of(1), Some(2));
 }

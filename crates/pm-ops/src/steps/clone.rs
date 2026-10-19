@@ -78,8 +78,10 @@ fn disk_pairs(
         CloneMode::Smart => p.used.unwrap_or(p.len),
         CloneMode::Sector => p.len,
     };
+    let probe = model.windows_probe();
     let layout =
-        plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of).ok()?;
+        plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of, Some(&probe))
+            .ok()?;
     Some(
         layout
             .map

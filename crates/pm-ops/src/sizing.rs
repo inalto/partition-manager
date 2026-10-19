@@ -75,7 +75,8 @@ fn too_small(src: &DiskInfo, item: &Item, room: u64) -> Error {
 /// Partitions are laid out in source order from the first usable byte, 1 MiB aligned (MBR
 /// logicals inside a rebuilt extended container with 1 MiB EBR slots), numbered 1..n (MBR
 /// logicals from 5), with fresh disk/partition GUIDs (GPT) or signature (MBR). `used_of`
-/// returns the bytes that must be copied for a partition.
+/// returns the bytes that must be copied for a partition; `probe` is passed on to
+/// [`windows_partition`] (e.g. [`crate::Model::windows_probe`]).
 pub fn plan_disk_clone(
     src: &DiskInfo,
     dst_len: u64,
@@ -83,6 +84,7 @@ pub fn plan_disk_clone(
     sizing: Sizing,
     only_system: bool,
     used_of: &dyn Fn(&PartitionInfo) -> u64,
+    probe: Option<&dyn Fn(u32, &PartitionInfo) -> bool>,
 ) -> Result<TargetLayout> {
     let kind = src.table;
     if !matches!(kind, TableKind::Mbr | TableKind::Gpt) {
@@ -102,7 +104,7 @@ pub fn plan_disk_clone(
         )));
     }
 
-    let windows = windows_partition(src);
+    let windows = windows_partition(src, probe);
     let mut parts: Vec<&PartitionInfo> = src
         .partitions
         .iter()

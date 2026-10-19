@@ -4,7 +4,8 @@ use pm_core::{
     gpt_types, DiskInfo, FsKind, PartitionInfo, PartitionType, Result, TableKind, VolumeInfo,
 };
 use pm_parttable::{Entry, Table};
-use pm_platform::Platform;
+use pm_core::SliceDevice;
+use pm_platform::{OpenMode, Platform};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,16 +20,58 @@ pub struct Model {
     pub volumes: Vec<VolumeInfo>,
     /// Index of the disk Windows is running from.
     pub system_disk: Option<u32>,
+    /// `(disk, partition start)` of partitions whose filesystem holds `\Windows\System32`,
+    /// found by [`Model::from_platform`] on disks where no partition is mounted at `C:\`
+    /// (the second rule of [`windows_partition`]).
+    #[serde(default)]
+    pub windows_found: Vec<(u32, u64)>,
 }
 
 impl Model {
-    /// Enumerate disks, volumes and the system disk from `p`.
+    /// Enumerate disks, volumes and the system disk from `p`, and look for Windows
+    /// installations on disks without a `C:\` partition ([`platform_windows_probe`]).
     pub fn from_platform(p: &dyn Platform) -> Result<Model> {
-        Ok(Model {
+        let mut m = Model {
             disks: p.enumerate_disks()?,
             volumes: p.enumerate_volumes()?,
             system_disk: p.system_disk(),
-        })
+            windows_found: Vec::new(),
+        };
+        m.probe_windows(&platform_windows_probe(p));
+        Ok(m)
+    }
+
+    /// Fill [`Model::windows_found`] with `probe`: on every disk where no candidate partition
+    /// is mounted at `C:\`, the first candidate (in table order) for which `probe` says its
+    /// filesystem contains `\Windows\System32`. Only NTFS partitions and partitions of
+    /// unknown filesystem are probed.
+    pub fn probe_windows(&mut self, probe: &dyn Fn(u32, &PartitionInfo) -> bool) {
+        self.windows_found.clear();
+        for d in &self.disks {
+            let cands = candidates(d);
+            if cands.iter().any(|p| p.letter() == Some('C')) {
+                continue;
+            }
+            if let Some(p) = cands
+                .iter()
+                .filter(|p| matches!(p.fs, None | Some(FsKind::Ntfs)))
+                .find(|p| probe(d.index, p))
+            {
+                self.windows_found.push((d.index, p.start));
+            }
+        }
+    }
+
+    /// The probe answers recorded by [`Model::probe_windows`], for [`windows_partition`].
+    pub fn windows_probe(&self) -> impl Fn(u32, &PartitionInfo) -> bool + '_ {
+        move |disk, p| self.windows_found.contains(&(disk, p.start))
+    }
+
+    /// The partition of disk `disk` holding Windows ([`windows_partition`] with this model's
+    /// probe answers).
+    pub fn windows_partition_of(&self, disk: u32) -> Option<u32> {
+        let probe = self.windows_probe();
+        windows_partition(self.disk(disk)?, Some(&probe))
     }
 
     /// The disk whose `index` is `i` (not the position in `disks`).
@@ -76,8 +119,7 @@ impl Model {
     /// True if `p` (on `disk`) holds the running Windows installation: `disk` is the system
     /// disk and `p` is its [`windows_partition`].
     pub fn is_windows_partition(&self, disk: u32, p: &PartitionInfo) -> bool {
-        self.is_system_disk(disk)
-            && self.disk(disk).and_then(windows_partition) == Some(p.number)
+        self.is_system_disk(disk) && self.windows_partition_of(disk) == Some(p.number)
     }
 
     /// True if drive letter `letter` (any case) is used by a partition or a volume.
@@ -105,35 +147,69 @@ pub(crate) fn is_fixed_system(p: &PartitionInfo) -> bool {
     p.ptype.map_or(false, |t| t.is_efi() || t.is_msr() || t.is_recovery())
 }
 
-/// The partition of `d` holding Windows, by the first rule that matches:
-/// 1. mounted at `C:\`;
-/// 2. `flags.boot` (contains the running/boot OS);
-/// 3. `flags.required` (checked last: OEM utility partitions carry this bit too);
-/// 4. the largest NTFS data partition.
-///
-/// EFI, MSR, recovery partitions and MBR extended containers never qualify. This one
-/// function is used both by the planner's guards and by the clone sizing.
-pub fn windows_partition(d: &DiskInfo) -> Option<u32> {
-    let candidates: Vec<&PartitionInfo> = d
-        .partitions
+/// Partitions of `d` that may hold Windows: not EFI, MSR, recovery or an MBR container.
+fn candidates(d: &DiskInfo) -> Vec<&PartitionInfo> {
+    d.partitions
         .iter()
         .filter(|p| !is_fixed_system(p) && !is_container(d.table, p))
-        .collect();
-    let rules: [&dyn Fn(&PartitionInfo) -> bool; 3] = [
-        &|p| p.letter() == Some('C'),
-        &|p| p.flags.boot,
-        &|p| p.flags.required,
-    ];
-    for rule in rules {
-        if let Some(p) = candidates.iter().find(|p| rule(p)) {
+        .collect()
+}
+
+/// The partition of `d` holding Windows, by the first rule that matches:
+/// 1. mounted at `C:\`;
+/// 2. its filesystem contains `\Windows\System32`, as `probe(disk, partition)` answers
+///    (with a platform: [`platform_windows_probe`]; a [`Model`] records the answers in
+///    [`Model::windows_found`] and hands them out through [`Model::windows_probe`]);
+///    `None` skips this rule;
+/// 3. the largest NTFS data partition.
+///
+/// The partition flags (`boot`, `required`) are not used: OEM utility partitions carry them
+/// too. EFI, MSR, recovery partitions and MBR extended containers never qualify. This one
+/// function is used both by the planner's guards and by the clone sizing.
+pub fn windows_partition(
+    d: &DiskInfo,
+    probe: Option<&dyn Fn(u32, &PartitionInfo) -> bool>,
+) -> Option<u32> {
+    let cands = candidates(d);
+    if let Some(p) = cands.iter().find(|p| p.letter() == Some('C')) {
+        return Some(p.number);
+    }
+    if let Some(probe) = probe {
+        if let Some(p) = cands.iter().find(|p| probe(d.index, p)) {
             return Some(p.number);
         }
     }
-    candidates
+    cands
         .iter()
         .filter(|p| p.fs == Some(FsKind::Ntfs) && p.ptype.map_or(true, |t| t.is_data()))
         .max_by_key(|p| p.len)
         .map(|p| p.number)
+}
+
+/// Largest directory listing looked at while probing for Windows (a damaged or huge root is
+/// not worth the wait).
+const PROBE_MAX_ENTRIES: usize = 4096;
+
+/// A probe for [`windows_partition`] / [`Model::probe_windows`] that opens the partition
+/// read-only through `p` and looks for a `Windows` directory holding a `System32` directory
+/// in the root of its filesystem. Any error (unreadable disk, unknown filesystem) is "no".
+pub fn platform_windows_probe(p: &dyn Platform) -> impl Fn(u32, &PartitionInfo) -> bool + '_ {
+    move |disk, part| has_windows_dir(p, disk, part).unwrap_or(false)
+}
+
+fn has_windows_dir(p: &dyn Platform, disk: u32, part: &PartitionInfo) -> Result<bool> {
+    let dev = p.open_disk(disk, OpenMode::ReadOnly)?;
+    let slice = SliceDevice::new(dev, part.start, part.len)?;
+    let mut fs = pm_fs::open(Box::new(slice))?;
+    let find = |list: Vec<pm_fs::Entry>, name: &str| {
+        if list.len() > PROBE_MAX_ENTRIES {
+            return None;
+        }
+        list.into_iter().find(|e| e.is_dir && !e.deleted && e.name.eq_ignore_ascii_case(name))
+    };
+    let root = fs.root();
+    let Some(windows) = find(fs.list(&root)?, "Windows") else { return Ok(false) };
+    Ok(find(fs.list(&windows)?, "System32").is_some())
 }
 
 /// The drive letter of a mount point string such as `E:` or `E:\` (upper-cased).

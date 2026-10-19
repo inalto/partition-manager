@@ -4,7 +4,7 @@ use super::clone::{copy_partition, grow_after_clone, prepare_copies};
 use super::table_ops::zero_table_areas;
 use super::{locate_volume, with_session, Ctx};
 use crate::operation::{BootFix, CloneMode, Sizing};
-use crate::sizing::{plan_disk_clone, windows_partition, TargetLayout};
+use crate::sizing::{plan_disk_clone, TargetLayout};
 use pm_core::{DiskInfo, Error, PartitionInfo, Result, TableKind, VolumeId};
 use pm_parttable::{Entry, Table};
 use pm_platform::{ExternalTool, MountPoint, OpenMode};
@@ -30,7 +30,9 @@ pub(crate) fn clone_disk(
         CloneMode::Smart => p.used.unwrap_or(p.len),
         CloneMode::Sector => p.len,
     };
-    let layout = plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of)?;
+    let probe = ctx.live.windows_probe();
+    let layout =
+        plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of, Some(&probe))?;
     let mut table = layout.table.clone();
     table.regenerate_ids();
     // keep the source's MBR boot code (BIOS boot) rather than the planner's zeroed one
@@ -112,7 +114,9 @@ fn fix_boot(
     table: &Table,
     dst_disk: u32,
 ) -> Result<()> {
-    let win_src = windows_partition(src)
+    let win_src = ctx
+        .live
+        .windows_partition_of(src.index)
         .ok_or_else(|| Error::Invalid(format!("Disk {} has no Windows partition", src.index)))?;
     let win_dst = layout
         .map

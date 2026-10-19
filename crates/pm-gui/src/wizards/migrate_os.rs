@@ -11,7 +11,7 @@ use eframe::egui::{self, RichText};
 use pm_core::{format_size, DiskInfo, TableKind, GIB};
 
 const TIB: u64 = 1024 * GIB;
-use pm_ops::{windows_partition, BootFix, Model, Operation, Sizing};
+use pm_ops::{BootFix, Model, Operation, Sizing};
 
 /// The disk the OS is migrated from: the running system disk, else the selected disk, else
 /// the first disk holding a Windows partition.
@@ -20,7 +20,7 @@ pub fn source_disk(m: &Model, selected: Option<u32>) -> Option<u32> {
     m.effective_system_disk()
         .filter(|&i| ok(i))
         .or_else(|| selected.filter(|&i| ok(i)))
-        .or_else(|| m.disks.iter().find(|d| ok(d.index) && windows_partition(d).is_some()).map(|d| d.index))
+        .or_else(|| m.disks.iter().find(|d| ok(d.index) && m.windows_partition_of(d.index).is_some()).map(|d| d.index))
         .or_else(|| m.disks.iter().find(|d| ok(d.index)).map(|d| d.index))
 }
 
