@@ -6,6 +6,33 @@ use crate::aligned::{read_unaligned, write_unaligned, RawSectorIo};
 use crate::traits::OpenMode;
 use pm_core::{BlockDevice, Error, Result};
 use std::io;
+use windows_sys::Win32::System::Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO;
+
+/// True for a volume path (`\\.\X:`, `\\?\Volume{..}`, with or without a trailing
+/// backslash), false for a physical disk (`\\.\PhysicalDriveN`) or anything else.
+pub(crate) fn is_volume_path(path: &str) -> bool {
+    let p = path.trim_end_matches('\\');
+    let Some(rest) = p.strip_prefix(r"\\.\").or_else(|| p.strip_prefix(r"\\?\")) else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    let letter = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let guid = rest.get(..7).is_some_and(|h| h.eq_ignore_ascii_case("Volume{"));
+    letter || guid
+}
+
+/// Let a volume handle read and write past the end the filesystem reports (the whole
+/// partition: e.g. the NTFS backup boot sector in the last sector, or a filesystem being
+/// grown or shrunk), with `FSCTL_ALLOW_EXTENDED_DASD_IO`. Failure is only logged: the handle
+/// still works inside the filesystem's bounds.
+fn allow_extended_dasd_io(handle: &Handle, path: &str) {
+    if let Err(c) = ioctl::ioctl(handle, FSCTL_ALLOW_EXTENDED_DASD_IO, &[], &mut []) {
+        log::warn!(
+            "{path}: FSCTL_ALLOW_EXTENDED_DASD_IO failed ({}); access stays within the filesystem",
+            super::friendly_error(c)
+        );
+    }
+}
 
 /// Raw disk (`\\.\PhysicalDriveN`) or volume (`\\?\Volume{..}`, `\\.\X:`) opened with
 /// `CreateFileW`. Reads and writes at any byte offset are bounced through sector-aligned
@@ -26,6 +53,9 @@ impl WinDevice {
             OpenMode::ReadWrite => GENERIC_READ | GENERIC_WRITE,
         };
         let handle = ioctl::open(path, access).map_err(|c| platform_error(c, &format!("open {path}")))?;
+        if is_volume_path(path) {
+            allow_extended_dasd_io(&handle, path);
+        }
         let geometry = ioctl::geometry(&handle).ok();
         let len = match ioctl::length_info(&handle) {
             Ok(len) => len,
@@ -114,5 +144,21 @@ impl BlockDevice for WinDevice {
     }
     fn is_read_only(&self) -> bool {
         self.read_only
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extended_dasd_io_is_requested_for_volume_paths_only() {
+        assert_eq!(FSCTL_ALLOW_EXTENDED_DASD_IO, 0x0009_0083);
+        for v in [r"\\.\E:", r"\\.\e:\", r"\\?\Volume{12345678-1234-1234-1234-123456789abc}", r"\\?\volume{x}\"] {
+            assert!(is_volume_path(v), "{v}");
+        }
+        for d in [r"\\.\PhysicalDrive0", r"\\?\PhysicalDrive3", r"C:\t\x.img", r"\\.\EE:", ""] {
+            assert!(!is_volume_path(d), "{d}");
+        }
     }
 }
