@@ -410,6 +410,11 @@ impl Planner {
                 restore(&mut m, path, *dst_disk, *dst_start)?
             }
         }
+        if let Some(d) = rewritten_table(model, &m, op) {
+            if let Some(disk) = m.disk_mut(d) {
+                renumber_logicals(disk);
+            }
+        }
         Ok(m)
     }
 
@@ -417,6 +422,42 @@ impl Planner {
     pub fn simulate_all(model: &Model, ops: &[Operation]) -> Result<Model> {
         ops.iter()
             .try_fold(model.clone(), |m, op| Planner::simulate(&m, op))
+    }
+}
+
+/// The disk whose partition table the executor rewrites for `op` (from the table it reads off
+/// the disk), when it does: `before` and `after` are the models around the simulation.
+fn rewritten_table(before: &Model, after: &Model, op: &Operation) -> Option<u32> {
+    use Operation::*;
+    match op {
+        CreatePartition { disk, .. }
+        | DeletePartition { disk, .. }
+        | ResizeMove { disk, .. }
+        | SetActive { disk, .. }
+        | SetType { disk, .. }
+        | AlignPartitions { disk }
+        | RebuildMbr { disk } => Some(*disk),
+        ClonePartition { dst_disk, .. } => Some(*dst_disk),
+        // over an existing partition only data is written; into free space a partition is added
+        RestoreImage { dst_disk, dst_start: Some(_), .. } => {
+            let count = |m: &Model| m.disk(*dst_disk).map(|d| d.partitions.len());
+            (count(before) != count(after)).then_some(*dst_disk)
+        }
+        _ => None,
+    }
+}
+
+/// Number the MBR logical partitions of `d` the way `pm_parttable::read_table` will after the
+/// table is written: the EBR chain is written in start order and its logicals are numbered
+/// from 5 in chain order. Deleting logical 5 of 5, 6, 7 therefore turns 6 into 5 and 7 into 6.
+fn renumber_logicals(d: &mut DiskInfo) {
+    if d.table != TableKind::Mbr {
+        return;
+    }
+    let mut logicals: Vec<&mut PartitionInfo> = d.partitions.iter_mut().filter(|p| p.logical).collect();
+    logicals.sort_by_key(|p| p.start);
+    for (i, p) in logicals.into_iter().enumerate() {
+        p.number = 5 + i as u32;
     }
 }
 

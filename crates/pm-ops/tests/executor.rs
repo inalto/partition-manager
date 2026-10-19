@@ -1079,3 +1079,154 @@ fn shrink_of_a_partition_with_unknown_filesystem_is_refused() {
     assert_eq!(r.failed, None, "{:?}", r.log);
     assert_eq!(table_of(&p, 1).entries[0].len, 24 * MIB);
 }
+
+/// Disk 1 (48 MiB, MBR): extended container 1 holding logicals 5, 6, 7 of 8 MiB each, filled
+/// with patterns 5, 6 and 7.
+fn mbr_logicals() -> MockPlatform {
+    let mut dev = MemDevice::new(DISK_LEN);
+    let mut t = Table::empty(TableKind::Mbr, DISK_LEN, 512);
+    let e = |number, start, len, ptype, logical| Entry {
+        number,
+        start,
+        len,
+        ptype: PartitionType::Mbr(ptype),
+        guid: None,
+        name: String::new(),
+        attrs: 0,
+        logical,
+    };
+    t.entries = vec![
+        e(1, MIB, 29 * MIB, 0x0F, false),
+        e(5, 2 * MIB, 8 * MIB, 0x07, true),
+        e(6, 11 * MIB, 8 * MIB, 0x07, true),
+        e(7, 20 * MIB, 8 * MIB, 0x07, true),
+    ];
+    write_table(&mut dev, &t).unwrap();
+    for (seed, start) in [(5u8, 2 * MIB), (6, 11 * MIB), (7, 20 * MIB)] {
+        dev.write_at(start + MIB, &pattern(MIB as usize, seed)).unwrap();
+    }
+    let p = MockPlatform::new();
+    p.add_disk(1, dev, DiskInfo { serial: "SER-1".into(), ..meta(1) });
+    p.set_system_disk(ELSEWHERE);
+    p
+}
+
+fn logicals_of(p: &MockPlatform) -> Vec<(u32, u64)> {
+    table_of(p, 1).entries.iter().filter(|e| e.logical).map(|e| (e.number, e.start)).collect()
+}
+
+#[test]
+fn deleting_a_logical_renumbers_the_rest_in_the_preview_and_on_disk() {
+    let p = mbr_logicals();
+    let model = Model::from_platform(&p).unwrap();
+    let mut q = OpQueue::new(model);
+    q.push(Operation::DeletePartition { disk: 1, number: 5 }).unwrap();
+    // the preview numbers the logicals as the disk will after the delete
+    let shown: Vec<(u32, u64)> = q.preview().disk(1).unwrap().partitions.iter()
+        .filter(|p| p.logical).map(|p| (p.number, p.start)).collect();
+    assert_eq!(shown, vec![(5, 11 * MIB), (6, 20 * MIB)]);
+    // the user wipes the partition the preview shows as 5 (the old 6)
+    q.push(Operation::WipePartition { disk: 1, number: 5, method: WipeMethod::Zero }).unwrap();
+    let r = pm_ops::execute_queued(&p, q.base(), q.ops(), &opts(), &NullProgress, &CancelToken::new())
+        .unwrap();
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(logicals_of(&p), vec![(5, 11 * MIB), (6, 20 * MIB)]);
+    let b = p.disk_bytes(1);
+    let at = |start: u64| &b[(start + MIB) as usize..(start + 2 * MIB) as usize];
+    assert!(at(11 * MIB).iter().all(|&x| x == 0), "the old 6 was wiped");
+    assert!(at(20 * MIB) == &pattern(MIB as usize, 7)[..], "the old 7 is untouched");
+    assert_sessions_finished(&p);
+
+    // a list still numbered as before the delete stops instead of hitting the old 7
+    let p = mbr_logicals();
+    let ops = [
+        Operation::DeletePartition { disk: 1, number: 5 },
+        Operation::WipePartition { disk: 1, number: 7, method: WipeMethod::Zero },
+    ];
+    let r = run(&p, &ops);
+    let (i, msg) = r.failed.expect("refused");
+    assert_eq!(i, 1, "{msg}");
+    assert!(msg.contains("partition 7"), "{msg}");
+    let b = p.disk_bytes(1);
+    assert!(b[(21 * MIB) as usize..(22 * MIB) as usize] == pattern(MIB as usize, 7)[..]);
+    assert!(b[(12 * MIB) as usize..(13 * MIB) as usize] == pattern(MIB as usize, 6)[..]);
+}
+
+#[test]
+fn operations_stop_when_the_disk_changed_since_they_were_queued() {
+    let wipe = Operation::WipePartition { disk: 1, number: 6, method: WipeMethod::Zero };
+    let queued_on = |p: &MockPlatform| Model::from_platform(p).unwrap();
+
+    // another disk (different size and serial) now has index 1
+    let p = mbr_logicals();
+    let base = queued_on(&p);
+    let mut other = mbr_logicals().disk_bytes(1);
+    other.resize((DISK_LEN + 8 * MIB) as usize, 0);
+    p.add_disk(1, MemDevice::from_vec(other), DiskInfo { serial: "SER-2".into(), ..meta(1) });
+    let before = p.disk_bytes(1);
+    for dry_run in [true, false] {
+        let o = ExecOpts { dry_run, ..opts() };
+        let r = pm_ops::execute_queued(&p, &base, &[wipe.clone()], &o, &NullProgress, &CancelToken::new())
+            .unwrap();
+        let (_, msg) = r.failed.expect("refused");
+        assert!(msg.contains("disk layout changed since the operations were queued"), "{msg}");
+    }
+    assert!(p.write_sessions_log().is_empty());
+    assert_eq!(p.disk_bytes(1), before, "nothing written");
+
+    // same size, only the serial number differs
+    let p = mbr_logicals();
+    let base = queued_on(&p);
+    p.add_disk(1, MemDevice::from_vec(p.disk_bytes(1)), DiskInfo { serial: "SER-9".into(), ..meta(1) });
+    let r = pm_ops::execute_queued(&p, &base, &[wipe.clone()], &opts(), &NullProgress, &CancelToken::new())
+        .unwrap();
+    assert!(r.failed.unwrap().1.contains("serial"));
+    assert!(p.write_sessions_log().is_empty());
+
+    // partition 6 was replaced by one at another position
+    let p = mbr_logicals();
+    let base = queued_on(&p);
+    let mut t = table_of(&p, 1);
+    t.entries.retain(|e| e.number != 6);
+    t.entries.push(Entry { start: 12 * MIB, len: 6 * MIB, number: 6, ..t.entries[1].clone() });
+    let mut dev = MemDevice::from_vec(p.disk_bytes(1));
+    write_table(&mut dev, &t).unwrap();
+    p.add_disk(1, dev, DiskInfo { serial: "SER-1".into(), ..meta(1) });
+    let r = pm_ops::execute_queued(&p, &base, &[wipe], &opts(), &NullProgress, &CancelToken::new())
+        .unwrap();
+    let msg = r.failed.unwrap().1;
+    assert!(msg.contains("disk layout changed") && msg.contains("partition 6"), "{msg}");
+    assert!(p.write_sessions_log().is_empty());
+
+    // unchanged: runs
+    let p = mbr_logicals();
+    let base = queued_on(&p);
+    let r = pm_ops::execute_queued(
+        &p,
+        &base,
+        &[Operation::WipePartition { disk: 1, number: 6, method: WipeMethod::Zero }],
+        &opts(),
+        &NullProgress,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r.failed, None, "{:?}", r.log);
+}
+
+#[test]
+fn partitions_created_earlier_in_the_run_keep_their_identity() {
+    // create (new GUID), then convert the table (new GUIDs and disk id), then wipe what was
+    // created: the identifiers the planner invented are matched to those really written
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let mut q = OpQueue::new(Model::from_platform(&p).unwrap());
+    q.push(create(1, MIB, 8 * MIB, None, None)).unwrap();
+    q.push(Operation::WipePartition { disk: 1, number: 1, method: WipeMethod::Zero }).unwrap();
+    q.push(Operation::ConvertTable { disk: 1, to: TableKind::Mbr }).unwrap();
+    q.push(Operation::WipePartition { disk: 1, number: 1, method: WipeMethod::Zero }).unwrap();
+    let r = pm_ops::execute_queued(&p, q.base(), q.ops(), &opts(), &NullProgress, &CancelToken::new())
+        .unwrap();
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(r.completed, 4);
+}

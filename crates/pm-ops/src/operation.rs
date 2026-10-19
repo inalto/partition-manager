@@ -388,6 +388,26 @@ impl Operation {
         }
     }
 
+    /// Every disk the operation reads or writes (source first for clones). Mount/Unmount
+    /// address a volume and return nothing.
+    pub fn disks(&self) -> Vec<u32> {
+        use Operation::*;
+        match self {
+            ClonePartition { src_disk, dst_disk, .. }
+            | CloneDisk { src_disk, dst_disk, .. }
+            | MigrateOs { src_disk, dst_disk, .. } => {
+                if src_disk == dst_disk {
+                    vec![*src_disk]
+                } else {
+                    vec![*src_disk, *dst_disk]
+                }
+            }
+            ImageDisk { disk, .. } | ImagePartition { disk, .. } => vec![*disk],
+            Mount { .. } | Unmount { .. } => Vec::new(),
+            _ => self.target_disk().into_iter().collect(),
+        }
+    }
+
     /// The disk the operation writes to (the destination for clones/restores), if any.
     pub fn target_disk(&self) -> Option<u32> {
         use Operation::*;

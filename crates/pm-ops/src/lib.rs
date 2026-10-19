@@ -6,6 +6,7 @@
 //! to the disks, only ever through [`pm_platform::Platform`] and its write sessions.
 
 pub mod executor;
+pub mod identity;
 pub mod model;
 pub mod operation;
 pub mod planner;
@@ -17,5 +18,6 @@ pub use model::{table_from_disk, Model};
 pub use operation::{BootFix, CloneMode, Operation, Sizing, WipeMethod};
 pub use planner::Planner;
 pub use sizing::{plan_disk_clone, windows_partition, TargetLayout};
-pub use executor::{execute, precheck, ExecOpts, ExecReport, StepEvent};
+pub use executor::{execute, execute_queued, precheck, ExecOpts, ExecReport, StepEvent};
+pub use identity::{adopt_generated_ids, layout_matches};
 pub use queue::OpQueue;

@@ -8,7 +8,7 @@ use crate::cli::CliError;
 use crate::progress::StderrProgress;
 use clap::Args;
 use pm_core::{format_size, CancelToken, Error, NullProgress};
-use pm_ops::{execute, ExecOpts, Model, Operation, Planner};
+use pm_ops::{execute_queued, ExecOpts, Model, Operation, Planner};
 use pm_platform::Platform;
 use std::io::Write;
 use std::path::PathBuf;
@@ -127,7 +127,7 @@ pub fn run_ops(env: &Env, ops: Vec<Operation>, flags: &RunFlags, out: &mut dyn W
     // the dry run re-checks every operation against the model its predecessors produce and
     // applies the system-disk guard, so a refusal is reported before anything is written
     let preview = ExecOpts { dry_run: true, allow_system_disk: flags.allow_system_disk };
-    let report = execute(env.platform, &ops, &preview, &NullProgress, env.cancel)?;
+    let report = execute_queued(env.platform, &model, &ops, &preview, &NullProgress, env.cancel)?;
     if let Some((_, msg)) = &report.failed {
         return Err(CliError::Usage(msg.clone()));
     }
@@ -139,7 +139,7 @@ pub fn run_ops(env: &Env, ops: Vec<Operation>, flags: &RunFlags, out: &mut dyn W
     }
 
     let opts = ExecOpts { dry_run: false, allow_system_disk: flags.allow_system_disk };
-    let report = execute(env.platform, &ops, &opts, &StderrProgress::new(), env.cancel)?;
+    let report = execute_queued(env.platform, &model, &ops, &opts, &StderrProgress::new(), env.cancel)?;
     print_log(out, &report.log)?;
     for st in &report.rescue_stats {
         if st.bad_bytes > 0 || st.read_errors > 0 {

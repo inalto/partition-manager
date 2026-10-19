@@ -10,7 +10,7 @@ use crate::selection::Selected;
 use crate::theme::Theme;
 use crate::tools::{Device, ToolEnv, ToolWindow};
 use crate::wizard::{Wizard, WizardCtx};
-use pm_ops::{execute, ExecOpts, ExecReport, Model, OpQueue, Operation};
+use pm_ops::{execute_queued, ExecOpts, ExecReport, Model, OpQueue, Operation};
 use pm_platform::Platform;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -228,10 +228,12 @@ impl AppState {
         }
         let p = self.platform.clone();
         let ops = self.queue.ops().to_vec();
+        let base = self.queue.base().clone();
         let dry_run = self.dry_run;
         let opts = ExecOpts { dry_run, allow_system_disk: allow_system };
         let handle = spawn_job("Applying changes", move |progress, cancel| {
-            let report = execute(&*p, &ops, &opts, progress, cancel)?;
+            // checked against the disks the operations were queued on
+            let report = execute_queued(&*p, &base, &ops, &opts, progress, cancel)?;
             let refreshed = if dry_run {
                 None
             } else {
@@ -530,15 +532,24 @@ pub fn destructive_flags(base: &Model, ops: &[Operation]) -> Vec<bool> {
 }
 
 /// Move `queue` onto a freshly enumerated `base`, keeping the pending operations that still
-/// validate (in order, up to the first that does not). Returns how many were dropped.
+/// validate and still reference the same disks and partitions ([`pm_ops::layout_matches`],
+/// the executor's check), in order, up to the first that does not. Returns how many were
+/// dropped.
 pub fn rebase(queue: &mut OpQueue, base: Model) -> usize {
     let ops = queue.ops().to_vec();
+    // the models the operations were queued against, one per operation
+    let mut old = queue.base().clone();
     queue.reset(base);
     let mut kept = 0;
     for op in &ops {
-        if queue.push(op.clone()).is_err() {
+        let new = queue.preview().clone();
+        if pm_ops::layout_matches(&old, &new, op).is_err() || queue.push(op.clone()).is_err() {
             break;
         }
+        let Ok(mut next) = pm_ops::Planner::simulate(&old, op) else { break };
+        // identifiers the two simulations invented independently are not a change
+        pm_ops::adopt_generated_ids(&old, &mut next, queue.preview(), &op.disks());
+        old = next;
         kept += 1;
     }
     ops.len() - kept
@@ -820,6 +831,41 @@ mod tests {
         d.partitions.retain(|p| p.number != 3);
         assert_eq!(rebase(&mut q, model_of(vec![d])), 1);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn rebase_drops_ops_whose_partition_was_replaced() {
+        let mut q = OpQueue::new(model_of(vec![gpt_disk(1)]));
+        q.push(Operation::SetLetter { disk: 1, number: 3, letter: Some('F') }).unwrap();
+        q.push(Operation::DeletePartition { disk: 1, number: 3 }).unwrap();
+        let n = q.len();
+        assert_eq!(n, 2);
+        // partition 3 is still number 3, but another partition (other GUID) at another place
+        let mut d = gpt_disk(1);
+        d.partitions[2].start += MIB;
+        d.partitions[2].guid = Some(uuid::Uuid::from_u128(0xBEEF));
+        assert_eq!(rebase(&mut q, model_of(vec![d])), n);
+        assert!(q.is_empty());
+        // a new partition created in the queue is followed through the rebase
+        let mut q = OpQueue::new(model_of(vec![gpt_disk(1)]));
+        q.push(Operation::CreatePartition {
+            disk: 1,
+            start: 801 * MIB,
+            len: 100 * MIB,
+            ptype: pm_core::PartitionType::Gpt(pm_core::gpt_types::BASIC_DATA),
+            fs: None,
+            label: String::new(),
+            letter: None,
+            name: String::new(),
+        })
+        .unwrap();
+        q.push(Operation::DeletePartition { disk: 1, number: 4 }).unwrap();
+        assert_eq!(rebase(&mut q, model_of(vec![gpt_disk(1)])), 0);
+        assert_eq!(q.len(), 2);
+        // a different disk under the same index
+        let mut other = gpt_disk(1);
+        other.serial = "OTHER".into();
+        assert_eq!(rebase(&mut q, model_of(vec![other])), 2);
     }
 
     #[test]

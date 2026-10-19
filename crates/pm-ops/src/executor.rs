@@ -1,16 +1,21 @@
 //! Applies a list of pending operations to the disks, one at a time, through [`Platform`].
 //!
 //! For every operation, in order:
-//! 1. the live state is re-read ([`Model::from_platform`]) and the operation is re-validated
-//!    with [`Planner::simulate`] on it — the disks may have changed since the queue was built;
+//! 1. the live state is re-read ([`Model::from_platform`]); every disk and partition the
+//!    operation references must still be the one it was queued against
+//!    ([`crate::layout_matches`] against the queue's base model with the earlier operations
+//!    simulated), and the operation is re-validated with [`Planner::simulate`] on it — the
+//!    disks may have changed since the queue was built;
 //! 2. the running system disk is refused as a destination (re-checked here, not trusted from
 //!    the queue);
 //! 3. the operation's steps run. Nothing is written outside a [`pm_platform::WriteSession`],
 //!    and every session is finished, on success and on every error path;
-//! 4. the OS re-reads the layout of the disks that were written.
+//! 4. the OS re-reads the layout of the disks that were written, and the executor waits
+//!    (bounded) for their volumes to come back before the next operation re-reads the disks.
 //!
 //! The first failing operation stops the run.
 
+use crate::identity::{adopt_generated_ids, layout_matches};
 use crate::model::Model;
 use crate::operation::Operation;
 use crate::planner::Planner;
@@ -166,9 +171,8 @@ fn guard_system_disk(live: &Model, op: &Operation, allow: bool) -> Result<()> {
     }))
 }
 
-/// Apply `ops` in order (see the module documentation). Failures of individual operations
-/// are reported in [`ExecReport::failed`], not as `Err`; the `Result` is kept for failures of
-/// the executor itself.
+/// Apply `ops` in order (see the module documentation), planned against the disks as they are
+/// now: [`execute_queued`] with a freshly read base model.
 pub fn execute(
     platform: &dyn Platform,
     ops: &[Operation],
@@ -176,17 +180,79 @@ pub fn execute(
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
 ) -> Result<ExecReport> {
+    let base = Model::from_platform(platform)?;
+    execute_queued(platform, &base, ops, opts, progress, cancel)
+}
+
+/// The model the next operation is expected to find, carried from one operation to the next.
+struct Expected {
+    /// The model `model` was simulated from (for [`adopt_generated_ids`]).
+    before: Option<Model>,
+    model: Model,
+    /// Disks the previous operation touched.
+    disks: Vec<u32>,
+}
+
+impl Expected {
+    fn new(base: &Model) -> Self {
+        Expected { before: None, model: base.clone(), disks: Vec::new() }
+    }
+
+    /// The expected model for the operation about to run on `live`: the identifiers the
+    /// previous simulation invented are replaced by those really written.
+    fn sync(&mut self, live: &Model) -> &Model {
+        if let Some(before) = self.before.take() {
+            adopt_generated_ids(&before, &mut self.model, live, &self.disks);
+        }
+        &self.model
+    }
+
+    /// Advance past `op`: fold [`Planner::simulate`] over the expected model; should it not
+    /// validate there (it did on the live model), continue from `fallback` (the live model's
+    /// simulation, as `fallback_before` produced it).
+    fn advance(&mut self, op: &Operation, fallback_before: &Model, fallback: &Model) {
+        match Planner::simulate(&self.model, op) {
+            Ok(next) => {
+                let before = std::mem::replace(&mut self.model, next);
+                self.before = Some(before);
+            }
+            Err(_) => {
+                self.model = fallback.clone();
+                self.before = Some(fallback_before.clone());
+            }
+        }
+        self.disks = op.disks();
+    }
+}
+
+/// Apply `ops`, queued against `base` (the model the user saw, e.g. [`crate::OpQueue::base`]),
+/// in order (see the module documentation). Before every operation the disks are re-read and
+/// everything the operation references must still match the expected model — `base` with the
+/// operations before it simulated ([`layout_matches`]); otherwise the run stops with "disk
+/// layout changed since the operations were queued" and nothing of that operation is written.
+/// Failures of individual operations are reported in [`ExecReport::failed`], not as `Err`;
+/// the `Result` is kept for failures of the executor itself.
+pub fn execute_queued(
+    platform: &dyn Platform,
+    base: &Model,
+    ops: &[Operation],
+    opts: &ExecOpts,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<ExecReport> {
     let mut report = ExecReport::default();
     if opts.dry_run {
-        dry_run(platform, ops, opts, &mut report);
+        dry_run(platform, base, ops, opts, &mut report);
         return Ok(report);
     }
     let n = ops.len();
+    let mut expected = Expected::new(base);
     for (i, op) in ops.iter().enumerate() {
         let r = cancel
             .check()
             .and_then(|_| Model::from_platform(platform))
             .and_then(|live| {
+                layout_matches(expected.sync(&live), &live, op)?;
                 guard_system_disk(&live, op, opts.allow_system_disk)?;
                 precheck(&live, op)?;
                 let after = Planner::simulate(&live, op)?;
@@ -201,9 +267,9 @@ pub fn execute(
                     (&live, &after),
                 );
                 run_op(&mut ctx, op)?;
-                Ok((written_disk(&live, op), after))
+                Ok((written_disk(&live, op), live, after))
             });
-        let (written, after) = match r {
+        let (written, live, after) = match r {
             Ok(v) => v,
             Err(e) => {
                 let msg = message(e);
@@ -213,6 +279,7 @@ pub fn execute(
             }
         };
         report.completed += 1;
+        expected.advance(op, &live, &after);
         if i + 1 < n {
             if let Some(d) = written {
                 settle_volumes(platform, d, &after, cancel, &mut report.log);
@@ -248,8 +315,8 @@ fn settle_volumes(
 }
 
 /// Validate the whole list against the live state (each operation on the model the previous
-/// ones produce) and log what would be done.
-fn dry_run(platform: &dyn Platform, ops: &[Operation], opts: &ExecOpts, report: &mut ExecReport) {
+/// ones produce, and against `base` as [`execute_queued`] does) and log what would be done.
+fn dry_run(platform: &dyn Platform, base: &Model, ops: &[Operation], opts: &ExecOpts, report: &mut ExecReport) {
     let n = ops.len();
     let mut model = match Model::from_platform(platform) {
         Ok(m) => m,
@@ -258,12 +325,15 @@ fn dry_run(platform: &dyn Platform, ops: &[Operation], opts: &ExecOpts, report: 
             return;
         }
     };
+    let mut expected = Expected::new(base);
     for (i, op) in ops.iter().enumerate() {
-        let r = guard_system_disk(&model, op, opts.allow_system_disk)
+        let r = layout_matches(expected.sync(&model), &model, op)
+            .and_then(|_| guard_system_disk(&model, op, opts.allow_system_disk))
             .and_then(|_| precheck(&model, op))
             .and_then(|_| Planner::simulate(&model, op));
         match r {
             Ok(m) => {
+                expected.advance(op, &model, &m);
                 model = m;
                 report.log.push(format!("[{}/{n}] would: {}", i + 1, op.summary()));
                 report.completed += 1;
