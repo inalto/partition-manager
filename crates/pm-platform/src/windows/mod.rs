@@ -1,0 +1,180 @@
+//! Windows implementation of [`Platform`].
+//!
+//! Elevation requirements: `enumerate_disks` / `enumerate_volumes` / `system_disk` work without
+//! elevation (query-only handles); opening disks or volumes for I/O, write sessions, mounting,
+//! formatting and resizing need administrator rights.
+
+mod device;
+mod disk;
+mod elevation;
+mod error;
+mod format;
+mod ioctl;
+pub mod layout;
+mod mount;
+mod session;
+mod volume;
+
+pub use device::WinDevice;
+pub use error::friendly_error;
+pub use session::WindowsWriteSession;
+
+use crate::traits::{ExternalTool, MountPoint, OpenMode, Platform, SmartData, WriteSession};
+use pm_core::{BlockDevice, DiskInfo, Error, FsKind, ProgressSink, Result, VolumeId, VolumeInfo};
+use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+
+/// `CREATE_NO_WINDOW`: keep console tools from flashing a window under the GUI.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The real Windows platform.
+#[derive(Default)]
+pub struct WindowsPlatform {
+    system_disk: OnceLock<Option<u32>>,
+}
+
+impl WindowsPlatform {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// `%SystemRoot%\System32\<exe>`.
+fn system32_path(exe: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .or_else(|| ioctl::windows_directory().ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(exe)
+}
+
+/// Run a system tool, returning stdout followed by stderr; non-zero exit → `Error::Platform`.
+pub(crate) fn run_tool(tool: ExternalTool, args: &[String]) -> Result<String> {
+    let exe = system32_path(tool.exe_name());
+    let out = Command::new(&exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| Error::Platform {
+            code: e.raw_os_error().unwrap_or(0) as u32,
+            msg: format!("cannot run {}: {e}", exe.display()),
+        })?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    if out.status.success() {
+        Ok(text)
+    } else {
+        Err(Error::Platform {
+            code: out.status.code().unwrap_or(-1) as u32,
+            msg: format!("{} failed: {}", tool.exe_name(), text.trim()),
+        })
+    }
+}
+
+impl Platform for WindowsPlatform {
+    fn enumerate_disks(&self) -> Result<Vec<DiskInfo>> {
+        let volumes = volume::enumerate_volumes().unwrap_or_else(|e| {
+            log::warn!("volume enumeration failed: {e}");
+            Vec::new()
+        });
+        Ok(disk::enumerate_disks(&volumes, self.system_disk()))
+    }
+
+    fn enumerate_volumes(&self) -> Result<Vec<VolumeInfo>> {
+        volume::enumerate_volumes()
+    }
+
+    fn open_disk(&self, index: u32, mode: OpenMode) -> Result<Box<dyn BlockDevice>> {
+        Ok(Box::new(WinDevice::open(&disk::disk_path(index), mode)?))
+    }
+
+    fn open_volume(&self, id: &VolumeId, mode: OpenMode) -> Result<Box<dyn BlockDevice>> {
+        Ok(Box::new(WinDevice::open(&volume::device_path(id), mode)?))
+    }
+
+    fn begin_write(&self, disk: u32) -> Result<Box<dyn WriteSession>> {
+        session::begin_write(disk, self.system_disk())
+    }
+
+    fn mount(&self, id: &VolumeId, at: &MountPoint) -> Result<()> {
+        mount::mount(id, at)
+    }
+
+    fn unmount(&self, id: &VolumeId, at: &MountPoint) -> Result<()> {
+        mount::unmount(id, at)
+    }
+
+    fn set_offline(&self, disk: u32, offline: bool) -> Result<()> {
+        mount::set_offline(disk, offline)
+    }
+
+    fn rescan(&self, disk: u32) -> Result<()> {
+        mount::rescan(disk)
+    }
+
+    fn format(
+        &self,
+        id: &VolumeId,
+        fs: FsKind,
+        label: &str,
+        cluster: Option<u32>,
+        quick: bool,
+        progress: &dyn ProgressSink,
+    ) -> Result<()> {
+        format::format(id, fs, label, cluster, quick, progress)
+    }
+
+    fn shrink_volume(&self, id: &VolumeId, new_len: u64) -> Result<()> {
+        format::shrink_volume(id, new_len)
+    }
+
+    fn extend_volume(&self, id: &VolumeId, new_len: u64) -> Result<()> {
+        format::extend_volume(id, new_len)
+    }
+
+    fn smart(&self, _disk: u32) -> Result<Option<SmartData>> {
+        // Task 17: IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceHealth / NVMe log) + ATA SMART.
+        Ok(None)
+    }
+
+    fn is_elevated(&self) -> bool {
+        elevation::is_elevated()
+    }
+
+    fn system_disk(&self) -> Option<u32> {
+        *self.system_disk.get_or_init(elevation::find_system_disk)
+    }
+
+    fn free_letters(&self) -> Vec<char> {
+        mount::free_letters()
+    }
+
+    fn run_tool(&self, tool: ExternalTool, args: &[String]) -> Result<String> {
+        run_tool(tool, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_resolve_in_system32() {
+        let p = system32_path(ExternalTool::FormatCom.exe_name());
+        assert!(p.ends_with(r"System32\format.com"), "{}", p.display());
+        assert!(p.exists());
+        assert!(system32_path(ExternalTool::BcdBoot.exe_name()).exists());
+    }
+
+    #[test]
+    fn run_tool_reports_nonzero_exit() {
+        // `bcdboot` with no arguments prints usage and exits with 87 without touching anything
+        match run_tool(ExternalTool::BcdBoot, &[]) {
+            Err(Error::Platform { code, .. }) => assert_ne!(code, 0),
+            Ok(out) => panic!("expected failure, got {out}"),
+            Err(e) => panic!("unexpected error {e}"),
+        }
+    }
+}
