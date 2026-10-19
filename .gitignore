@@ -1,0 +1,10 @@
+﻿/target
+**/*.rs.bk
+/reverse_engineer/
+*.img
+*.vhd
+*.vmdk
+*.qcow2
+*.map
+/dist/
+
