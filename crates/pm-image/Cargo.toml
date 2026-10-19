@@ -7,9 +7,16 @@ description = "Partition Manager virtual disk images: raw, VHD, VMDK and qcow2 a
 
 [dependencies]
 pm-core = { path = "../pm-core" }
+pm-fs = { path = "../pm-fs" }
 serde.workspace = true
 uuid.workspace = true
 
+[features]
+# Exposes `rescue::FaultyDevice`, an error-injecting test double, to other crates' tests.
+testing = []
+
 [dev-dependencies]
+# Self-reference so this crate's integration tests see the `testing` feature.
+pm-image = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 serde_json.workspace = true

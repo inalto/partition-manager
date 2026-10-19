@@ -5,11 +5,13 @@
 mod format;
 mod qcow2;
 mod raw;
+pub mod rescue;
 mod sparse;
 mod vhd;
 mod vmdk;
 
 pub use format::ImageFormat;
+pub use rescue::{copy_simple, rescue, BlockStatus, MapFile, MapStats, RescueOpts, RescueStats};
 use pm_core::{BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result};
 use std::path::Path;
 

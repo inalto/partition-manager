@@ -395,6 +395,8 @@ name = "pm-image"
 version = "0.1.0"
 dependencies = [
  "pm-core",
+ "pm-fs",
+ "pm-image",
  "serde",
  "serde_json",
  "tempfile",
