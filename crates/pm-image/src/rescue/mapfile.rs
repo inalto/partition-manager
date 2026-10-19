@@ -18,6 +18,7 @@
 
 use pm_core::{Error, Result};
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Rescue state of a block of the source.
@@ -227,7 +228,8 @@ impl MapFile {
         Self::parse(&s)
     }
 
-    /// Write the mapfile atomically (temporary file + rename).
+    /// Write the mapfile atomically and durably: `<path>.tmp` is written and fsynced, then
+    /// renamed over `path`, so a crash leaves either the old or the new complete file.
     pub fn save(&self, p: &Path) -> Result<()> {
         self.save_with_comments(p, &[])
     }
@@ -237,8 +239,12 @@ impl MapFile {
         let mut tmp = p.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, self.render(comments)).map_err(|e| Error::io(0, 0, e))?;
-        std::fs::rename(&tmp, p).map_err(|e| Error::io(0, 0, e))
+        let io = |e| Error::io(0, 0, e);
+        let mut f = std::fs::File::create(&tmp).map_err(io)?;
+        f.write_all(self.render(comments).as_bytes()).map_err(io)?;
+        f.sync_all().map_err(io)?;
+        drop(f);
+        std::fs::rename(&tmp, p).map_err(io)
     }
 
     /// The mapfile text with extra comment lines after the header.

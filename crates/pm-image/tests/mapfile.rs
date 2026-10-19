@@ -166,5 +166,14 @@ fn mapfile_save_load() {
     m.current_status = '*';
     m.save(&p).unwrap();
     assert_eq!(MapFile::load(&p).unwrap(), m);
+    // saving again replaces the file and leaves no temporary behind
+    m.mark(0, 512, Finished);
+    m.save(&p).unwrap();
+    assert_eq!(MapFile::load(&p).unwrap(), m);
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["x.map".to_string()]);
     assert!(MapFile::load(&dir.path().join("missing.map")).is_err());
 }

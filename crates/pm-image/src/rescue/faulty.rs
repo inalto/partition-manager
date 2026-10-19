@@ -11,6 +11,8 @@ const SECTOR: u64 = 512;
 /// Wraps a [`MemDevice`] and fails every `read_at` whose range touches a bad 512-byte
 /// sector, as a whole (like a real drive failing a multi-sector read). Transient sectors
 /// fail a given number of times and then read normally. Writes pass through.
+/// Bad/transient offsets have 512-byte granularity; `sector_size()` reports the inner
+/// device's (e.g. 4096 via `MemDevice::with_sector_size`).
 pub struct FaultyDevice {
     inner: MemDevice,
     bad: BTreeSet<u64>,
@@ -89,7 +91,7 @@ impl BlockDevice for FaultyDevice {
         self.inner.len()
     }
     fn sector_size(&self) -> u32 {
-        SECTOR as u32
+        self.inner.sector_size()
     }
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.reads.fetch_add(1, Ordering::SeqCst);

@@ -404,3 +404,82 @@ fn rescue_odd_length_tail_sector() {
     assert!(dst.as_slice()[..LEN as usize] == data[..LEN as usize]);
     assert!(src.read_log().iter().all(|&(o, l)| o + l as u64 <= len));
 }
+
+#[test]
+fn rescue_zero_unused_reports_progress() {
+    let mut used = UsedMap::new(LEN, 4096);
+    used.set(0, MIB);
+    let unused = LEN - MIB;
+    let reports = Mutex::new(Vec::<ProgressReport>::new());
+    let sink = FnProgress(|p: &ProgressReport| reports.lock().unwrap().push(p.clone()));
+    let mut src = faulty(&[], &[]);
+    let mut dst = MemDevice::from_vec(vec![0xEE; LEN as usize]);
+    let opts = RescueOpts { used_map: Some(used), zero_unused: true, ..RescueOpts::default() };
+    rescue(&mut src, &mut dst, 0, &opts, &sink, &CancelToken::new()).unwrap();
+    assert!(dst.as_slice()[MIB as usize..].iter().all(|&b| b == 0));
+    let r = reports.lock().unwrap();
+    let zeroing: Vec<_> = r.iter().filter(|p| p.phase == "Zeroing unused").collect();
+    let last = zeroing.last().expect("a Zeroing unused report");
+    assert_eq!((last.done, last.total), (unused, unused));
+    // zeroing precedes copying, which covers only the used bytes
+    let copy = r.iter().rposition(|p| p.phase == "Copying").unwrap();
+    assert!(r.iter().position(|p| p.phase == "Zeroing unused").unwrap() < copy);
+    assert_eq!((r[copy].done, r[copy].total), (MIB, MIB));
+}
+
+#[test]
+fn rescue_corrupt_mapfile_is_reported_not_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let mf = dir.path().join("nul.map");
+    // what a power loss can leave behind: a file of NULs
+    std::fs::write(&mf, vec![0u8; 300]).unwrap();
+    let mut src = faulty(&[], &[]);
+    let mut dst = MemDevice::new(LEN);
+    let opts = RescueOpts { mapfile: Some(mf.clone()), ..RescueOpts::default() };
+    let r = rescue(&mut src, &mut dst, 0, &opts, &NullProgress, &CancelToken::new());
+    match r {
+        Err(Error::Parse(msg)) => {
+            assert!(msg.contains("nul.map"), "{msg}");
+            assert!(msg.contains("delete or move the mapfile to start over"), "{msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+    assert_eq!(src.read_count(), 0);
+    assert_eq!(std::fs::read(&mf).unwrap(), vec![0u8; 300], "corrupt mapfile left as is");
+    // invalid UTF-8 is reported the same way
+    std::fs::write(&mf, [0xFFu8, 0xFE, 0x00]).unwrap();
+    let r = rescue(&mut src, &mut dst, 0, &opts, &NullProgress, &CancelToken::new());
+    assert!(matches!(r, Err(Error::Parse(ref m)) if m.contains("start over")), "{r:?}");
+}
+
+#[test]
+fn rescue_uses_device_sector_size_4kn() {
+    let mut src = FaultyDevice::new(
+        MemDevice::from_vec(pattern()).with_sector_size(4096),
+        vec![BAD],
+        HashMap::new(),
+    );
+    assert_eq!(src.sector_size(), 4096);
+    let mut dst = MemDevice::new(LEN);
+    // opts.sector stays at the 512 default: the device's 4096 wins
+    let st = rescue(&mut src, &mut dst, 0, &RescueOpts::default(), &NullProgress, &CancelToken::new())
+        .unwrap();
+    assert_eq!(st.bad_bytes, 4096);
+    assert_eq!(st.bad_areas, 1);
+    assert_copied_except(dst.as_slice(), &[(MIB, 4096)]);
+    let small: Vec<_> = src.read_log().into_iter().filter(|&(_, l)| l < (64 << 10)).collect();
+    assert!(!small.is_empty());
+    assert!(small.iter().all(|&(o, l)| l == 4096 && o % 4096 == 0), "{small:?}");
+}
+
+#[test]
+fn rescue_block_size_clamped() {
+    let mut src = faulty(&[], &[]);
+    let mut dst = MemDevice::new(LEN);
+    let opts = RescueOpts { block_size: usize::MAX, ..RescueOpts::default() };
+    let st = rescue(&mut src, &mut dst, 0, &opts, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(st.rescued, LEN);
+    // capped at 64 MiB (and at the device size): one read of the whole 4 MiB source
+    assert_eq!(src.read_log(), vec![(0, LEN as usize)]);
+    assert!(dst.as_slice() == &pattern()[..]);
+}

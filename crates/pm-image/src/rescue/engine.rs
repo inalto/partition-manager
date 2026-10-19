@@ -15,9 +15,11 @@ use std::time::{Duration, Instant};
 /// Options for [`rescue`].
 #[derive(Clone, Debug)]
 pub struct RescueOpts {
-    /// Read size of the copy phase (rounded down to a sector multiple). Default 128 KiB.
+    /// Read size of the copy phase (capped at 64 MiB, rounded down to a sector
+    /// multiple). Default 128 KiB.
     pub block_size: usize,
-    /// Sector size: the unit of trimming, scraping and retrying. Default 512.
+    /// Sector size: the unit of trimming, scraping and retrying; raised to the source's
+    /// `sector_size()` if that is larger. Default 512.
     pub sector: u32,
     /// Initial skip after a read error in the copy phase; doubles after every further
     /// error up to `max(1% of the source, 64 KiB)` and resets after a good read.
@@ -84,7 +86,9 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 const RATE_WINDOW: Duration = Duration::from_secs(5);
 const DETAIL_INTERVAL: Duration = Duration::from_millis(250);
 const SIMPLE_CHUNK: u64 = 4 << 20;
-const ZERO_CHUNK: u64 = 1 << 20;
+const ZERO_CHUNK: u64 = 4 << 20;
+/// Largest copy-phase read: bounds the buffer and the bytes between cancel checks.
+const MAX_BLOCK: u64 = 64 << 20;
 
 /// Outcome of one source read.
 enum Read {
@@ -273,8 +277,11 @@ impl<'a> Engine<'a> {
         self.unused = unused.iter().map(|r| r.1).sum();
         let mut map = self.map.clone();
         let changed = map.mark_many(&unused, BlockStatus::Finished);
-        if self.opts.zero_unused {
-            let zeros = vec![0u8; ZERO_CHUNK as usize];
+        if self.opts.zero_unused && !changed.is_empty() {
+            // its own phase: on a large mostly-empty disk this can be most of the run
+            let total: u64 = changed.iter().map(|r| r.1).sum();
+            let mut tracker = ProgressTracker::new(self.progress, "Zeroing unused", total);
+            let zeros = vec![0u8; ZERO_CHUNK.min(total) as usize];
             for (s, l) in changed {
                 let mut off = 0;
                 while off < l {
@@ -282,8 +289,10 @@ impl<'a> Engine<'a> {
                     let n = (l - off).min(ZERO_CHUNK);
                     self.dst.write_at(self.dst_offset + s + off, &zeros[..n as usize])?;
                     off += n;
+                    tracker.add(n);
                 }
             }
+            tracker.finish();
         }
         self.map = map;
         Ok(())
@@ -534,24 +543,33 @@ pub fn rescue(
 ) -> Result<RescueStats> {
     let start = Instant::now();
     let len = src.len();
-    if opts.sector == 0 {
+    // never trim/scrape/retry below the device's physical sector (4Kn drives)
+    let sector = opts.sector.max(src.sector_size()) as u64;
+    if sector == 0 {
         return Err(Error::Invalid("rescue sector size must be non-zero".into()));
     }
-    let sector = opts.sector as u64;
     if dst_offset.checked_add(len).map_or(true, |e| e > dst.len()) {
         return Err(Error::Invalid(format!(
             "rescue destination too small: need {len} bytes at offset {dst_offset}, device has {}",
             dst.len()
         )));
     }
-    let block = (opts.block_size as u64 / sector * sector).max(sector);
+    // capped so cancellation is checked at least every MAX_BLOCK bytes
+    let block = ((opts.block_size as u64).min(MAX_BLOCK) / sector * sector).max(sector);
     let map = match &opts.mapfile {
         Some(p) if p.exists() => {
-            let text = std::fs::read_to_string(p).map_err(|e| Error::io(0, 0, e))?;
+            let corrupt = |why: String| {
+                Error::Parse(format!(
+                    "mapfile {} is unreadable ({why}); delete or move the mapfile to start over",
+                    p.display()
+                ))
+            };
+            let bytes = std::fs::read(p).map_err(|e| Error::io(0, 0, e))?;
+            let text = String::from_utf8(bytes).map_err(|_| corrupt("not UTF-8 text".into()))?;
             if text.trim().is_empty() {
                 MapFile::new(len)
             } else {
-                let m = MapFile::parse(&text)?;
+                let m = MapFile::parse(&text).map_err(|e| corrupt(e.to_string()))?;
                 if m.len() != len {
                     return Err(Error::Invalid(format!(
                         "mapfile {} covers {} bytes but the source has {len}",
@@ -590,7 +608,7 @@ pub fn rescue(
         block,
         unused: 0,
         tracker: None,
-        buf: vec![0u8; block as usize],
+        buf: vec![0u8; block.min(len) as usize],
         start,
         last_save: now,
         last_detail: now,
