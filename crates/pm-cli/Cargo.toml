@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 pm-core = { path = "../pm-core" }
 pm-parttable = { path = "../pm-parttable" }
+pm-image = { path = "../pm-image" }
+pm-fs = { path = "../pm-fs" }
 pm-platform = { path = "../pm-platform" }
 clap.workspace = true
 serde.workspace = true

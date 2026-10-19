@@ -3,27 +3,55 @@
 //! Exit codes: 0 success, 1 usage / invalid argument, 2 platform or runtime error.
 
 mod cli;
+mod cmd_clone;
 mod cmd_doctor;
+mod cmd_image;
 mod cmd_list;
+mod cmd_ls;
 mod cmd_mount;
+mod cmd_probe;
+mod cmd_rescue;
 mod cmd_table;
 mod device_arg;
-// Used by the long-running commands added in later tasks.
-#[allow(dead_code)]
 mod progress;
 
 use clap::Parser;
 use cli::{Cli, CliError, Command, EXIT_OK};
+use pm_core::CancelToken;
 use pm_platform::Platform;
 use std::io::Write;
 
-fn dispatch(platform: &dyn Platform, command: Command, out: &mut dyn Write) -> Result<(), CliError> {
+fn dispatch(
+    platform: &dyn Platform,
+    command: Command,
+    cancel: &CancelToken,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     match command {
         Command::List { json } => cmd_list::run(platform, json, out),
         Command::Table { device, json } => cmd_table::run(platform, &device, json, out),
         Command::Mount { volume, at } => cmd_mount::run_mount(platform, &volume, &at, out),
         Command::Unmount { volume, at } => cmd_mount::run_unmount(platform, &volume, &at, out),
         Command::Doctor => cmd_doctor::run(platform, out),
+        Command::Clone { src, dst, mode, dst_offset } => {
+            cmd_clone::run(platform, &src, &dst, mode.mode(), dst_offset, cancel, out)
+        }
+        Command::Image { src, file, format, mode } => {
+            cmd_image::run_image(platform, &src, &file, format, mode.mode(), cancel, out)
+        }
+        Command::Restore { file, dst, dst_offset } => {
+            cmd_image::run_restore(platform, &file, &dst, dst_offset, cancel, out)
+        }
+        Command::Convert { input, output, format } => {
+            cmd_image::run_convert(&input, &output, format, cancel, out)
+        }
+        Command::Rescue(args) => cmd_rescue::run(platform, &args, cancel, out),
+        Command::Probe { device, offset } => cmd_probe::run(platform, &device, offset, out),
+        Command::Ls { device, path } => cmd_ls::run_ls(platform, &device, path.as_deref(), out),
+        Command::Cat { device, path } => cmd_ls::run_cat(platform, &device, &path, out),
+        Command::Extract { device, path, dest } => {
+            cmd_ls::run_extract(platform, &device, &path, &dest, cancel, out)
+        }
     }
 }
 
@@ -42,7 +70,9 @@ fn main() {
     let platform = pm_platform::default_platform();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let result = dispatch(platform.as_ref(), cli.command, &mut out);
+    // Not triggered yet: a Ctrl-C handler can cancel this token to stop a running copy cleanly.
+    let cancel = CancelToken::new();
+    let result = dispatch(platform.as_ref(), cli.command, &cancel, &mut out);
     let _ = out.flush();
     if let Err(e) = result {
         eprintln!("error: {e}");

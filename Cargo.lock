@@ -361,6 +361,8 @@ dependencies = [
  "env_logger",
  "log",
  "pm-core",
+ "pm-fs",
+ "pm-image",
  "pm-parttable",
  "pm-platform",
  "serde",
