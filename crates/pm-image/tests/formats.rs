@@ -871,3 +871,39 @@ fn convert_refuses_same_file() {
     assert_eq!(got, pattern(2048, 2));
     assert!(sub.join("out-flat.vmdk").exists());
 }
+
+// ---------------------------------------------------------------- fix round 3
+
+#[test]
+fn convert_refuses_same_file_through_missing_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.img");
+    {
+        let mut d = create(&src, &opts(ImageFormat::Raw, MIB)).unwrap();
+        d.write_at(0, &pattern(4096, 3)).unwrap();
+        d.flush().unwrap();
+    }
+    let before = std::fs::read(&src).unwrap();
+    // Windows resolves `..` lexically, so this names src.img even though the
+    // directory does not exist.
+    let via_missing = dir.path().join("no_such_dir").join("..").join("src.img");
+    let deeper = dir
+        .path()
+        .join("a")
+        .join("b")
+        .join("..")
+        .join("..")
+        .join(".")
+        .join("src.img");
+    for (s, d, what) in [
+        (&src, &via_missing, "dst through missing dir"),
+        (&via_missing, &src, "src through missing dir"),
+        (&src, &deeper, "dst through two missing dirs"),
+    ] {
+        assert_same_file_refused(s, d, ImageFormat::Raw, what);
+        assert_same_file_refused(s, d, ImageFormat::Qcow2, what);
+        assert_eq!(std::fs::read(&src).unwrap(), before, "{what}: source untouched");
+    }
+    assert!(!dir.path().join("no_such_dir").exists());
+    assert!(!dir.path().join("a").exists());
+}

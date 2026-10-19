@@ -13,7 +13,7 @@ mod vmdk;
 pub use format::ImageFormat;
 pub use rescue::{copy_simple, rescue, BlockStatus, MapFile, MapStats, RescueOpts, RescueStats};
 use pm_core::{BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Options for [`create`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +68,7 @@ pub fn identify(path: &Path) -> Result<ImageFormat> {
 /// path, or through a flat VMDK extent on either side — is refused with
 /// [`Error::Invalid`] before anything is created. On cancellation the partial
 /// destination is left in place.
+/// Known limitation: hard links (and aliases canonicalization cannot see) are not detected.
 pub fn convert(
     src: &Path,
     dst: &Path,
@@ -110,44 +111,59 @@ pub fn convert(
 /// `<stem>-flat.vmdk`) overlap the files the source is read from (including a flat
 /// descriptor's extent): `create` would truncate the source before it is read.
 fn refuse_same_file(src: &Path, dst: &Path, fmt: ImageFormat) -> Result<()> {
-    let mut sources = vec![src.to_path_buf()];
-    if format::sniff(src)? == ImageFormat::VmdkFlat {
-        sources.push(vmdk::flat_extent_path(src)?);
-    }
-    let mut targets = vec![dst.to_path_buf()];
+    let mut targets = vec![file_identity(dst)?];
     if fmt == ImageFormat::VmdkFlat {
-        targets.push(vmdk::flat_sibling(dst)?);
+        targets.push(file_identity(&vmdk::flat_sibling(dst)?)?);
     }
-    let sources: Vec<PathBuf> = sources.iter().map(|p| file_identity(p)).collect();
-    for t in targets.iter().map(|p| file_identity(p)) {
-        if sources.iter().any(|s| same_path(s, &t)) {
+    let clash = |source: &Path| -> Result<()> {
+        if targets.iter().any(|t| same_path(source, t)) {
             return Err(Error::Invalid(
                 "destination is the same file as the source".into(),
             ));
         }
+        Ok(())
+    };
+    // Compare the source path before reading it, then its flat extent if any.
+    clash(&file_identity(src)?)?;
+    if format::sniff(src)? == ImageFormat::VmdkFlat {
+        clash(&file_identity(&vmdk::flat_extent_path(src)?)?)?;
     }
     Ok(())
 }
 
-/// Canonical form of a path that may not exist yet: the canonical file if it exists,
-/// else the canonical parent directory joined with the file name.
-fn file_identity(p: &Path) -> PathBuf {
-    if let Ok(c) = std::fs::canonicalize(p) {
-        return c;
-    }
-    match (p.parent(), p.file_name()) {
-        (Some(parent), Some(name)) => {
-            let parent = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            std::fs::canonicalize(parent)
-                .map(|c| c.join(name))
-                .unwrap_or_else(|_| p.to_path_buf())
+/// Canonical identity of a path that may not exist yet. The longest existing ancestor
+/// is canonicalized and the remaining components are applied lexically (`.` dropped,
+/// `..` pops, even past that ancestor), which is how Windows itself resolves `..`.
+/// Fails closed: a path that exists but cannot be canonicalized is an error rather
+/// than being compared by its raw spelling.
+fn file_identity(p: &Path) -> Result<PathBuf> {
+    let fail = || Error::Invalid(format!("cannot resolve path {}", p.display()));
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|_| fail())?.join(p)
+    };
+    let comps: Vec<Component> = abs.components().collect();
+    for k in (1..=comps.len()).rev() {
+        let prefix: PathBuf = comps[..k].iter().collect();
+        if matches!(prefix.try_exists(), Ok(false)) {
+            continue;
         }
-        _ => p.to_path_buf(),
+        // exists (or existence is unknowable): it must canonicalize
+        let mut base = std::fs::canonicalize(&prefix).map_err(|_| fail())?;
+        for c in &comps[k..] {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    base.pop();
+                }
+                Component::Normal(name) => base.push(name),
+                Component::RootDir | Component::Prefix(_) => return Err(fail()),
+            }
+        }
+        return Ok(base);
     }
+    Err(fail())
 }
 
 /// Path equality; case-insensitive on Windows, where file names are.
@@ -156,5 +172,32 @@ fn same_path(a: &Path, b: &Path) -> bool {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
         a == b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_identity_resolves_missing_ancestors_lexically() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(dir.path().join("f.img"), b"x").unwrap();
+        // existing file
+        assert_eq!(file_identity(&dir.path().join("f.img")).unwrap(), base.join("f.img"));
+        // missing directories, `.` and `..` applied after the existing ancestor
+        let p = dir.path().join("a").join("b").join("..").join(".").join("c");
+        assert_eq!(file_identity(&p).unwrap(), base.join("a").join("c"));
+        let p = dir.path().join("missing").join("..").join("f.img");
+        assert_eq!(file_identity(&p).unwrap(), base.join("f.img"));
+        // `..` popping past the existing ancestor applies to the ancestor itself
+        let p = dir.path().join("m").join("..").join("..").join("z");
+        assert_eq!(file_identity(&p).unwrap(), base.parent().unwrap().join("z"));
+        // relative paths resolve against the current directory
+        assert_eq!(
+            file_identity(Path::new("Cargo.toml")).unwrap(),
+            std::fs::canonicalize("Cargo.toml").unwrap()
+        );
     }
 }
