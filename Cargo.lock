@@ -145,6 +145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-fs"
+version = "0.1.0"
+dependencies = [
+ "pm-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pm-parttable"
 version = "0.1.0"
 dependencies = [
