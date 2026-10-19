@@ -8,6 +8,9 @@
 //! unaligned requests with read-modify-write. The benchmark itself uses multiples of 4096, which
 //! take the fast path.
 //!
+//! The file is only sized, not pre-filled: its valid data length starts at 0 and NTFS zero-fills
+//! lazily, so `pm_analyze::benchmark` writes the whole file once, untimed, before measuring.
+//!
 //! The `pm_analyze::BenchTarget` trait lives in `pm-analyze` (which depends on this crate), so
 //! the trait impl for [`FileBenchTarget`] is provided there.
 

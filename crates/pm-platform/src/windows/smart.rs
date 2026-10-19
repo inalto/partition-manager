@@ -248,52 +248,45 @@ fn query_ata(h: &Handle, drive: u32) -> std::result::Result<SmartData, Code> {
     Ok(parse_ata_smart(&attrs, thresholds.as_deref()))
 }
 
-/// Open `path` with the first access mask that works; the last error if none does.
-fn open_any(path: &str, accesses: &[u32]) -> std::result::Result<Handle, Code> {
-    let mut last = 0;
-    for &a in accesses {
-        match ioctl::open(path, a) {
-            Ok(h) => return Ok(h),
-            Err(c) => last = c,
+/// Try `query` on a fresh handle for each access mask in turn (a handle that opens may still be
+/// refused the IOCTL, e.g. without write access), returning the first success or the error codes.
+fn query_with<F>(path: &str, accesses: &[u32], query: F) -> std::result::Result<SmartData, Vec<Code>>
+where
+    F: Fn(&Handle) -> std::result::Result<SmartData, Code>,
+{
+    let mut codes = Vec::new();
+    for &access in accesses {
+        match ioctl::open(path, access) {
+            Ok(h) => match query(&h) {
+                Ok(d) => return Ok(d),
+                Err(c) => codes.push(c),
+            },
+            Err(c) => codes.push(c),
         }
     }
-    Err(last)
+    Err(codes)
 }
 
-/// SMART data of `PhysicalDrive<disk>`: NVMe health log first, then ATA SMART. `Ok(None)` when
-/// the drive exposes neither (or access was denied; the codes are logged), `Err` when the disk
-/// does not exist.
+/// SMART data of `PhysicalDrive<disk>`: NVMe health log first, then ATA SMART. Each query is
+/// retried with every access mask (query-only, read, read+write). `Ok(None)` when the drive
+/// exposes neither (or access was denied; the codes are logged), `Err` when the disk does not
+/// exist.
 pub fn smart(disk: u32) -> Result<Option<SmartData>> {
     let path = disk_path(disk);
-    let nvme_handle = open_any(&path, &[0, GENERIC_READ, GENERIC_READ | GENERIC_WRITE]);
-    match &nvme_handle {
-        Err(c) if *c == ERROR_FILE_NOT_FOUND || *c == ERROR_PATH_NOT_FOUND => {
-            return Err(platform_error(*c, &format!("open {path}")));
-        }
-        _ => {}
-    }
-    let mut nvme_err = None;
-    if let Ok(h) = &nvme_handle {
-        match query_nvme(h) {
-            Ok(d) => return Ok(Some(d)),
-            Err(c) => nvme_err = Some(c),
+    if let Err(c) = ioctl::open(&path, 0) {
+        if c == ERROR_FILE_NOT_FOUND || c == ERROR_PATH_NOT_FOUND {
+            return Err(platform_error(c, &format!("open {path}")));
         }
     }
-    let ata_err = match open_any(&path, &[GENERIC_READ | GENERIC_WRITE, GENERIC_READ]) {
-        Ok(h) => match query_ata(&h, disk) {
-            Ok(d) => return Ok(Some(d)),
-            Err(c) => c,
-        },
-        Err(c) => c,
+    let nvme = match query_with(&path, &[0, GENERIC_READ, GENERIC_READ | GENERIC_WRITE], query_nvme) {
+        Ok(d) => return Ok(Some(d)),
+        Err(codes) => codes,
     };
-    log::info!(
-        "no SMART data for {path}: NVMe query {}, ATA query code {ata_err}",
-        match (&nvme_handle, nvme_err) {
-            (Err(c), _) => format!("open failed (code {c})"),
-            (Ok(_), Some(c)) => format!("code {c}"),
-            (Ok(_), None) => "not attempted".to_string(),
-        }
-    );
+    let ata = match query_with(&path, &[GENERIC_READ | GENERIC_WRITE, GENERIC_READ], |h| query_ata(h, disk)) {
+        Ok(d) => return Ok(Some(d)),
+        Err(codes) => codes,
+    };
+    log::info!("no SMART data for {path}: NVMe query codes {nvme:?}, ATA query codes {ata:?}");
     Ok(None)
 }
 

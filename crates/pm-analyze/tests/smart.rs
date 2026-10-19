@@ -58,3 +58,13 @@ fn smart_summary_thresholds() {
     assert_eq!(row(&rows, "Health").2, Health::Warn);
     assert!(rows.iter().all(|r| r.0 != "Temperature"));
 }
+
+#[test]
+fn smart_summary_does_not_repeat_power_on_hours() {
+    let mut nvme = attr(128, 4567);
+    nvme.name = "Power-on hours".into();
+    let d = SmartData { power_on_hours: Some(4567), attrs: vec![nvme, attr(5, 0)], ..Default::default() };
+    let rows = smart_summary(&d);
+    assert_eq!(rows.iter().filter(|r| r.0 == "Power-on hours").count(), 1);
+    assert!(rows.iter().any(|r| r.0 == "attr5"));
+}

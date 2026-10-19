@@ -58,7 +58,8 @@ pub fn smart_summary(d: &SmartData) -> Vec<(String, String, Health)> {
         rows.push(("Percentage used".into(), format!("{p} %"), h));
     }
     for a in &d.attrs {
-        if (a.id == 9 && d.power_on_hours.is_some()) || (a.id == 194 && d.temperature_c.is_some()) {
+        let dup_hours = d.power_on_hours.is_some() && (a.id == 9 || a.name == "Power-on hours");
+        if dup_hours || (a.id == 194 && d.temperature_c.is_some()) {
             continue;
         }
         let h = if is_sector_error_attr(a.id) {

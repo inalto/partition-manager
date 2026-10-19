@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 /// Transfer sizes are rounded up to this (the physical sector size of unbuffered file I/O).
 const IO_ALIGN: u64 = 4096;
+/// Size of the writes that pre-fill a scratch device before the timed passes.
+const WARMUP_CHUNK: u64 = 1 << 20;
 /// Sanity bound for one request.
 const MAX_TRANSFER: u64 = 256 << 20;
 
@@ -188,6 +190,71 @@ fn run_pass(
     }
 }
 
+/// Untimed sequential pre-fill of every device in `WARMUP_CHUNK` writes. A freshly sized scratch
+/// file has no valid data yet, and the file system would otherwise zero-fill it inside the timed
+/// write pass (e.g. up to the first random offset), biasing write throughput downwards. It also
+/// gives the read pass real data. The warm-up is not part of any reported figure.
+fn warm_up(devs: &mut [Box<dyn BlockDevice>], progress: &dyn ProgressSink, size: u64, cancel: &CancelToken) -> Result<()> {
+    let total: u64 = devs.iter().map(|d| d.len()).sum();
+    let phase = format!("Benchmark {} warm-up", format_size(size));
+    let tracker = Mutex::new(ProgressTracker::new(progress, &phase, total));
+    let abort = AtomicBool::new(false);
+    let results: Vec<Result<()>> = std::thread::scope(|s| {
+        let handles: Vec<_> = devs
+            .iter_mut()
+            .enumerate()
+            .map(|(i, dev)| {
+                let (tracker, abort) = (&tracker, &abort);
+                s.spawn(move || {
+                    let r = (|| {
+                        let len = dev.len();
+                        let mut rng = XorShift64::new(0xD1B5_4A32_D192_ED03u64.wrapping_mul(i as u64 + 1));
+                        let mut buf = vec![0u8; WARMUP_CHUNK.min(len) as usize];
+                        for chunk in buf.chunks_mut(8) {
+                            let r = rng.next().to_le_bytes();
+                            chunk.copy_from_slice(&r[..chunk.len()]);
+                        }
+                        let mut pos = 0u64;
+                        while pos < len {
+                            if abort.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            cancel.check()?;
+                            let n = (buf.len() as u64).min(len - pos) as usize;
+                            dev.write_at(pos, &buf[..n])?;
+                            pos += n as u64;
+                            lock(tracker).add(n as u64);
+                        }
+                        dev.flush()
+                    })();
+                    if r.is_err() {
+                        abort.store(true, Ordering::SeqCst);
+                    }
+                    r
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    lock(&tracker).finish();
+    let mut cancelled = false;
+    for r in results {
+        match r {
+            Err(Error::Cancelled) => cancelled = true,
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
+    }
+    if cancelled {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 fn cooldown(secs: u32, cancel: &CancelToken) -> Result<()> {
     let end = Instant::now() + Duration::from_secs(secs as u64);
     loop {
@@ -206,8 +273,10 @@ fn cooldown(secs: u32, cancel: &CancelToken) -> Result<()> {
 /// The `BlockDevice` API is synchronous, so the effective concurrency is `threads`;
 /// `queue_depth` is the number of requests a worker issues back to back between cancellation
 /// and progress checks. Sequential mode walks consecutive offsets (wrapping inside the worker's
-/// region); random mode picks size-aligned offsets from a xorshift64 generator. Write timing
-/// includes the final flush. MB/s is 1e6 bytes per second.
+/// region); random mode picks size-aligned offsets from a xorshift64 generator. Before the timed
+/// passes each device gets an untimed sequential warm-up write of its whole region (so that
+/// lazily allocated or zero-filled files do not distort the write numbers); warm-up I/O is not
+/// counted in the results. Write timing includes the final flush. MB/s is 1e6 bytes per second.
 pub fn benchmark(
     target: &dyn BenchTarget,
     opts: &BenchOpts,
@@ -243,6 +312,8 @@ pub fn benchmark(
         let mut devs = (0..workers)
             .map(|_| target.open_for_bench(slots * size))
             .collect::<Result<Vec<_>>>()?;
+
+        warm_up(&mut devs, progress, size, cancel)?;
 
         let mut secs = [0.0f64; 2];
         for (pass_no, write) in [true, false].into_iter().enumerate() {

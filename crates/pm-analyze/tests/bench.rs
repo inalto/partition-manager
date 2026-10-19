@@ -6,12 +6,28 @@ use std::sync::{Arc, Mutex};
 /// Bench target on `MemDevice`s that counts the I/O performed.
 struct MemTarget {
     ops: Arc<AtomicU64>,
+    warm: Arc<AtomicU64>,
     opened: Arc<AtomicU64>,
+    slow_bulk_write: bool,
 }
 
+/// Counts requests of at most 8 KiB (the benchmark's transfers); larger writes are the untimed
+/// warm-up and are counted separately, as are the bytes they carry.
 struct Counting {
     inner: MemDevice,
     ops: Arc<AtomicU64>,
+    warm: Arc<AtomicU64>,
+    slow_bulk_write: bool,
+}
+
+impl Counting {
+    fn note(&self, len: usize) {
+        if len <= 8192 {
+            self.ops.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.warm.fetch_add(len as u64, Ordering::SeqCst);
+        }
+    }
 }
 
 impl BlockDevice for Counting {
@@ -24,13 +40,16 @@ impl BlockDevice for Counting {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
         assert_eq!(offset % 4096, 0);
         assert_eq!(buf.len() % 4096, 0);
-        self.ops.fetch_add(1, Ordering::SeqCst);
+        self.note(buf.len());
         self.inner.read_at(offset, buf)
     }
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
         assert_eq!(offset % 4096, 0);
         assert_eq!(buf.len() % 4096, 0);
-        self.ops.fetch_add(1, Ordering::SeqCst);
+        self.note(buf.len());
+        if self.slow_bulk_write && buf.len() > 8192 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         self.inner.write_at(offset, buf)
     }
     fn flush(&mut self) -> Result<()> {
@@ -44,12 +63,22 @@ impl BlockDevice for Counting {
 impl BenchTarget for MemTarget {
     fn open_for_bench(&self, len: u64) -> Result<Box<dyn BlockDevice>> {
         self.opened.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(Counting { inner: MemDevice::new(len), ops: self.ops.clone() }))
+        Ok(Box::new(Counting {
+            inner: MemDevice::new(len),
+            ops: self.ops.clone(),
+            warm: self.warm.clone(),
+            slow_bulk_write: self.slow_bulk_write,
+        }))
     }
 }
 
 fn target() -> MemTarget {
-    MemTarget { ops: Arc::new(AtomicU64::new(0)), opened: Arc::new(AtomicU64::new(0)) }
+    MemTarget {
+        ops: Arc::new(AtomicU64::new(0)),
+        warm: Arc::new(AtomicU64::new(0)),
+        opened: Arc::new(AtomicU64::new(0)),
+        slow_bulk_write: false,
+    }
 }
 
 fn opts(mode: BenchMode) -> BenchOpts {
@@ -82,6 +111,21 @@ fn benchmark_runs_on_mem_device_returns_points() {
         // one device per worker per size
         assert_eq!(t.opened.load(Ordering::SeqCst), 2 * 2);
     }
+}
+
+#[test]
+fn warm_up_writes_each_device_once_and_is_not_timed_or_counted() {
+    let mut t = target();
+    t.slow_bulk_write = true; // every warm-up write takes 100 ms
+    let mut o = opts(BenchMode::Random);
+    o.transfer_sizes = vec![4096];
+    let pts = benchmark(&t, &o, &NullProgress, &CancelToken::new()).unwrap();
+    // the whole of both devices (256 KiB) was pre-filled with large writes ...
+    assert_eq!(t.warm.load(Ordering::SeqCst), 256 * 1024);
+    // ... which are not among the counted transfers (64 writes + 64 reads) ...
+    assert_eq!(t.ops.load(Ordering::SeqCst), 128);
+    // ... nor in the timing: 64 ops would take >= 0.1 s (<= 640 IOPS) if the 100 ms warm-up were timed
+    assert!(pts[0].write_iops > 5_000.0, "warm-up leaked into timing: {:?}", pts[0]);
 }
 
 #[test]
