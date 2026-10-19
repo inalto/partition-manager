@@ -59,6 +59,8 @@ pub fn open(mut dev: Box<dyn BlockDevice>) -> Result<Box<dyn FileSystem>> {
     match probe.kind {
         FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 => Ok(Box::new(crate::fat::FatFs::open(dev, 0)?)),
         FsKind::Ntfs => Ok(Box::new(crate::ntfs::Ntfs::open(dev)?)),
+        FsKind::ExFat => Ok(Box::new(crate::exfat::ExFat::open(dev)?)),
+        FsKind::Ext2 | FsKind::Ext3 | FsKind::Ext4 => Ok(Box::new(crate::ext::Ext::open(dev)?)),
         k => Err(Error::Unsupported(format!("no reader for {}", k.display_name()))),
     }
 }

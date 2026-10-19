@@ -354,11 +354,11 @@ fn fat_chain_loop_is_reported() {
 #[test]
 fn open_rejects_unknown_and_unsupported() {
     assert!(matches!(open(Box::new(MemDevice::new(1 << 20))), Err(Error::Unsupported(_))));
-    let mut ext = MemDevice::new(1 << 20);
-    ext.write_at(0x400 + 0x38, &0xEF53u16.to_le_bytes()).unwrap();
-    ext.write_at(0x400 + 0x18, &2u32.to_le_bytes()).unwrap();
-    ext.write_at(0x400 + 4, &256u32.to_le_bytes()).unwrap();
-    assert!(matches!(open(Box::new(ext)), Err(Error::Unsupported(_))));
+    // XFS is recognised but has no reader (ext now does)
+    let mut xfs = MemDevice::new(1 << 20);
+    xfs.write_at(0, b"XFSB").unwrap();
+    xfs.write_at(4, &4096u32.to_be_bytes()).unwrap();
+    assert!(matches!(open(Box::new(xfs)), Err(Error::Unsupported(_))));
 }
 
 #[test]

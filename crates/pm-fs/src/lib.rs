@@ -3,6 +3,8 @@
 
 pub mod bitmap;
 pub mod detect;
+pub mod exfat;
+pub mod ext;
 pub mod fat;
 pub mod ntfs;
 pub mod traits;
