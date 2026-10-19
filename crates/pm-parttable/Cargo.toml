@@ -3,9 +3,10 @@ name = "pm-parttable"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Partition Manager partition tables: table model and MBR (GPT is added separately)"
+description = "Partition Manager partition tables: table model, MBR, GPT, conversion and lost-partition search"
 
 [dependencies]
+crc32fast.workspace = true
 pm-core = { path = "../pm-core" }
 serde.workspace = true
 uuid.workspace = true

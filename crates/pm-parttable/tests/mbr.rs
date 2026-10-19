@@ -315,7 +315,8 @@ fn protective_mbr_is_detected_and_read_table_defers_to_gpt() {
     put_sig(&mut img);
     assert!(is_protective_mbr(&img[..512]));
     let mut dev = MemDevice::from_vec(img);
-    assert!(matches!(read_table(&mut dev), Err(Error::Unsupported(_))));
+    // Protective MBR but no GPT behind it: the GPT parser reports it.
+    assert!(matches!(read_table(&mut dev), Err(Error::Parse(_))));
 
     // A normal MBR is not protective, nor is one without a signature.
     assert!(!is_protective_mbr(image_with_four_primaries().as_slice()));
@@ -336,13 +337,43 @@ fn read_table_dispatches_to_mbr() {
 }
 
 #[test]
-fn write_table_dispatch_errors() {
+fn write_table_dispatch() {
     let mut dev = MemDevice::new(DISK);
     let none = Table::empty(TableKind::None, DISK, 512);
     assert!(matches!(write_table(&mut dev, &none), Err(Error::Invalid(_))));
-    let gpt = Table::empty(TableKind::Gpt, DISK, 512);
-    assert!(matches!(write_table(&mut dev, &gpt), Err(Error::Unsupported(_))));
     assert!(dev.as_slice().iter().all(|&b| b == 0), "nothing written on error");
+    // GPT goes to the GPT writer.
+    let gpt = Table::empty(TableKind::Gpt, DISK, 512);
+    write_table(&mut dev, &gpt).unwrap();
+    assert!(is_protective_mbr(&dev.as_slice()[..512]));
+    assert_eq!(&dev.as_slice()[512..520], b"EFI PART");
+}
+
+#[test]
+fn mbr_parse_stops_at_ebr_link_past_device() {
+    let mut dev = image_with_extended_chain();
+    // Point EBR 0's link far beyond the 64 MiB device: the chain ends, logical 1 is kept.
+    let e0 = 20480 * 512;
+    let mut ebr0 = vec![0u8; 512];
+    dev.read_at(e0, &mut ebr0).unwrap();
+    put_entry(&mut ebr0, 1, 0x00, 0x05, 4_000_000, 10240);
+    dev.write_at(e0, &ebr0).unwrap();
+    let t = parse_mbr(&mut dev).unwrap();
+    assert_eq!(t.entries.len(), 3);
+    assert!(t.entries[2].logical);
+    assert_eq!(t.entries[2].number, 5);
+}
+
+#[test]
+fn write_mbr_rejects_short_bootcode() {
+    let mut t = Table::empty(TableKind::Mbr, DISK, 512);
+    t.entries = vec![entry(1, MIB, 4 * MIB, 0x07, false)];
+    t.bootcode = vec![0xAA; 100];
+    let mut dev = MemDevice::new(DISK);
+    assert!(matches!(write_mbr(&mut dev, &t), Err(Error::Invalid(_))));
+    t.bootcode = Vec::new();
+    assert!(matches!(write_mbr(&mut dev, &t), Err(Error::Invalid(_))));
+    assert!(dev.as_slice().iter().all(|&b| b == 0));
 }
 
 #[test]
@@ -484,10 +515,10 @@ fn free_ranges_mbr_with_extended() {
 fn free_ranges_gpt_uses_usable_bounds() {
     let mut t = Table::empty(TableKind::Gpt, DISK, 512);
     assert_eq!(t.gpt_first_usable, MIB);
-    assert_eq!(t.gpt_last_usable, DISK - 34 * 512);
+    assert_eq!(t.gpt_last_usable, DISK - 33 * 512);
     t.entries = vec![entry(1, MIB, 10 * MIB, 0x07, false)];
     t.entries[0].ptype = PartitionType::Gpt(pm_core::gpt_types::BASIC_DATA);
-    assert_eq!(t.free_ranges(1), vec![(11 * MIB, DISK - 34 * 512 - 11 * MIB)]);
+    assert_eq!(t.free_ranges(1), vec![(11 * MIB, DISK - 33 * 512 - 11 * MIB)]);
 }
 
 #[test]
@@ -504,7 +535,7 @@ fn table_empty_defaults() {
     let g = Table::empty(TableKind::Gpt, DISK, 4096);
     assert!(g.disk_guid.is_some());
     assert_eq!(g.gpt_first_usable, MIB);
-    assert_eq!(g.gpt_last_usable, DISK - 34 * 4096);
+    assert_eq!(g.gpt_last_usable, DISK - 33 * 4096);
 
     let n = Table::empty(TableKind::None, DISK, 512);
     assert_eq!(n.kind, TableKind::None);

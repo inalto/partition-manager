@@ -86,7 +86,8 @@ fn read_sector(dev: &mut dyn BlockDevice, offset: u64) -> Result<Vec<u8>> {
 /// Parse the MBR at sector 0 and follow the EBR chain of the first extended partition.
 ///
 /// Primaries get numbers 1..=4 by slot; logicals continue at 5 in chain order. The chain stops at
-/// a missing EBR signature, an empty link entry, a repeated EBR offset or after 128 logicals.
+/// a missing EBR signature, an empty link entry, a link past the end of the device, a repeated
+/// EBR offset or after 128 logicals.
 pub fn parse_mbr(dev: &mut dyn BlockDevice) -> Result<Table> {
     let sector_size = dev.sector_size();
     let ss = sector_size as u64;
@@ -132,9 +133,8 @@ fn parse_ebr_chain(dev: &mut dyn BlockDevice, t: &mut Table, ext_start: u64, ss:
     let mut number = 5u32;
     while count < MAX_LOGICALS && seen.insert(ebr_off) {
         if ebr_off.checked_add(ss).map_or(true, |end| end > dev.len()) {
-            return Err(Error::Parse(format!(
-                "EBR at byte offset {ebr_off} lies beyond the end of the device"
-            )));
+            // A link pointing past the device ends the chain; keep the logicals found so far.
+            break;
         }
         let s = read_sector(dev, ebr_off)?;
         if !has_signature(&s) {
@@ -213,9 +213,9 @@ pub fn write_mbr(dev: &mut dyn BlockDevice, t: &Table) -> Result<()> {
             dev.sector_size()
         )));
     }
-    if t.bootcode.len() > BOOTCODE_LEN {
+    if t.bootcode.len() != BOOTCODE_LEN {
         return Err(Error::Invalid(format!(
-            "boot code is {} bytes, at most {BOOTCODE_LEN} allowed",
+            "boot code is {} bytes, expected exactly {BOOTCODE_LEN}",
             t.bootcode.len()
         )));
     }
@@ -313,8 +313,7 @@ pub fn write_mbr(dev: &mut dyn BlockDevice, t: &Table) -> Result<()> {
     }
 
     // Sector 0 last.
-    s0[..BOOTCODE_LEN].fill(0);
-    s0[..t.bootcode.len()].copy_from_slice(&t.bootcode);
+    s0[..BOOTCODE_LEN].copy_from_slice(&t.bootcode);
     wr_u32(&mut s0, SIGNATURE_OFF, t.mbr_signature);
     s0[ENTRIES_OFF..BOOT_SIG_OFF].fill(0);
     for (i, slot) in slots.iter().enumerate() {

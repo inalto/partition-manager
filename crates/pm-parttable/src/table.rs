@@ -1,15 +1,19 @@
 //! Partition table model shared by the MBR and GPT back ends.
 
-use crate::mbr;
-use pm_core::units::{align_up, MIB};
+use crate::{gpt, mbr};
+use pm_core::units::{align_down, align_up, MIB};
 use pm_core::{
     BlockDevice, DiskInfo, Error, PartFlags, PartitionInfo, PartitionType, Result, TableKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Sectors reserved at the start (header + entry array) and at the end (backup) of a GPT disk.
-const GPT_RESERVED_SECTORS: u64 = 34;
+/// Sectors reserved at the start (protective MBR, header, entry array) of a GPT disk.
+const GPT_HEAD_SECTORS: u64 = 34;
+/// Sectors reserved at the end (backup entry array + header) of a GPT disk.
+const GPT_TAIL_SECTORS: u64 = 33;
+/// Most partitions a GPT written by this crate can hold.
+const GPT_MAX_ENTRIES: usize = 128;
 /// Size of the boot code area at the start of an MBR.
 const MBR_BOOTCODE_LEN: usize = 440;
 
@@ -116,7 +120,9 @@ fn check_no_overlap(mut items: Vec<(u64, u64, u32)>, what: &str) -> Result<()> {
 
 impl Table {
     /// A table with no partitions. MBR gets a random non-zero signature and zeroed boot code;
-    /// GPT gets a random disk GUID and default usable bounds (the GPT writer may refine them).
+    /// GPT gets a random disk GUID, zeroed boot code and usable bounds of
+    /// `[align_up(max(34 sectors, 1 MiB), 1 MiB), disk_len - 33 sectors)` (the end rounded down
+    /// to a whole sector).
     pub fn empty(kind: TableKind, disk_len: u64, sector_size: u32) -> Table {
         let ss = sector_size as u64;
         let mut t = Table {
@@ -137,8 +143,10 @@ impl Table {
             }
             TableKind::Gpt => {
                 t.disk_guid = Some(Uuid::new_v4());
-                t.gpt_first_usable = align_up(GPT_RESERVED_SECTORS * ss, MIB);
-                t.gpt_last_usable = disk_len.saturating_sub(GPT_RESERVED_SECTORS * ss);
+                t.bootcode = vec![0; MBR_BOOTCODE_LEN];
+                t.gpt_first_usable = align_up((GPT_HEAD_SECTORS * ss).max(MIB), MIB);
+                t.gpt_last_usable =
+                    align_down(disk_len.saturating_sub(GPT_TAIL_SECTORS * ss), ss.max(1));
             }
             TableKind::None | TableKind::Unknown => {}
         }
@@ -253,6 +261,26 @@ impl Table {
                 if self.entries.iter().any(|e| e.logical) {
                     return invalid("GPT has no logical partitions".into());
                 }
+                if self.entries.len() > GPT_MAX_ENTRIES {
+                    return invalid(format!(
+                        "GPT supports at most {GPT_MAX_ENTRIES} partitions, found {}",
+                        self.entries.len()
+                    ));
+                }
+                for e in &self.entries {
+                    if e.number == 0 || e.number as usize > GPT_MAX_ENTRIES {
+                        return invalid(format!(
+                            "GPT partition number {} is outside 1..={GPT_MAX_ENTRIES}",
+                            e.number
+                        ));
+                    }
+                    if e.start < self.gpt_first_usable || e.end() > self.gpt_last_usable {
+                        return invalid(format!(
+                            "partition {} lies outside the GPT usable area",
+                            e.number
+                        ));
+                    }
+                }
                 check_no_overlap(self.entries.iter().map(span).collect(), "partition")?;
             }
             TableKind::None | TableKind::Unknown => {
@@ -281,20 +309,28 @@ impl Table {
         let partitions = self
             .entries
             .iter()
-            .map(|e| PartitionInfo {
-                number: e.number,
-                start: e.start,
-                len: e.len,
-                ptype: Some(e.ptype),
-                guid: e.guid,
-                name: e.name.clone(),
-                // GPT attribute bits (required/hidden/...) are mapped by the GPT back end.
-                flags: PartFlags {
-                    active: self.kind == TableKind::Mbr && e.attrs & 1 != 0,
+            .map(|e| {
+                let gpt = self.kind == TableKind::Gpt;
+                let bit = |n: u32| gpt && e.attrs >> n & 1 != 0;
+                PartitionInfo {
+                    number: e.number,
+                    start: e.start,
+                    len: e.len,
+                    ptype: Some(e.ptype),
+                    guid: e.guid,
+                    name: e.name.clone(),
+                    flags: PartFlags {
+                        active: self.kind == TableKind::Mbr && e.attrs & 1 != 0,
+                        // GPT attributes: bit 0 required, 60 read-only, 62 hidden, 63 no drive letter.
+                        required: bit(0),
+                        read_only: bit(60),
+                        hidden: bit(62),
+                        no_letter: bit(63),
+                        ..Default::default()
+                    },
+                    logical: e.logical,
                     ..Default::default()
-                },
-                logical: e.logical,
-                ..Default::default()
+                }
             })
             .collect();
         DiskInfo {
@@ -322,19 +358,21 @@ impl Table {
 
 /// Read the partition table of `dev`.
 ///
-/// A device whose first sector lacks the 0x55AA signature has no table (`TableKind::None`).
+/// A protective MBR (or a missing MBR signature with a valid GPT header at LBA 1, as left by
+/// tools that wipe only sector 0) selects the GPT parser; otherwise a first sector without the
+/// 0x55AA signature means no table (`TableKind::None`).
 pub fn read_table(dev: &mut dyn BlockDevice) -> Result<Table> {
-    // Task 4: dispatch to gpt::parse_gpt here when a valid GPT header is found at LBA 1
-    // (or its backup at the end of the disk), before falling back to the MBR logic below.
     let ss = dev.sector_size();
     let mut sector = vec![0u8; ss as usize];
     dev.read_at(0, &mut sector)?;
     if !mbr::has_signature(&sector) {
+        if gpt::has_valid_primary_header(dev) {
+            return gpt::parse_gpt(dev);
+        }
         return Ok(Table::empty(TableKind::None, dev.len(), ss));
     }
     if mbr::is_protective_mbr(&sector) {
-        // Task 4: dispatch to gpt::parse_gpt
-        return Err(Error::Unsupported("GPT".into()));
+        return gpt::parse_gpt(dev);
     }
     mbr::parse_mbr(dev)
 }
@@ -343,8 +381,7 @@ pub fn read_table(dev: &mut dyn BlockDevice) -> Result<Table> {
 pub fn write_table(dev: &mut dyn BlockDevice, t: &Table) -> Result<()> {
     match t.kind {
         TableKind::Mbr => mbr::write_mbr(dev, t),
-        // Task 4: dispatch to gpt::write_gpt
-        TableKind::Gpt => Err(Error::Unsupported("GPT".into())),
+        TableKind::Gpt => gpt::write_gpt(dev, t),
         TableKind::None | TableKind::Unknown => {
             Err(Error::Invalid("cannot write a table of kind None/Unknown".into()))
         }
