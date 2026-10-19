@@ -91,6 +91,8 @@ pub enum Cmd {
     CloseProperties,
     SetTheme(Theme),
     SetDryRun(bool),
+    /// Show the folder of the application log in the file manager.
+    OpenLogFolder,
     DismissBanner,
     /// Queue the operations of the open wizard; it closes on success and shows the error on
     /// its summary page otherwise.
@@ -470,6 +472,13 @@ impl AppState {
             Cmd::CloseProperties => self.properties = None,
             Cmd::SetTheme(t) => self.theme = t,
             Cmd::SetDryRun(d) => self.dry_run = d,
+            Cmd::OpenLogFolder => match crate::logging::log_dir() {
+                Some(dir) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    explore(self, &dir.display().to_string());
+                }
+                None => self.toast("The log folder is unknown (LOCALAPPDATA is not set)"),
+            },
             Cmd::DismissBanner => self.banner = None,
             Cmd::FinishWizard(ops) => match self.try_push_ops(ops) {
                 Ok(()) => self.wizard = None,

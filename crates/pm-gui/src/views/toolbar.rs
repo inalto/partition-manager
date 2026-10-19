@@ -65,6 +65,15 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
             {
                 out.push(Cmd::SetDryRun(dry));
             }
+            ui.separator();
+            if ui
+                .button("Open log folder")
+                .on_hover_text(r"%LOCALAPPDATA%\PartitionManager (partition-manager.log)")
+                .clicked()
+            {
+                out.push(Cmd::OpenLogFolder);
+                ui.close_menu();
+            }
         });
     });
 }

@@ -13,6 +13,7 @@ pub mod dialogs;
 pub mod format_util;
 pub mod items;
 pub mod jobs;
+pub mod logging;
 pub mod main_window;
 pub mod selection;
 pub mod theme;

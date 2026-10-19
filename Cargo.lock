@@ -2707,6 +2707,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "embed-resource",
+ "env_logger",
  "log",
  "pm-analyze",
  "pm-core",

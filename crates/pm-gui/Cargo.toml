@@ -26,6 +26,7 @@ pm-analyze = { path = "../pm-analyze" }
 eframe.workspace = true
 egui_extras.workspace = true
 log.workspace = true
+env_logger.workspace = true
 
 [build-dependencies]
 embed-resource.workspace = true

@@ -15,6 +15,7 @@ fn attach_console() {
 }
 
 fn main() -> ExitCode {
+    pm_gui::logging::init();
     let args = match args::parse(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
