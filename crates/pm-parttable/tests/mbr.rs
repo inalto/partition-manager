@@ -469,7 +469,8 @@ fn write_mbr_rejects_logical_too_close_to_extended_start() {
         entry(1, 10 * MIB, 20 * MIB, 0x0F, false),
         entry(5, 10 * MIB + 512 * 63, 4 * MIB, 0x07, true), // no room for a 1 MiB EBR gap
     ];
-    t.validate().unwrap();
+    // validate applies the same EBR-room rule as write_mbr
+    assert!(matches!(t.validate(), Err(Error::Invalid(_))));
     let mut dev = MemDevice::new(DISK);
     assert!(matches!(write_mbr(&mut dev, &t), Err(Error::Invalid(_))));
     // second logical too close to the first
@@ -478,6 +479,7 @@ fn write_mbr_rejects_logical_too_close_to_extended_start() {
         entry(5, 11 * MIB, 4 * MIB, 0x07, true),
         entry(6, 15 * MIB + 512, MIB, 0x07, true),
     ];
+    assert!(matches!(t.validate(), Err(Error::Invalid(_))));
     assert!(matches!(write_mbr(&mut dev, &t), Err(Error::Invalid(_))));
     assert!(dev.as_slice().iter().all(|&b| b == 0));
 }
@@ -613,4 +615,34 @@ fn table_serde_roundtrip() {
     let json = serde_json::to_string(&t).unwrap();
     let back: Table = serde_json::from_str(&json).unwrap();
     assert_eq!(back, t);
+}
+
+#[test]
+fn validate_requires_ebr_room() {
+    let mut t = Table::empty(TableKind::Mbr, DISK, 512);
+    // Exactly 1 MiB for every EBR is enough.
+    t.entries = vec![
+        entry(1, 10 * MIB, 20 * MIB, 0x0F, false),
+        entry(5, 11 * MIB, 4 * MIB, 0x07, true),
+        entry(6, 16 * MIB, MIB, 0x07, true),
+    ];
+    t.validate().unwrap();
+    let mut dev = MemDevice::new(DISK);
+    write_mbr(&mut dev, &t).unwrap();
+    // Legacy 63-sector gap after the extended start.
+    t.entries[1].start = 10 * MIB + 63 * 512;
+    match t.validate() {
+        Err(Error::Invalid(m)) => assert!(m.contains("logical partition 5") && m.contains("EBR"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    // Second logical with less than 1 MiB after the first (entries in any order).
+    t.entries = vec![
+        entry(6, 15 * MIB + 512 * 63, MIB, 0x07, true),
+        entry(1, 10 * MIB, 20 * MIB, 0x0F, false),
+        entry(5, 11 * MIB, 4 * MIB, 0x07, true),
+    ];
+    match t.validate() {
+        Err(Error::Invalid(m)) => assert!(m.contains("logical partition 6"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }

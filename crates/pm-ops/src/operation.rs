@@ -330,6 +330,7 @@ impl Operation {
             | WipeDisk { .. }
             | WipePartition { .. }
             | ConvertTable { .. }
+            | AlignPartitions { .. }
             | ClonePartition { .. }
             | CloneDisk { .. }
             | MigrateOs { .. }
@@ -341,7 +342,6 @@ impl Operation {
             | SetType { .. }
             | Mount { .. }
             | Unmount { .. }
-            | AlignPartitions { .. }
             | RebuildMbr { .. }
             | ImageDisk { .. }
             | ImagePartition { .. } => false,

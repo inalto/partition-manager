@@ -256,6 +256,31 @@ impl Table {
                     None => {}
                 }
                 check_no_overlap(logicals.iter().map(|e| span(e)).collect(), "logical partition")?;
+                // Room for the EBRs, as `write_mbr` lays them out: the first EBR sits at the
+                // extended start and every later one 1 MiB before its logical.
+                if let Some(ext) = exts.first() {
+                    let mut sorted = logicals.clone();
+                    sorted.sort_by_key(|e| e.start);
+                    for (i, l) in sorted.iter().enumerate() {
+                        let (floor, after) = match i {
+                            0 => (
+                                ext.start.saturating_add(MIB),
+                                format!("the start of extended partition {}", ext.number),
+                            ),
+                            _ => (
+                                sorted[i - 1].end().saturating_add(MIB),
+                                format!("the end of logical partition {}", sorted[i - 1].number),
+                            ),
+                        };
+                        if l.start < floor {
+                            return invalid(format!(
+                                "logical partition {} must start at least 1 MiB after {after} \
+                                 (room for its EBR)",
+                                l.number
+                            ));
+                        }
+                    }
+                }
             }
             TableKind::Gpt => {
                 if self.entries.iter().any(|e| e.logical) {

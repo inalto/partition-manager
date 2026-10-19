@@ -1,9 +1,10 @@
 //! Target layout planning for disk clones and OS migrations.
 
-use crate::model::{attrs_of, default_ptype};
+pub use crate::model::windows_partition;
+use crate::model::{attrs_of, default_ptype, is_container, is_fixed_system};
 use pm_core::units::{align_down, align_up, MIB};
 use pm_core::{
-    format_size, DiskInfo, Error, FsKind, PartitionInfo, PartitionType, Result, TableKind,
+    format_size, DiskInfo, Error, PartitionInfo, PartitionType, Result, TableKind,
 };
 use crate::operation::Sizing;
 use crate::planner::err_text;
@@ -26,35 +27,6 @@ struct Item<'a> {
     data: bool,
     /// Smallest acceptable target length (data partitions only).
     min: u64,
-}
-
-fn is_container(kind: TableKind, p: &PartitionInfo) -> bool {
-    kind == TableKind::Mbr && !p.logical && p.ptype.map_or(false, |t| t.is_extended_mbr())
-}
-
-fn is_fixed_system(p: &PartitionInfo) -> bool {
-    p.ptype.map_or(false, |t| t.is_efi() || t.is_msr() || t.is_recovery())
-}
-
-/// The partition holding Windows: flagged required/boot, else mounted at `C:\`, else the
-/// largest NTFS data partition. EFI, MSR, recovery and MBR extended containers never qualify.
-pub fn windows_partition(d: &DiskInfo) -> Option<u32> {
-    let candidates: Vec<&PartitionInfo> = d
-        .partitions
-        .iter()
-        .filter(|p| !is_fixed_system(p) && !is_container(d.table, p))
-        .collect();
-    if let Some(p) = candidates.iter().find(|p| p.flags.required || p.flags.boot) {
-        return Some(p.number);
-    }
-    if let Some(p) = candidates.iter().find(|p| p.letter() == Some('C')) {
-        return Some(p.number);
-    }
-    candidates
-        .iter()
-        .filter(|p| p.fs == Some(FsKind::Ntfs) && p.ptype.map_or(true, |t| t.is_data()))
-        .max_by_key(|p| p.len)
-        .map(|p| p.number)
 }
 
 /// `used` plus a 10 % margin, but never more than the source length (the source size always
@@ -156,7 +128,7 @@ pub fn plan_disk_clone(
 
     let src_container = src.partitions.iter().find(|p| is_container(kind, p));
     let entries = if sizing == Sizing::Exact {
-        place_exact(src, &items, src_container, lo, hi)?
+        place_exact(src, &items, src_container, lo, hi).map_err(|e| with_exact_hint(sizing, e))?
     } else {
         let sizes = match sizing {
             Sizing::Fit => fit_sizes(src, &items, hi - lo)?,
@@ -184,9 +156,26 @@ pub fn plan_disk_clone(
     }
     table.regenerate_ids();
     table.validate().map_err(|e| {
-        Error::Invalid(format!("Cannot clone Disk {} to the target: {}", src.index, err_text(e)))
+        let e = Error::Invalid(format!(
+            "Cannot clone Disk {} to the target: {}",
+            src.index,
+            err_text(e)
+        ));
+        with_exact_hint(sizing, e)
     })?;
     Ok(TargetLayout { table, map })
+}
+
+/// For `Exact`, point the user at the sizings that re-lay the partitions out.
+fn with_exact_hint(sizing: Sizing, e: Error) -> Error {
+    if sizing != Sizing::Exact {
+        return e;
+    }
+    Error::Invalid(format!(
+        "{} (an exact copy keeps the source layout; use Fit or Proportional sizing, which lay \
+         the partitions out on a 1 MB grid with room for MBR EBRs)",
+        err_text(e)
+    ))
 }
 
 fn entry_for(kind: TableKind, p: &PartitionInfo, start: u64, len: u64) -> Entry {

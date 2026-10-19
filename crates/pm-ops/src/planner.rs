@@ -1,6 +1,8 @@
 //! Validation and in-memory simulation of pending operations.
 
-use crate::model::{carry_volume_fields, default_ptype, mount_letter, table_from_disk, Model};
+use crate::model::{
+    carry_volume_fields, default_ptype, is_container, mount_letter, table_from_disk, Model,
+};
 use crate::operation::{table_name, CloneMode, Operation, Sizing};
 use crate::sizing::plan_disk_clone;
 use pm_core::units::{align_down, align_up, MIB};
@@ -57,11 +59,16 @@ fn part_mut(m: &mut Model, d: u32, n: u32) -> Result<&mut PartitionInfo> {
         .ok_or_else(|| Error::Invalid(format!("Disk {d} has no partition {n}")))
 }
 
+/// Refuse a whole-disk destructive operation on the running system disk, and on every
+/// disk when the system disk cannot be determined.
 fn guard_system_disk(m: &Model, d: u32) -> Result<()> {
-    if m.is_system_disk(d) {
-        return invalid(format!("Disk {d} is the running system disk"));
+    match m.effective_system_disk() {
+        Some(s) if s == d => invalid(format!("Disk {d} is the running system disk")),
+        Some(_) => Ok(()),
+        None => invalid(format!(
+            "Disk {d}: cannot determine the running system disk; refusing destructive operation"
+        )),
     }
-    Ok(())
 }
 
 fn guard_windows(m: &Model, d: u32, p: &PartitionInfo, action: &str) -> Result<()> {
@@ -72,10 +79,6 @@ fn guard_windows(m: &Model, d: u32, p: &PartitionInfo, action: &str) -> Result<(
         ));
     }
     Ok(())
-}
-
-fn is_container(kind: TableKind, p: &PartitionInfo) -> bool {
-    kind == TableKind::Mbr && !p.logical && p.ptype.map_or(false, |t| t.is_extended_mbr())
 }
 
 fn guard_container(d: &DiskInfo, p: &PartitionInfo, action: &str) -> Result<()> {
@@ -520,25 +523,53 @@ fn resize_move(m: &mut Model, disk: u32, number: u32, new_start: u64, new_len: u
     if new_len < MIB {
         return invalid(format!("Partition {number} on Disk {disk} cannot be smaller than 1 MB"));
     }
-    if let Some(used) = p.used {
-        if new_len < used {
+    match p.used {
+        Some(used) if new_len < used => {
             return invalid(format!(
                 "Partition {number} on Disk {disk} cannot be smaller than its used data ({})",
                 format_size(used)
             ));
         }
+        // Same conservative rule as the clone paths: a filesystem of unknown fill level may
+        // not be shrunk; a raw partition (no filesystem) may.
+        None if new_len < p.len && p.fs.is_some() => {
+            return invalid(format!(
+                "Cannot shrink partition {number} on Disk {disk}: its used space is unknown; \
+                 mount or check the volume first"
+            ));
+        }
+        _ => {}
     }
-    if moving && new_start < MIB {
-        return invalid(format!(
-            "Partition {number} on Disk {disk} cannot start in the first 1 MB of the disk"
-        ));
-    }
-    match new_start.checked_add(new_len) {
-        Some(end) if end <= size => {}
+    let end = match new_start.checked_add(new_len) {
+        Some(end) if end <= size => end,
         _ => {
             return invalid(format!(
                 "Partition {number} on Disk {disk} would extend past the end of the disk"
             ))
+        }
+    };
+    if moving {
+        // A moved partition lands on the 1 MiB grid; only an in-place resize may keep a
+        // legacy (unaligned) start.
+        let usable_end = {
+            let t = table_from_disk(disk_ref(m, disk)?);
+            match t.kind {
+                TableKind::Gpt => t.gpt_last_usable,
+                _ => t.disk_len,
+            }
+        };
+        if new_start < MIB || new_start % MIB != 0 {
+            return invalid(format!(
+                "Partition {number} on Disk {disk} must move to a 1 MB-aligned start of at least \
+                 1 MB (got {} bytes)",
+                new_start
+            ));
+        }
+        if end % MIB != 0 && end != usable_end {
+            return invalid(format!(
+                "Partition {number} on Disk {disk} must end on a 1 MB boundary or at the end of \
+                 the usable area when it is moved"
+            ));
         }
     }
     let q = part_mut(m, disk, number)?;
@@ -650,7 +681,8 @@ fn unmount(m: &mut Model, volume: &VolumeId, at: &MountPoint) -> Result<()> {
         let p = part_ref(m, d, n)?;
         if m.is_windows_partition(d, p) && mount_letter(&path) == Some('C') {
             return invalid(format!(
-                "Cannot unmount {path} from partition {n} on Disk {d}: it is the running                  Windows volume"
+                "Cannot unmount {path} from partition {n} on Disk {d}: it is the running Windows \
+                 volume"
             ));
         }
         part_mut(m, d, n)?.mount_points.retain(|mp| !same_mount(mp, &path));
@@ -879,9 +911,17 @@ fn restore(m: &mut Model, path: &Path, dst_disk: u32, dst_start: Option<u64>) ->
         return Ok(());
     }
     // Into unallocated space: a new partition of the image's size.
+    if cap < MIB {
+        return invalid(format!(
+            "Image {} ({}) is smaller than 1 MB and cannot become a partition on Disk {dst_disk}",
+            path.display(),
+            format_size(cap)
+        ));
+    }
+    let start = align_up(start, MIB);
     let ss = (d.sector_size.max(512)) as u64;
     let len = align_up(cap, ss);
-    if start % ss != 0 || !fits_free(d, start, len) {
+    if !fits_free(d, start, len) {
         return invalid(format!(
             "Image {} ({}) does not fit the unallocated space of Disk {dst_disk} at {}",
             path.display(),

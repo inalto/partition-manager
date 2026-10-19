@@ -1,6 +1,8 @@
 //! The in-memory model of disks and volumes that operations are simulated against.
 
-use pm_core::{gpt_types, DiskInfo, PartitionInfo, PartitionType, Result, TableKind, VolumeInfo};
+use pm_core::{
+    gpt_types, DiskInfo, FsKind, PartitionInfo, PartitionType, Result, TableKind, VolumeInfo,
+};
 use pm_parttable::{Entry, Table};
 use pm_platform::Platform;
 use serde::{Deserialize, Serialize};
@@ -47,17 +49,35 @@ impl Model {
         self.disk_mut(disk)?.partitions.iter_mut().find(|p| p.number == number)
     }
 
-    /// True if `disk` is the disk Windows is running from.
-    pub fn is_system_disk(&self, disk: u32) -> bool {
-        self.system_disk == Some(disk)
+    /// The disk Windows is running from: `system_disk` when the platform reported one,
+    /// otherwise the disk holding a partition mounted at `C:\`, otherwise the disk of a
+    /// volume mounted at `C:\`. `None` when none of these is known.
+    pub fn effective_system_disk(&self) -> Option<u32> {
+        self.system_disk
+            .or_else(|| {
+                self.disks
+                    .iter()
+                    .find(|d| d.partitions.iter().any(|p| p.letter() == Some('C')))
+                    .map(|d| d.index)
+            })
+            .or_else(|| {
+                self.volumes
+                    .iter()
+                    .find(|v| v.mount_points.iter().any(|m| mount_letter(m) == Some('C')))
+                    .and_then(|v| v.disk)
+            })
     }
 
-    /// True if `p` (on `disk`) holds the running Windows installation: it lives on the
-    /// system disk and is flagged required/boot or mounted at `C:\`.
+    /// True if `disk` is the disk Windows is running from ([`Model::effective_system_disk`]).
+    pub fn is_system_disk(&self, disk: u32) -> bool {
+        self.effective_system_disk() == Some(disk)
+    }
+
+    /// True if `p` (on `disk`) holds the running Windows installation: `disk` is the system
+    /// disk and `p` is its [`windows_partition`].
     pub fn is_windows_partition(&self, disk: u32, p: &PartitionInfo) -> bool {
         self.is_system_disk(disk)
-            && (p.flags.required || p.flags.boot || p.letter() == Some('C'))
-            && !p.ptype.map_or(false, |t| t.is_efi() || t.is_msr() || t.is_recovery())
+            && self.disk(disk).and_then(windows_partition) == Some(p.number)
     }
 
     /// True if drive letter `letter` (any case) is used by a partition or a volume.
@@ -73,6 +93,47 @@ impl Model {
                 .flat_map(|v| v.mount_points.iter())
                 .any(|m| mount_letter(m) == Some(letter))
     }
+}
+
+/// MBR extended-partition container (not a partition with data of its own).
+pub(crate) fn is_container(kind: TableKind, p: &PartitionInfo) -> bool {
+    kind == TableKind::Mbr && !p.logical && p.ptype.map_or(false, |t| t.is_extended_mbr())
+}
+
+/// EFI system, Microsoft reserved or Windows recovery partition.
+pub(crate) fn is_fixed_system(p: &PartitionInfo) -> bool {
+    p.ptype.map_or(false, |t| t.is_efi() || t.is_msr() || t.is_recovery())
+}
+
+/// The partition of `d` holding Windows, by the first rule that matches:
+/// 1. mounted at `C:\`;
+/// 2. `flags.boot` (contains the running/boot OS);
+/// 3. `flags.required` (checked last: OEM utility partitions carry this bit too);
+/// 4. the largest NTFS data partition.
+///
+/// EFI, MSR, recovery partitions and MBR extended containers never qualify. This one
+/// function is used both by the planner's guards and by the clone sizing.
+pub fn windows_partition(d: &DiskInfo) -> Option<u32> {
+    let candidates: Vec<&PartitionInfo> = d
+        .partitions
+        .iter()
+        .filter(|p| !is_fixed_system(p) && !is_container(d.table, p))
+        .collect();
+    let rules: [&dyn Fn(&PartitionInfo) -> bool; 3] = [
+        &|p| p.letter() == Some('C'),
+        &|p| p.flags.boot,
+        &|p| p.flags.required,
+    ];
+    for rule in rules {
+        if let Some(p) = candidates.iter().find(|p| rule(p)) {
+            return Some(p.number);
+        }
+    }
+    candidates
+        .iter()
+        .filter(|p| p.fs == Some(FsKind::Ntfs) && p.ptype.map_or(true, |t| t.is_data()))
+        .max_by_key(|p| p.len)
+        .map(|p| p.number)
 }
 
 /// The drive letter of a mount point string such as `E:` or `E:\` (upper-cased).
@@ -109,7 +170,12 @@ pub(crate) fn attrs_of(kind: TableKind, p: &PartitionInfo) -> u64 {
     }
 }
 
-/// Rebuild a [`Table`] from a [`DiskInfo`]: kind, sector size, disk id (GPT GUID / MBR
+/// Rebuild a [`Table`] from a [`DiskInfo`] **for modelling only** (validation, conversion
+/// and alignment in the planner). It is lossy and must never be written to a disk: the MBR
+/// boot code is zeroed, GPT attribute bits other than required / read-only / hidden /
+/// no-letter are dropped, and the usable bounds are reconstructed rather than read.
+///
+/// Kind, sector size, disk id (GPT GUID / MBR
 /// signature when parseable, random otherwise), and one entry per partition with its type
 /// (basic data / 0x07 when unknown), GUID, name and attribute bits.
 ///
