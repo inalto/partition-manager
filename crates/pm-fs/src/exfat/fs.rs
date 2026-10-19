@@ -31,6 +31,19 @@ impl Loc {
         Loc { first: id as u32, nofat: id & NOFAT_BIT != 0, clusters: id >> CLUSTERS_SHIFT }
     }
 
+    /// A `NoFatChain` run must lie wholly inside the cluster heap (`first >= 2`,
+    /// `first + clusters <= cluster_count + 2`). Every consumer of such a run calls this.
+    fn check_run(&self, cluster_count: u32) -> Result<()> {
+        let end = (self.first as u64).checked_add(self.clusters);
+        if self.first < 2 || end.is_none_or(|e| e > cluster_count as u64 + 2) {
+            return Err(Error::Parse(format!(
+                "contiguous stream of {} clusters at cluster {} leaves the cluster heap",
+                self.clusters, self.first
+            )));
+        }
+        Ok(())
+    }
+
     fn to_id(self) -> u64 {
         self.first as u64 | if self.nofat { NOFAT_BIT | (self.clusters << CLUSTERS_SHIFT) } else { 0 }
     }
@@ -57,9 +70,11 @@ pub struct ExFat {
     /// `(first cluster, index, cluster)`: where the last FAT-chain lookup ended, so sequential
     /// reads of a fragmented file do not rewalk the chain from its start.
     cursor: Option<(u32, u64, u32)>,
-    /// ValidDataLength of the files handed out by `list` / `deleted_entries`, keyed by first
-    /// cluster, for those where it is below the data length. `Entry` has no field for it.
-    valid_len: HashMap<u32, u64>,
+    /// ValidDataLength of every non-empty file handed out by `list` / `deleted_entries`, keyed
+    /// by `(first cluster, deleted)` so live and deleted entries never collide (of two deleted
+    /// entries sharing a first cluster the first one listed wins). `Entry` has no field for
+    /// it, so entries built by hand read up to `size`.
+    valid_len: HashMap<(u32, bool), u64>,
 }
 
 impl ExFat {
@@ -117,13 +132,11 @@ impl ExFat {
     /// Cluster number of the `idx`-th cluster of the stream.
     fn cluster_at(&mut self, loc: Loc, idx: u64) -> Result<u32> {
         if loc.nofat {
+            loc.check_run(self.boot.cluster_count)?;
             if idx >= loc.clusters {
                 return Err(Error::Parse("read beyond the clusters of a contiguous stream".into()));
             }
             let c = loc.first as u64 + idx;
-            if loc.first < 2 || c >= self.boot.cluster_count as u64 + 2 {
-                return Err(Error::Parse(format!("contiguous stream at cluster {} leaves the heap", loc.first)));
-            }
             return Ok(c as u32);
         }
         if loc.first < 2 || loc.first as u64 >= self.boot.cluster_count as u64 + 2 {
@@ -148,6 +161,7 @@ impl ExFat {
     fn chain(&mut self, loc: Loc, limit: u64) -> Result<Vec<u32>> {
         let mut out = Vec::new();
         if loc.nofat {
+            loc.check_run(self.boot.cluster_count)?;
             if loc.clusters > limit {
                 return Err(Error::Parse("contiguous stream longer than allowed".into()));
             }
@@ -184,16 +198,11 @@ impl ExFat {
     fn entry_of(&mut self, parent: &str, s: &FileSet, deleted: bool) -> Entry {
         let loc = Loc::of_set(s, self.cs());
         if !s.is_dir() && s.first_cluster >= 2 {
-            let short = s.valid_len < s.data_len;
-            if !deleted {
-                if short {
-                    self.valid_len.insert(s.first_cluster, s.valid_len);
-                } else {
-                    self.valid_len.remove(&s.first_cluster);
-                }
-            } else if short {
-                // a deleted file never overrides a live file that reuses its first cluster
-                self.valid_len.entry(s.first_cluster).or_insert(s.valid_len);
+            let key = (s.first_cluster, deleted);
+            if deleted {
+                self.valid_len.entry(key).or_insert(s.valid_len);
+            } else {
+                self.valid_len.insert(key, s.valid_len);
             }
         }
         Entry {
@@ -339,17 +348,10 @@ impl FileSystem for ExFat {
         let want = (buf.len() as u64).min(e.size - offset) as usize;
         let loc = self.effective(Loc::from_id(e.id), e);
         if loc.nofat {
-            // the whole contiguous run must lie in the cluster heap
-            let end = (loc.first as u64).checked_add(loc.clusters);
-            if loc.first < 2 || end.is_none_or(|x| x > self.boot.cluster_count as u64 + 2) {
-                return Err(Error::Parse(format!(
-                    "contiguous stream of {} clusters at cluster {} leaves the heap",
-                    loc.clusters, loc.first
-                )));
-            }
+            loc.check_run(self.boot.cluster_count)?;
         }
         // bytes at or beyond ValidDataLength read as zeros
-        let valid = self.valid_len.get(&loc.first).copied().unwrap_or(u64::MAX).min(e.size);
+        let valid = self.valid_len.get(&(loc.first, e.deleted)).copied().unwrap_or(u64::MAX).min(e.size);
         let disk = valid.saturating_sub(offset).min(want as u64) as usize;
         let cs = self.cs();
         let mut done = 0usize;

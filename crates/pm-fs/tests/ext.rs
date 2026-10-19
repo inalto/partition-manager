@@ -521,5 +521,5 @@ fn ext_huge_geometry_is_a_parse_error_not_an_overflow() {
     assert!(matches!(Ext::open(Box::new(dev)), Err(Error::Parse(_))));
     // the same through the crate's dispatching entry point
     let dev = FileDevice::open(&path, true).unwrap();
-    assert!(pm_fs::open(Box::new(dev)).is_err());
+    assert!(matches!(pm_fs::open(Box::new(dev)).err(), Some(Error::Parse(_))));
 }

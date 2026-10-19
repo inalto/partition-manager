@@ -15,6 +15,13 @@
 //!
 //! The root directory is always a FAT chain, so its id is simply the first cluster.
 //!
+//! # ValidDataLength
+//!
+//! Bytes at or beyond a file's `ValidDataLength` read as zeros. `Entry` has no field for it,
+//! so the reader remembers it per `(first cluster, deleted)` for the entries returned by
+//! `list` and `deleted_entries` of the same [`ExFat`] instance; an `Entry` built by hand reads
+//! up to its `size`.
+//!
 //! # Deleted entries
 //!
 //! A deleted entry set has bit 7 of its primary entry type cleared (`0x05`). Deleting clears

@@ -418,11 +418,16 @@ fn stream_off(b: &Built, entry_index: usize) -> usize {
 #[test]
 fn exfat_contiguous_run_must_stay_in_the_heap() {
     // heap at sector 260 leaves 2 KiB of volume slack after the last cluster
-    for (first, why) in [(None, "run past the heap end"), (Some(1u32), "cluster below 2")] {
-        let mut built = build(&ExOpts { heap_sectors: 260 });
+    for (first, why, heap_sectors) in [
+        (None, "run past the heap end, slack after the heap", 260u32),
+        (None, "run past the heap end, heap ends the volume", 256),
+        (Some(1u32), "cluster below 2", 260),
+    ] {
+        let mut built = build(&ExOpts { heap_sectors });
         let s = stream_off(&built, 4); // hello.txt stream (label, bitmap, up-case, primary, stream)
         assert_eq!(built.image[s], 0xC0);
-        put32(&mut built.image, s + 20, first.unwrap_or(built.cluster_count + 1)); // last cluster
+        // FirstCluster of the stream: by default the heap's last cluster, so 2 clusters run past the end
+        put32(&mut built.image, s + 20, first.unwrap_or(built.cluster_count + 1));
         let mut fs = open_image(built.image);
         let root = fs.root();
         let list = fs.list(&root).unwrap();
@@ -442,7 +447,8 @@ fn exfat_valid_data_length_zero_fills_the_tail() {
     put64(&mut built.image, s + 8, 5000);
     let c5 = coff(&built, 5) as usize;
     built.image[c5 + 5000..c5 + 6000].fill(0xAA);
-    // frag.bin (FAT chain) valid up to 4100, stale beyond in the 2nd and 3rd clusters
+    // frag.bin (FAT chain) valid up to 4100: stale bytes follow byte 4 of its second cluster (10);
+    // the third (12) lies wholly beyond the valid length
     let f = stream_off(&built, 7);
     assert_eq!(built.image[f], 0xC0);
     put64(&mut built.image, f + 8, 4100);
@@ -480,4 +486,74 @@ fn exfat_valid_data_length_zero_fills_the_tail() {
     let mut want = gone_data;
     want[40..].fill(0);
     assert_eq!(read_all(&mut fs, gone), want);
+}
+
+/// Patch the stream entry of an entry set: `(first_cluster, data_len, valid_len)`.
+fn patch_stream(img: &mut [u8], stream: usize, first: u32, data_len: u64, valid_len: u64) {
+    put32(img, stream + 20, first);
+    put64(img, stream + 24, data_len);
+    put64(img, stream + 8, valid_len);
+}
+
+#[test]
+fn exfat_live_file_unaffected_by_deleted_entry_sharing_first_cluster() {
+    // scenario 1: live hello.txt (full VDL) and deleted gone.txt (VDL 40 of 80) share cluster 5;
+    // scenario 2: live hello.txt has a short VDL (50), the deleted one a full VDL
+    for (live_valid, del_valid) in [(6000u64, 40u64), (50, 80)] {
+        for deleted_first in [false, true] {
+            let mut built = build(&ExOpts::default());
+            let hs = stream_off(&built, 4);
+            patch_stream(&mut built.image, hs, 5, 6000, live_valid);
+            let gs = stream_off(&built, 21);
+            assert_eq!(built.image[gs], 0x40);
+            patch_stream(&mut built.image, gs, 5, 80, del_valid);
+            let hello = built.hello.clone();
+            let mut fs = open_image(built.image);
+            let root = fs.root();
+            let mut list = None;
+            let mut del = None;
+            let order: [bool; 2] = if deleted_first { [true, false] } else { [false, true] };
+            for step in order {
+                if step {
+                    del = Some(fs.deleted_entries(&NullProgress, &CancelToken::new()).unwrap());
+                } else {
+                    list = Some(fs.list(&root).unwrap());
+                }
+            }
+            let (list, del) = (list.unwrap(), del.unwrap());
+            let a = find(&list, "hello.txt");
+            let b = del.iter().find(|e| e.name == "gone.txt").unwrap();
+            let mut want_a = hello.clone();
+            want_a[live_valid as usize..].fill(0);
+            assert_eq!(read_all(&mut fs, a), want_a, "live {live_valid}/{del_valid} deleted_first {deleted_first}");
+            let mut want_b = hello[..80].to_vec();
+            want_b[del_valid as usize..].fill(0);
+            assert_eq!(read_all(&mut fs, b), want_b, "deleted {live_valid}/{del_valid} deleted_first {deleted_first}");
+        }
+    }
+}
+
+#[test]
+fn exfat_directory_run_must_stay_in_the_heap() {
+    let mut built = build(&ExOpts::default());
+    // contig/ becomes a 2-cluster contiguous directory starting at the heap's last cluster
+    let cs = stream_off(&built, 13);
+    assert_eq!(built.image[cs], 0xC0);
+    patch_stream(&mut built.image, cs, built.cluster_count + 1, 2 * CS as u64, 2 * CS as u64);
+    let mut fs = open_image(built.image);
+    let root = fs.root();
+    let list = fs.list(&root).unwrap();
+    let contig = find(&list, "contig");
+    assert!(matches!(fs.list(contig), Err(Error::Parse(_))));
+}
+
+#[test]
+fn exfat_bitmap_run_must_stay_in_the_heap() {
+    // the 8-cluster bitmap is contiguous (free first FAT entry); move it so it crosses the heap end
+    let (mut img, _bits, count, heap) = small_cluster_image(false);
+    let root_dir = heap + 8 * 512; // cluster 10
+    assert_eq!(img[root_dir], 0x81);
+    put32(&mut img, root_dir + 20, count); // clusters count..count+7, only count and count+1 exist
+    let mut fs = open_image(img);
+    assert!(matches!(fs.used_map(), Err(Error::Parse(_))));
 }
