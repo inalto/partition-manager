@@ -7,7 +7,10 @@
 //!
 //! Operations that need an operating system volume layer (mount, unmount, format, shrink,
 //! extend, external tools) fail with [`Error::Unsupported`]; there are no volumes, so
-//! partitions never report a file system, drive letters or used space.
+//! partitions have no drive letters and no used-space figure. Each partition's file system
+//! kind and label are read from its first sectors (`pm_fs::detect`), which lets the planner
+//! and executor protect them: with the fill level unknown a shrink is refused, and so is a
+//! length change of a non-NTFS file system.
 //!
 //! # The system disk
 //!
@@ -114,7 +117,20 @@ impl Platform for FilePlatform {
                 ..Default::default()
             };
             out.push(match read_table(&mut dev) {
-                Ok(t) => t.to_disk_info(base),
+                Ok(t) => {
+                    let mut info = t.to_disk_info(base);
+                    // kind and label only: the fill level stays unknown (`used == None`), so the
+                    // planner's "unknown fill level" rule keeps shrinks of a filesystem away
+                    for p in &mut info.partitions {
+                        if let Some(probe) = pm_fs::detect(&mut dev, p.start) {
+                            if probe.kind != FsKind::Unknown {
+                                p.fs = Some(probe.kind);
+                                p.label = probe.label;
+                            }
+                        }
+                    }
+                    info
+                }
                 Err(e @ (Error::Io { .. } | Error::Cancelled)) => return Err(e),
                 // a damaged table: show the disk without partitions rather than failing the list
                 Err(e) => {

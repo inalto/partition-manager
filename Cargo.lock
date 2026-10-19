@@ -2761,6 +2761,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "pm-core",
+ "pm-fs",
  "pm-parttable",
  "serde",
  "tempfile",

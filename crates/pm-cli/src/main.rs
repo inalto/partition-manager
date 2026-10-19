@@ -17,13 +17,14 @@ mod cmd_recover;
 mod cmd_rescue;
 mod cmd_table;
 mod device_arg;
+mod disk_files;
 mod partial;
 mod progress;
 
 use clap::Parser;
 use cli::{Cli, CliError, Command, EXIT_OK};
 use pm_core::CancelToken;
-use pm_platform::{FilePlatform, Platform};
+use pm_platform::Platform;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -80,10 +81,9 @@ fn main() {
 
     let on_images = !cli.disk_files.is_empty();
     let platform: Arc<dyn Platform> = if on_images {
-        match FilePlatform::new(cli.disk_files) {
+        match disk_files::open_platform(cli.disk_files) {
             Ok(p) => Arc::new(p),
             Err(e) => {
-                let e = cli::arg_error(e);
                 eprintln!("error: {e}");
                 std::process::exit(e.exit_code());
             }

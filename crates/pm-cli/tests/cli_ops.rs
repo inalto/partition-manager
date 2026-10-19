@@ -469,3 +469,63 @@ fn cli_analyze_bench_runs_on_a_temp_directory() {
         assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     }
 }
+
+#[test]
+fn cli_image_filesystems_are_protected_from_resize_and_align() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    gpt_fat32_image(&img, 128 * MIB, MIB, 40 * MIB);
+    let run = |extra: &[&str]| {
+        let mut a = vec!["--disk-file", s(&img)];
+        a.extend_from_slice(extra);
+        pm(&a)
+    };
+
+    // the file system kind and label are read from the image
+    let out = run(&["list"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("FAT32"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("PMTEST"), "{}", stdout(&out));
+
+    // a shrink (or any length change of a FAT volume) would truncate the file system: refused
+    let before = read_all(&img);
+    for len in ["20M", "60M"] {
+        let out = run(&["resize", "0", "1", "--start", "1M", "--len", len, "--yes"]);
+        assert_eq!(out.status.code(), Some(1), "{len}: {}", stderr(&out));
+        assert_eq!(read_all(&img), before, "{len}");
+    }
+    let out = run(&["align", "0", "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("image files"), "{}", stderr(&out));
+    assert_eq!(read_all(&img), before);
+
+    // moving it (same length) is fine and the files follow
+    let out = run(&["resize", "0", "1", "--start", "60M", "--len", "40M", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(table_of(&img).entries[0].start, 60 * MIB);
+    let out = pm(&["cat", &format!("{}:1", s(&img)), "/HELLO.TXT"]);
+    assert_eq!(out.stdout, HELLO);
+}
+
+#[test]
+fn cli_disk_file_must_be_a_raw_image_and_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhd = dir.path().join("disk.vhd");
+    pm_image::create(
+        &vhd,
+        &pm_image::CreateOpts { format: pm_image::ImageFormat::VhdFixed, capacity: MIB, sparse: false },
+    )
+    .unwrap();
+    let before = read_all(&vhd);
+    let out = pm(&["--disk-file", s(&vhd), "list"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("only raw images"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("pm convert"), "{}", stderr(&out));
+    assert_eq!(read_all(&vhd), before);
+
+    let img = dir.path().join("a.img");
+    blank(&img, MIB);
+    let out = pm(&["--disk-file", s(&img), "--disk-file", s(&img), "list"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("more than once"), "{}", stderr(&out));
+}

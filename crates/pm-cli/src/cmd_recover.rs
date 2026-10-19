@@ -11,6 +11,7 @@ use crate::device_arg::{open_spec, parse_device, DeviceArg, Identity, Opened};
 use crate::progress::StderrProgress;
 use clap::Subcommand;
 use pm_core::{format_size, CancelToken, DiskInfo, Error, TableKind};
+use pm_ops::Model;
 use pm_parttable::{read_table, write_table, Candidate, Table};
 use pm_platform::{OpenMode, Platform};
 use pm_recover::{
@@ -346,19 +347,7 @@ fn partitions(
     drop(opened);
 
     match arg {
-        DeviceArg::Disk(i) => {
-            if platform.system_disk() == Some(i) && !opts.allow_system_disk {
-                return Err(CliError::Usage(format!(
-                    "Disk {i} is the running system disk; refusing to write its partition table \
-                     (--allow-system-disk overrides)"
-                )));
-            }
-            let mut session = platform.begin_write(i)?;
-            let r = session.commit_table(&new);
-            let fin = session.finish();
-            r?;
-            fin?;
-        }
+        DeviceArg::Disk(i) => write_disk_table(platform, i, &new, opts.allow_system_disk)?,
         DeviceArg::File(path) => {
             let mut dev = pm_image::open(&path, false)?;
             write_table(&mut *dev, &new)?;
@@ -367,6 +356,36 @@ fn partitions(
         _ => unreachable!("checked above"),
     }
     writeln!(out, "Partition table written ({} partition(s) added).", chosen.len()).map_err(write_err)
+}
+
+/// Write `table` to disk `disk` through a platform write session, then have the OS re-read the
+/// layout. Same system-disk rule as the executor: refused when the disk is the running system
+/// disk, and when that cannot be determined, unless `allow_system_disk` is given (adding
+/// partitions in free space is in the family that flag relaxes).
+fn write_disk_table(
+    platform: &dyn Platform,
+    disk: u32,
+    table: &Table,
+    allow_system_disk: bool,
+) -> Result<(), CliError> {
+    let sys = Model::from_platform(platform)?.effective_system_disk();
+    if !(sys.is_some_and(|s| s != disk) || allow_system_disk) {
+        return Err(CliError::Usage(match sys {
+            Some(_) => format!(
+                "Disk {disk} is the running system disk; refusing to write to it (--allow-system-disk overrides)"
+            ),
+            None => format!(
+                "Disk {disk}: cannot determine the running system disk; refusing to write to it (--allow-system-disk overrides)"
+            ),
+        }));
+    }
+    let mut session = platform.begin_write(disk)?;
+    let r = session.commit_table(table);
+    let fin = session.finish();
+    r?;
+    fin?;
+    platform.rescan(disk)?;
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------------
@@ -646,6 +665,37 @@ mod tests {
         assert!(check_dest(&p, vol, Path::new(r"d:\x")).is_err());
         // a relative destination is resolved against the current directory
         assert!(check_dest(&p, "disk:0", Path::new("relative")).is_ok());
+    }
+
+    #[test]
+    fn disk_table_write_follows_the_system_disk_rule_and_rescans() {
+        use pm_core::MemDevice;
+        use pm_platform::MockPlatform;
+        let table = Table::empty(TableKind::Gpt, 8 << 20, 512);
+        let p = MockPlatform::new();
+        p.add_disk(0, MemDevice::new(8 << 20), DiskInfo::default());
+        p.add_disk(1, MemDevice::new(8 << 20), DiskInfo::default());
+
+        // the system disk is unknown: refused (fails closed), nothing written
+        let r = write_disk_table(&p, 0, &table, false);
+        assert!(matches!(&r, Err(CliError::Usage(m)) if m.contains("cannot determine")), "{r:?}");
+        assert!(p.write_sessions_log().is_empty());
+
+        // the disk is the system disk: refused
+        p.set_system_disk(0);
+        let r = write_disk_table(&p, 0, &table, false);
+        assert!(matches!(&r, Err(CliError::Usage(m)) if m.contains("running system disk")), "{r:?}");
+        assert!(p.write_sessions_log().is_empty());
+
+        // another disk is the system disk: written, session finished, layout re-read
+        write_disk_table(&p, 1, &table, false).unwrap();
+        assert_eq!(p.write_sessions_log(), vec![1]);
+        assert_eq!(p.finished_sessions_log(), vec![1]);
+        assert!(p.calls().contains(&"rescan 1".to_string()), "{:?}", p.calls());
+
+        // the override lets the system disk through
+        write_disk_table(&p, 0, &table, true).unwrap();
+        assert_eq!(p.write_sessions_log(), vec![1, 0]);
     }
 
     #[test]

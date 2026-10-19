@@ -75,10 +75,17 @@ pub fn run_apply(env: &Env, args: &ApplyArgs, out: &mut dyn Write) -> Result<(),
 }
 
 /// What an image file cannot do: everything that needs the operating system's volumes.
-fn check_supported_on_images(ops: &[Operation]) -> Result<(), CliError> {
+fn check_supported_on_images(model: &Model, ops: &[Operation]) -> Result<(), CliError> {
+    use pm_core::FsKind;
     use pm_ops::BootFix;
     for op in ops {
         let needs_volumes = match op {
+            // NTFS / ReFS follow a length change through the volume layer
+            Operation::ResizeMove { disk, number, new_len, .. } => model
+                .partition(*disk, *number)
+                .is_some_and(|p| p.len != *new_len && matches!(p.fs, Some(FsKind::Ntfs | FsKind::ReFs))),
+            // alignment shrinks partitions, and nothing here can shrink a file system with them
+            Operation::AlignPartitions { .. } => true,
             Operation::CreatePartition { fs, letter, .. } => fs.is_some() || letter.is_some(),
             Operation::FormatPartition { .. }
             | Operation::SetLetter { .. }
@@ -105,8 +112,9 @@ pub fn run_ops(env: &Env, ops: Vec<Operation>, flags: &RunFlags, out: &mut dyn W
     if ops.is_empty() {
         return Err(CliError::Usage("the operations list is empty".into()));
     }
+    let model = Model::from_platform(env.platform)?;
     if env.on_images {
-        check_supported_on_images(&ops)?;
+        check_supported_on_images(&model, &ops)?;
     }
     let mut text = String::from("Operations:\n");
     for (i, op) in ops.iter().enumerate() {
@@ -114,7 +122,6 @@ pub fn run_ops(env: &Env, ops: Vec<Operation>, flags: &RunFlags, out: &mut dyn W
     }
     out.write_all(text.as_bytes()).map_err(write_err)?;
 
-    let model = Model::from_platform(env.platform)?;
     Planner::simulate_all(&model, &ops).map_err(plan_error)?;
 
     // the dry run re-checks every operation against the model its predecessors produce and
@@ -192,8 +199,13 @@ mod tests {
             cluster: None,
             quick: true,
         };
-        assert!(matches!(check_supported_on_images(&[fmt]), Err(CliError::Usage(m)) if m.contains("image files")));
+        let model = Model::default();
+        assert!(
+            matches!(check_supported_on_images(&model, &[fmt]), Err(CliError::Usage(m)) if m.contains("image files"))
+        );
         let init = Operation::InitializeDisk { disk: 0, kind: TableKind::Mbr };
-        assert!(check_supported_on_images(&[init]).is_ok());
+        assert!(check_supported_on_images(&model, &[init]).is_ok());
+        let align = Operation::AlignPartitions { disk: 0 };
+        assert!(check_supported_on_images(&model, &[align]).is_err());
     }
 }

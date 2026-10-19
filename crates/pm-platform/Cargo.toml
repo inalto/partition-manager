@@ -7,6 +7,7 @@ description = "Partition Manager OS abstraction: Platform trait, mock and the Wi
 
 [dependencies]
 pm-core = { path = "../pm-core" }
+pm-fs = { path = "../pm-fs" }
 pm-parttable = { path = "../pm-parttable" }
 serde.workspace = true
 uuid.workspace = true
@@ -26,4 +27,5 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
+    "Win32_System_Console",
 ] }

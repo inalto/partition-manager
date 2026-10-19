@@ -112,3 +112,25 @@ fn file_platform_rejects_bad_files_and_unsupported_ops() {
     p.rescan(0).unwrap();
     assert!(p.open_volume(&id, OpenMode::ReadOnly).is_err());
 }
+
+#[test]
+fn file_platform_detects_filesystems_without_fill_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.img");
+    gpt_image(&a, 128 * MIB);
+    {
+        let mut dev = FileDevice::open(&a, false).unwrap();
+        let mut t = read_table(&mut dev).unwrap();
+        t.entries[0].len = 40 * MIB;
+        write_table(&mut dev, &t).unwrap();
+        let mut slice = pm_core::SliceDevice::new(&mut dev, 2 * MIB, 40 * MIB).unwrap();
+        let opts = pm_fs::FormatOpts { label: "PMTEST".into(), cluster_size: None, volume_id: Some(1) };
+        pm_fs::format_fat32(&mut slice, &opts).unwrap();
+    }
+    let p = FilePlatform::new(vec![a]).unwrap();
+    let part = &p.enumerate_disks().unwrap()[0].partitions[0];
+    assert_eq!(part.fs, Some(FsKind::Fat32));
+    assert_eq!(part.label, "PMTEST");
+    // the fill level is unknown, so the planner will not shrink it
+    assert_eq!(part.used, None);
+}
