@@ -1,0 +1,18 @@
+[package]
+name = "pm-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Partition Manager operations: in-memory model, pending operation list, planner/simulator and clone sizing"
+
+[dependencies]
+pm-core = { path = "../pm-core" }
+pm-parttable = { path = "../pm-parttable" }
+pm-platform = { path = "../pm-platform" }
+pm-image = { path = "../pm-image" }
+serde = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

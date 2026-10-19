@@ -406,6 +406,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-ops"
+version = "0.1.0"
+dependencies = [
+ "pm-core",
+ "pm-image",
+ "pm-parttable",
+ "pm-platform",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "pm-parttable"
 version = "0.1.0"
 dependencies = [
