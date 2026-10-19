@@ -120,3 +120,47 @@ fn cli_usage_errors_exit_1() {
     assert_eq!(pm(&["unmount", "D:", "--letter", "1"]).status.code(), Some(1));
     assert_eq!(pm(&["--help"]).status.code(), Some(0));
 }
+
+/// A drive letter that no volume on this machine uses (`None` if `pm list` itself fails).
+fn unused_letter() -> Option<char> {
+    let out = pm(&["list", "--json"]);
+    if out.status.code() != Some(0) {
+        return None;
+    }
+    let disks: Vec<pm_core::DiskInfo> = serde_json::from_str(&stdout(&out)).ok()?;
+    let used: Vec<char> = disks
+        .iter()
+        .flat_map(|d| d.partitions.iter().filter_map(|p| p.letter()))
+        .collect();
+    ('D'..='Z').rev().find(|c| !used.contains(c))
+}
+
+#[test]
+fn cli_unknown_volume_exits_1() {
+    // an unknown disk index is an argument error, not a platform failure
+    let out = pm(&["table", "disk:99999"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
+
+    // so is a drive letter nothing is mounted at, for every command that takes a volume
+    let Some(c) = unused_letter() else { return };
+    let letter = format!("{c}:");
+    let out = pm(&["table", &letter]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let out = pm(&["mount", &letter, "--letter", "Y"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let out = pm(&["unmount", &letter, "--letter", "Y"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+}
+
+#[test]
+fn cli_missing_file_exits_1_for_both_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.img");
+    let m = missing.to_str().unwrap();
+    for arg in [m.to_string(), format!("file:{m}")] {
+        let out = pm(&["table", &arg]);
+        assert_eq!(out.status.code(), Some(1), "{arg}: {}", stderr(&out));
+        assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
+    }
+}

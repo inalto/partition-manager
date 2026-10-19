@@ -34,6 +34,15 @@ fn is_volume_path(s: &str) -> bool {
     strip_prefix_ci(s, r"\\?\Volume{").is_some()
 }
 
+/// The volume path with exactly one trailing backslash, as the platform expects it.
+fn normalize_volume_path(s: &str) -> String {
+    let mut v = s.to_string();
+    if !v.ends_with('\\') {
+        v.push('\\');
+    }
+    v
+}
+
 /// Parse `"disk:1"`, `"D:"`, `"\\?\Volume{..}\"`, `"file:PATH"` or a path of an existing file.
 pub fn parse_device(s: &str) -> Result<DeviceArg> {
     if let Some(n) = strip_prefix_ci(s, "disk:") {
@@ -43,17 +52,17 @@ pub fn parse_device(s: &str) -> Result<DeviceArg> {
             .map_err(|_| Error::Invalid(format!("'{s}': expected disk:<index>, e.g. disk:1")));
     }
     if is_volume_path(s) {
-        let mut v = s.to_string();
-        if !v.ends_with('\\') {
-            v.push('\\');
-        }
-        return Ok(DeviceArg::Volume(v));
+        return Ok(DeviceArg::Volume(normalize_volume_path(s)));
     }
     if let Some(path) = strip_prefix_ci(s, "file:") {
         if path.is_empty() {
             return Err(Error::Invalid("file: needs a path".into()));
         }
-        return Ok(DeviceArg::File(PathBuf::from(path)));
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(Error::NotFound(format!("image file '{}' does not exist", path.display())));
+        }
+        return Ok(DeviceArg::File(path));
     }
     if let Some(c) = drive_letter(s) {
         return Ok(DeviceArg::Volume(format!("{c}:")));
@@ -69,7 +78,7 @@ pub fn parse_device(s: &str) -> Result<DeviceArg> {
 /// Resolve `D:` (via the volumes' mount points) or a `\\?\Volume{..}\` path to a [`VolumeId`].
 pub fn resolve_volume(platform: &dyn Platform, s: &str) -> Result<VolumeId> {
     if is_volume_path(s) {
-        return Ok(VolumeId(s.to_string()));
+        return Ok(VolumeId(normalize_volume_path(s)));
     }
     let letter = drive_letter(s)
         .ok_or_else(|| Error::Invalid(format!("'{s}' is not a drive letter or volume path")))?;
@@ -82,12 +91,29 @@ pub fn resolve_volume(platform: &dyn Platform, s: &str) -> Result<VolumeId> {
 }
 
 /// Open the device described by `a`.
+///
+/// A device that does not exist is reported as `Error::NotFound` (an argument error for the CLI),
+/// whatever the OS says when opening it; genuine failures (access denied, I/O) pass through.
 pub fn open_device(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -> Result<Box<dyn BlockDevice>> {
     match a {
-        DeviceArg::Disk(i) => p.open_disk(*i, mode),
+        DeviceArg::Disk(i) => p.open_disk(*i, mode).map_err(|e| {
+            let missing = p.enumerate_disks().map_or(false, |d| !d.iter().any(|x| x.index == *i));
+            if missing {
+                Error::NotFound(format!("no disk with index {i}"))
+            } else {
+                e
+            }
+        }),
         DeviceArg::Volume(v) => {
             let id = resolve_volume(p, v)?;
-            p.open_volume(&id, mode)
+            p.open_volume(&id, mode).map_err(|e| {
+                let missing = p.enumerate_volumes().map_or(false, |vs| !vs.iter().any(|x| x.id == id));
+                if missing {
+                    Error::NotFound(format!("no volume {}", id.0))
+                } else {
+                    e
+                }
+            })
         }
         // Raw image file. Later tasks route image formats (VHD, VMDK, ...) through pm-image here.
         DeviceArg::File(path) => Ok(Box::new(FileDevice::open(path, mode == OpenMode::ReadOnly)?)),
@@ -117,14 +143,8 @@ mod tests {
         // trailing backslash is normalised
         assert_eq!(parse_device(v.trim_end_matches('\\')).unwrap(), DeviceArg::Volume(v.into()));
 
-        assert_eq!(
-            parse_device(r"file:C:\x.img").unwrap(),
-            DeviceArg::File(PathBuf::from(r"C:\x.img"))
-        );
-        assert_eq!(
-            parse_device("file:rel/x.img").unwrap(),
-            DeviceArg::File(PathBuf::from("rel/x.img"))
-        );
+        assert!(matches!(parse_device("file:rel/does-not-exist.img"), Err(Error::NotFound(_))));
+        assert!(matches!(parse_device(r"file:C:\no\such.img"), Err(Error::NotFound(_))));
         assert!(parse_device("file:").is_err());
 
         // a bare path is a File only if it exists
@@ -137,6 +157,7 @@ mod tests {
             parse_device(dir.path().join("missing.raw").to_str().unwrap()),
             Err(Error::Invalid(_))
         ));
+        assert_eq!(parse_device(&format!("file:{s}")).unwrap(), DeviceArg::File(img.clone()));
         assert!(parse_device("").is_err());
         assert!(parse_device("C").is_err());
     }
@@ -157,7 +178,18 @@ mod tests {
         plat.add_disk(0, MemDevice::new(8192), Default::default());
         let d = open_device(&plat, &DeviceArg::Disk(0), OpenMode::ReadOnly).unwrap();
         assert_eq!(d.len(), 8192);
-        assert!(open_device(&plat, &DeviceArg::Disk(7), OpenMode::ReadOnly).is_err());
+        assert!(matches!(
+            open_device(&plat, &DeviceArg::Disk(7), OpenMode::ReadOnly),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            open_device(&plat, &DeviceArg::Volume("E:".into()), OpenMode::ReadOnly),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            open_device(&plat, &DeviceArg::Volume(r"\\?\Volume{zzzz}\".into()), OpenMode::ReadOnly),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]
@@ -178,6 +210,11 @@ mod tests {
         assert!(matches!(resolve_volume(&plat, "E:"), Err(Error::NotFound(_))));
         let raw = r"\\?\Volume{bbbb}\";
         assert_eq!(resolve_volume(&plat, raw).unwrap(), VolumeId(raw.into()));
+        // a missing trailing backslash is added here too (mount / unmount call this directly)
+        assert_eq!(
+            resolve_volume(&plat, raw.trim_end_matches('\\')).unwrap(),
+            VolumeId(raw.into())
+        );
         assert!(resolve_volume(&plat, "nonsense").is_err());
     }
 }

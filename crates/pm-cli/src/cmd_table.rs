@@ -9,7 +9,11 @@ use std::io::Write;
 
 pub fn run(platform: &dyn Platform, device: &str, json: bool, out: &mut dyn Write) -> Result<(), CliError> {
     let arg = parse_device(device).map_err(arg_error)?;
-    let mut dev = open_device(platform, &arg, OpenMode::ReadOnly)?;
+    let mut dev = open_device(platform, &arg, OpenMode::ReadOnly).map_err(|e| match e {
+        // a device that does not exist is an argument error; everything else is a runtime failure
+        pm_core::Error::NotFound(m) => CliError::Usage(m),
+        other => CliError::Runtime(other),
+    })?;
     let table = read_table(&mut *dev)?;
     let text = if json {
         let mut s = serde_json::to_string_pretty(&table)
