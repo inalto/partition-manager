@@ -12,7 +12,9 @@ pub mod windows;
 pub use mock::MockPlatform;
 pub use traits::*;
 #[cfg(windows)]
-pub use windows::{friendly_error, WinDevice, WindowsPlatform};
+pub use windows::{
+    friendly_error, parse_ata_smart, parse_nvme_smart_log, BenchFile, FileBenchTarget, WinDevice, WindowsPlatform,
+};
 
 use pm_core::{BlockDevice, DiskInfo, Error, FsKind, ProgressSink, Result, VolumeId, VolumeInfo};
 use std::sync::Arc;

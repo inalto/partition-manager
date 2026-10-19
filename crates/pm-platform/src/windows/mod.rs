@@ -4,6 +4,7 @@
 //! elevation (query-only handles); opening disks or volumes for I/O, write sessions, mounting,
 //! formatting and resizing need administrator rights.
 
+mod bench;
 mod device;
 mod disk;
 mod elevation;
@@ -13,11 +14,14 @@ mod ioctl;
 pub mod layout;
 mod mount;
 mod session;
+mod smart;
 mod volume;
 
+pub use bench::{BenchFile, FileBenchTarget};
 pub use device::WinDevice;
 pub use error::friendly_error;
 pub use session::WindowsWriteSession;
+pub use smart::{parse_ata_smart, parse_nvme_smart_log};
 
 use crate::traits::{ExternalTool, MountPoint, OpenMode, Platform, SmartData, WriteSession};
 use pm_core::{BlockDevice, DiskInfo, Error, FsKind, ProgressSink, Result, VolumeId, VolumeInfo};
@@ -137,9 +141,8 @@ impl Platform for WindowsPlatform {
         format::extend_volume(id, new_len)
     }
 
-    fn smart(&self, _disk: u32) -> Result<Option<SmartData>> {
-        // Task 17: IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceHealth / NVMe log) + ATA SMART.
-        Ok(None)
+    fn smart(&self, disk: u32) -> Result<Option<SmartData>> {
+        smart::smart(disk)
     }
 
     fn is_elevated(&self) -> bool {

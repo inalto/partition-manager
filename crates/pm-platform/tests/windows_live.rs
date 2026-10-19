@@ -75,3 +75,13 @@ fn live_open_disk0_reads_sector0() {
     assert_eq!(sig, [0x55, 0xAA]);
     assert!(d.write_at(0, &sector).is_err());
 }
+
+#[test]
+#[ignore = "touches real hardware (read-only); NVMe/ATA SMART usually needs administrator rights"]
+fn live_smart_disk0() {
+    let p = WindowsPlatform::new();
+    match p.smart(0).unwrap() {
+        Some(d) => println!("SMART disk 0: {d:#?}"),
+        None => println!("SMART disk 0: not available (elevated: {})", p.is_elevated()),
+    }
+}

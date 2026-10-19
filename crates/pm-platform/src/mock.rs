@@ -26,6 +26,7 @@ struct State {
     calls: Vec<String>,
     fail_prefixes: Vec<String>,
     system_disk: Option<u32>,
+    smart: BTreeMap<u32, SmartData>,
 }
 
 /// Test double for [`Platform`].
@@ -72,6 +73,11 @@ impl MockPlatform {
         let mut st = self.st();
         st.volumes.retain(|x| x.id != v.id);
         st.volumes.push(v);
+    }
+
+    /// Make [`Platform::smart`] return `data` for disk `index` (other disks report `None`).
+    pub fn set_smart(&self, index: u32, data: SmartData) {
+        self.st().smart.insert(index, data);
     }
 
     pub fn set_system_disk(&self, index: u32) {
@@ -351,8 +357,8 @@ impl Platform for MockPlatform {
         Ok(())
     }
 
-    fn smart(&self, _disk: u32) -> Result<Option<SmartData>> {
-        Ok(None)
+    fn smart(&self, disk: u32) -> Result<Option<SmartData>> {
+        Ok(self.st().smart.get(&disk).cloned())
     }
 
     fn is_elevated(&self) -> bool {

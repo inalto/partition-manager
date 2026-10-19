@@ -208,3 +208,14 @@ fn mock_open_disk_returns_device_with_len() {
     v.read_at(0, &mut b).unwrap();
     assert_eq!(&b, b"abc");
 }
+
+#[test]
+fn mock_smart_returns_configured_data_per_disk() {
+    use pm_platform::SmartData;
+    let p = MockPlatform::new();
+    assert!(p.smart(0).unwrap().is_none());
+    p.set_smart(0, SmartData { healthy: Some(true), temperature_c: Some(40), ..Default::default() });
+    let d = p.smart(0).unwrap().expect("data for disk 0");
+    assert_eq!((d.healthy, d.temperature_c), (Some(true), Some(40)));
+    assert!(p.smart(1).unwrap().is_none());
+}
