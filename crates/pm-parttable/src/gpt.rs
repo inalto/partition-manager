@@ -87,6 +87,12 @@ fn read_header(dev: &mut dyn BlockDevice, lba: u64) -> SideResult<Header> {
     if crc32fast::hash(&copy) != stored_crc {
         return Err(format!("GPT header CRC mismatch at LBA {lba}"));
     }
+    let revision = rd_u32(&buf, 8);
+    if revision != REVISION {
+        return Err(format!(
+            "GPT header revision {revision:#010x} is not supported (expected {REVISION:#010x})"
+        ));
+    }
     if rd_u64(&buf, 24) != lba {
         return Err(format!("GPT header at LBA {lba} claims MyLBA {}", rd_u64(&buf, 24)));
     }
@@ -234,6 +240,10 @@ pub(crate) fn parse_gpt_backup(dev: &mut dyn BlockDevice) -> Result<Table> {
 
 /// Inspect both GPT copies without modifying anything. A disk without any GPT reports all
 /// fields false rather than an error.
+///
+/// "ok" means the copy is readable (valid header and entry-array CRCs, sane ranges). It does not
+/// imply the table is writable: the repair functions additionally require `Table::validate` to
+/// pass (for example no overlapping partitions) and fail with `Error::Invalid` otherwise.
 pub fn gpt_health(dev: &mut dyn BlockDevice) -> Result<GptHealth> {
     check_sector_size(dev)?;
     let backup = backup_lba(dev);
@@ -257,16 +267,32 @@ pub fn gpt_health(dev: &mut dyn BlockDevice) -> Result<GptHealth> {
     })
 }
 
+/// Refuse to rewrite a GPT that parses but would not pass `Table::validate`.
+fn ensure_writable(t: &Table) -> Result<()> {
+    t.validate()
+        .map_err(|e| Error::Invalid(format!("source GPT is readable but not writable: {e}")))
+}
+
 /// Rewrite the backup GPT (entries + header) from a valid primary.
+///
+/// The primary must be readable (`Error::Parse` otherwise) and its table must pass
+/// `Table::validate` (`Error::Invalid` otherwise, nothing is written): a copy that
+/// [`gpt_health`] reports as ok can still be refused here.
 pub fn gpt_repair_backup_from_primary(dev: &mut dyn BlockDevice) -> Result<()> {
     check_sector_size(dev)?;
     let t = side_table(dev, 1).map_err(|e| Error::Parse(format!("primary GPT is not usable: {e}")))?;
+    ensure_writable(&t)?;
     write_gpt(dev, &t)
 }
 
 /// Rewrite the primary GPT (header + entries, protective MBR) from a valid backup.
+///
+/// The backup must be readable (`Error::Parse` otherwise) and its table must pass
+/// `Table::validate` (`Error::Invalid` otherwise, nothing is written): a copy that
+/// [`gpt_health`] reports as ok can still be refused here.
 pub fn gpt_repair_primary_from_backup(dev: &mut dyn BlockDevice) -> Result<()> {
     let t = parse_gpt_backup(dev)?;
+    ensure_writable(&t)?;
     write_gpt(dev, &t)
 }
 

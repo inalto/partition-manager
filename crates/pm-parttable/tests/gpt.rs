@@ -449,3 +449,121 @@ fn write_gpt_rejects_bad_input() {
     assert!(matches!(write_gpt(&mut tiny, &t), Err(Error::Invalid(_))));
     assert!(dev.as_slice().iter().all(|&b| b == 0), "nothing written on error");
 }
+
+// ---- header validation and repair of unwritable sources ----
+
+const BACKUP_ARRAY_OFF: u64 = DISK - 512 - ENTRY_ARRAY as u64;
+
+/// Apply `f` to the header sector at `off`, then recompute its CRC (over header_size, clamped
+/// to the sector) so only the patched field is wrong.
+fn patch_header(dev: &mut MemDevice, off: u64, f: &dyn Fn(&mut [u8])) {
+    let mut buf = vec![0u8; 512];
+    dev.read_at(off, &mut buf).unwrap();
+    f(&mut buf);
+    let n = (u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize).clamp(20, 512);
+    buf[16..20].fill(0);
+    let crc = crc32fast::hash(&buf[..n]);
+    buf[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write_at(off, &buf).unwrap();
+}
+
+/// Apply `f` to the entry array at `array_off`, then fix the array CRC in the header at
+/// `header_off` and the header CRC.
+fn patch_array(dev: &mut MemDevice, array_off: u64, header_off: u64, f: &dyn Fn(&mut [u8])) {
+    let mut arr = vec![0u8; ENTRY_ARRAY];
+    dev.read_at(array_off, &mut arr).unwrap();
+    f(&mut arr);
+    dev.write_at(array_off, &arr).unwrap();
+    let crc = crc32fast::hash(&arr);
+    patch_header(dev, header_off, &|h| h[88..92].copy_from_slice(&crc.to_le_bytes()));
+}
+
+fn valid_dev() -> (MemDevice, Table) {
+    let mut t = sample_table(512);
+    t.bootcode = vec![0; 440];
+    let mut dev = MemDevice::new(DISK);
+    write_gpt(&mut dev, &t).unwrap();
+    (dev, t)
+}
+
+#[test]
+fn gpt_rejects_bad_revision() {
+    let (mut dev, t) = valid_dev();
+    let bad_rev = |h: &mut [u8]| h[8..12].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+    patch_header(&mut dev, 512, &bad_rev);
+    assert_eq!(parse_gpt(&mut dev).unwrap(), t, "backup rescues a bad primary revision");
+    assert!(!gpt_health(&mut dev).unwrap().primary_ok);
+    patch_header(&mut dev, DISK - 512, &bad_rev);
+    assert!(matches!(parse_gpt(&mut dev), Err(Error::Parse(_))));
+}
+
+#[test]
+fn gpt_repair_refuses_invalid_source() {
+    let (mut dev, _t) = valid_dev();
+    // Make partition 2 start inside partition 1 on both copies; every CRC stays valid.
+    let overlap = |a: &mut [u8]| {
+        let first = u64::from_le_bytes(a[32..40].try_into().unwrap());
+        a[128 + 32..128 + 40].copy_from_slice(&(first + 10).to_le_bytes());
+    };
+    patch_array(&mut dev, 1024, 512, &overlap);
+    patch_array(&mut dev, BACKUP_ARRAY_OFF, DISK - 512, &overlap);
+    let h = gpt_health(&mut dev).unwrap();
+    assert!(h.primary_ok && h.backup_ok && h.entries_crc_ok, "readable");
+    assert!(parse_gpt(&mut dev).unwrap().validate().is_err());
+
+    let before = dev.as_slice().to_vec();
+    for result in [
+        gpt_repair_backup_from_primary(&mut dev),
+        gpt_repair_primary_from_backup(&mut dev),
+    ] {
+        match result {
+            Err(Error::Invalid(m)) => assert!(m.contains("readable but not writable"), "{m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+    assert_eq!(dev.as_slice(), &before[..], "device untouched");
+}
+
+#[test]
+fn gpt_corrupt_headers_never_panic() {
+    type Patch = Box<dyn Fn(&mut [u8])>;
+    fn set32(off: usize, v: u32) -> Patch {
+        Box::new(move |h| h[off..off + 4].copy_from_slice(&v.to_le_bytes()))
+    }
+    fn set64(off: usize, v: u64) -> Patch {
+        Box::new(move |h| h[off..off + 8].copy_from_slice(&v.to_le_bytes()))
+    }
+    let header_cases: Vec<(&str, Patch)> = vec![
+        ("num_entries = u32::MAX", set32(80, u32::MAX)),
+        ("num_entries = 0", set32(80, 0)),
+        ("entry_size = u32::MAX", set32(84, u32::MAX)),
+        ("entry_size = 100", set32(84, 100)),
+        ("entries LBA beyond device", set64(72, DISK / 512 + 1000)),
+        ("entries LBA overflows", set64(72, u64::MAX)),
+        ("header_size = 4000", set32(12, 4000)),
+        ("header_size = 50", set32(12, 50)),
+        ("last usable beyond device", set64(48, u64::MAX)),
+        ("first usable > last usable", set64(40, DISK / 512)),
+    ];
+    for (name, patch) in &header_cases {
+        let (mut dev, t) = valid_dev();
+        patch_header(&mut dev, 512, patch.as_ref());
+        assert_eq!(parse_gpt(&mut dev).unwrap(), t, "{name}: backup rescues the table");
+        assert!(read_table(&mut dev).is_ok(), "{name}");
+        patch_header(&mut dev, DISK - 512, patch.as_ref());
+        assert!(matches!(parse_gpt(&mut dev), Err(Error::Parse(_))), "{name}: both bad");
+        assert!(gpt_health(&mut dev).is_ok(), "{name}");
+    }
+
+    // An entry whose LastLBA is below its FirstLBA (CRCs recomputed).
+    let (mut dev, t) = valid_dev();
+    let bad_entry = |a: &mut [u8]| {
+        let first = u64::from_le_bytes(a[32..40].try_into().unwrap());
+        a[40..48].copy_from_slice(&(first - 1).to_le_bytes());
+    };
+    patch_array(&mut dev, 1024, 512, &bad_entry);
+    assert_eq!(parse_gpt(&mut dev).unwrap(), t, "backup rescues a bad primary entry");
+    patch_array(&mut dev, BACKUP_ARRAY_OFF, DISK - 512, &bad_entry);
+    assert!(matches!(parse_gpt(&mut dev), Err(Error::Parse(_))));
+    assert!(gpt_health(&mut dev).is_ok());
+}
