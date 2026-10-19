@@ -1,7 +1,9 @@
 //! Command line definition (clap) and the CLI error type with its exit-code mapping.
 
+use crate::cmd_analyze::AnalyzeCommand;
 use crate::cmd_apply::ApplyArgs;
 use crate::cmd_ops::OpCommand;
+use crate::cmd_recover::RecoverCommand;
 use clap::{Args, Parser, Subcommand};
 use pm_image::ImageFormat;
 use std::fmt;
@@ -164,6 +166,12 @@ pub enum Command {
     Apply(ApplyArgs),
     #[command(flatten)]
     Op(OpCommand),
+    /// Find lost partitions, deleted files and carve files out of raw data
+    #[command(subcommand)]
+    Recover(RecoverCommand),
+    /// Space usage, surface test, benchmark and SMART health
+    #[command(subcommand)]
+    Analyze(AnalyzeCommand),
 }
 
 /// `--smart` / `--sector` (neither: smart when a filesystem is recognised, else sector).

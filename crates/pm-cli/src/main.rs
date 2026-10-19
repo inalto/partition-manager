@@ -3,6 +3,7 @@
 //! Exit codes: 0 success, 1 usage / invalid argument, 2 platform or runtime error.
 
 mod cli;
+mod cmd_analyze;
 mod cmd_apply;
 mod cmd_clone;
 mod cmd_doctor;
@@ -12,6 +13,7 @@ mod cmd_ls;
 mod cmd_mount;
 mod cmd_ops;
 mod cmd_probe;
+mod cmd_recover;
 mod cmd_rescue;
 mod cmd_table;
 mod device_arg;
@@ -59,6 +61,8 @@ fn dispatch(
         }
         Command::Apply(args) => cmd_apply::run_apply(&cmd_apply::Env { platform, on_images, cancel }, &args, out),
         Command::Op(op) => cmd_ops::run(&cmd_apply::Env { platform, on_images, cancel }, op, out),
+        Command::Recover(cmd) => cmd_recover::run(platform, cmd, cancel, out),
+        Command::Analyze(cmd) => cmd_analyze::run(platform, cmd, cancel, out),
     }
 }
 

@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use pm_core::{gpt_types, FileDevice, PartitionType, TableKind, MIB};
+use pm_core::{gpt_types, BlockDevice, FileDevice, PartitionType, TableKind, MIB};
 use pm_ops::Operation;
 use pm_parttable::{read_table, Table};
 use std::path::Path;
@@ -33,6 +33,13 @@ fn create_op(start: u64, len: u64, name: &str) -> Operation {
         letter: None,
         name: name.into(),
     }
+}
+
+/// Zero LBA 0..34: the protective MBR and the primary GPT.
+fn wipe_primary_gpt(img: &Path) {
+    let mut dev = FileDevice::open(img, false).unwrap();
+    dev.write_at(0, &vec![0u8; 34 * 512]).unwrap();
+    dev.flush().unwrap();
 }
 
 #[test]
@@ -271,4 +278,194 @@ fn cli_image_and_restore_ops_roundtrip() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let out = pm(&["cat", &format!("{}:1", s(&dst)), "/HELLO.TXT"]);
     assert_eq!(out.stdout, HELLO);
+}
+
+#[test]
+fn cli_recover_partitions_on_wiped_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    gpt_fat32_image(&img, 64 * MIB, MIB, 40 * MIB);
+    wipe_primary_gpt(&img);
+    assert!(table_of(&img).entries.is_empty());
+
+    // listing never writes
+    let before = read_all(&img);
+    let out = pm(&["recover", "partitions", s(&img)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("FAT32") && text.contains(&MIB.to_string()), "{text}");
+    assert_eq!(read_all(&img), before);
+
+    // --apply without --yes only says what it would do
+    let out = pm(&["recover", "partitions", s(&img), "--apply"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Re-run with --yes"), "{}", stdout(&out));
+    assert_eq!(read_all(&img), before);
+
+    let session = dir.path().join("found.json");
+    let out = pm(&["recover", "partitions", s(&img), "--apply", "--yes", "--session", s(&session)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let t = table_of(&img);
+    assert_eq!(t.kind, TableKind::Gpt);
+    assert_eq!(t.entries.len(), 1);
+    assert_eq!((t.entries[0].start, t.entries[0].len), (MIB, 40 * MIB));
+    let out = pm(&["table", s(&img)]);
+    assert!(stdout(&out).contains(&MIB.to_string()), "{}", stdout(&out));
+    // the filesystem is reachable again through the recovered table
+    let out = pm(&["ls", &format!("{}:1", s(&img))]);
+    assert!(stdout(&out).contains("HELLO.TXT"), "{}", stdout(&out));
+
+    let out = pm(&["recover", "open-session", s(&session)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("FAT32"), "{}", stdout(&out));
+}
+
+#[test]
+fn cli_recover_partitions_through_the_platform_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    gpt_fat32_image(&img, 64 * MIB, MIB, 40 * MIB);
+    wipe_primary_gpt(&img);
+    let out = pm(&["--disk-file", s(&img), "recover", "partitions", "disk:0", "--quick", "--apply", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(table_of(&img).entries.len(), 1);
+}
+
+#[test]
+fn cli_recover_files_lists_and_restores_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    gpt_fat32_image_with(&img, 64 * MIB, MIB, 40 * MIB, |b| {
+        b.add_file(2, "GONE.BIN", &pattern(20_000, 5));
+        b.delete(2, "GONE.BIN");
+    });
+    let spec = format!("{}:1", s(&img));
+    let out = pm(&["recover", "files", &spec]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // FAT replaces the first character of a deleted name
+    assert!(stdout(&out).to_ascii_lowercase().contains("one.bin"), "{}", stdout(&out));
+
+    let dest = dir.path().join("out");
+    let out = pm(&["recover", "files", &spec, "--dest", s(&dest), "--min-integrity", "50"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let restored: Vec<_> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(restored.len(), 1, "{restored:?} / {}", stdout(&out));
+    assert_eq!(std::fs::read(&restored[0]).unwrap(), pattern(20_000, 5));
+}
+
+#[test]
+fn cli_recover_carve_finds_embedded_jpeg() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("raw.img");
+    let mut dev = FileDevice::create(&img, 4 * MIB).unwrap();
+    let j = jpeg(3000);
+    let off = 701 * 512;
+    dev.write_at(off, &j).unwrap();
+    dev.flush().unwrap();
+    drop(dev);
+
+    let out = pm(&["recover", "carve", s(&img)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Image") && text.contains("JPEG"), "{text}");
+    assert!(text.contains(&off.to_string()), "{text}");
+
+    // --types filters
+    let out = pm(&["recover", "carve", s(&img), "--types", "document"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!stdout(&out).contains("JPEG"), "{}", stdout(&out));
+
+    // --extract writes the file and a session can be saved
+    let dest = dir.path().join("carved");
+    let session = dir.path().join("carve.json");
+    let out = pm(&[
+        "recover", "carve", s(&img), "--types", "image", "--extract", "--dest", s(&dest),
+        "--session", s(&session),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let files: Vec<_> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(std::fs::read(&files[0]).unwrap(), j);
+    assert!(session.exists());
+    let out = pm(&["recover", "open-session", s(&session)]);
+    assert!(stdout(&out).contains("JPEG"), "{}", stdout(&out));
+
+    // --extract needs somewhere to write; an unknown type is a usage error
+    assert_eq!(pm(&["recover", "carve", s(&img), "--extract"]).status.code(), Some(1));
+    assert_eq!(pm(&["recover", "carve", s(&img), "--types", "bogus"]).status.code(), Some(1));
+}
+
+#[test]
+fn cli_analyze_space_on_temp_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("big")).unwrap();
+    std::fs::create_dir_all(root.join("small/inner")).unwrap();
+    std::fs::write(root.join("big/a.bin"), vec![1u8; 100_000]).unwrap();
+    std::fs::write(root.join("big/b.txt"), vec![2u8; 20_000]).unwrap();
+    std::fs::write(root.join("small/inner/c.txt"), vec![3u8; 5_000]).unwrap();
+
+    let out = pm(&["analyze", "space", s(root), "--threads", "2"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let big = text.find("big").expect(&text);
+    let small = text.find("small").expect(&text);
+    assert!(big < small, "largest directory first: {text}");
+    assert!(text.contains("bin") && text.contains("txt"), "{text}");
+    assert!(text.contains("a.bin"), "{text}");
+
+    let out = pm(&["analyze", "space", s(root), "--json", "--top", "2"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("JSON");
+    assert_eq!(v["total"], 125_000);
+
+    // a file is not a directory
+    let out = pm(&["analyze", "space", s(&root.join("big/a.bin"))]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn cli_analyze_surface_on_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, 8 * MIB + 4096);
+    let out = pm(&["analyze", "surface", s(&img), "--block", "1M"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Bad blocks: 0"), "{text}");
+    assert!(text.contains("Slow blocks:"), "{text}");
+    assert!(text.contains("........."), "map of ok blocks: {text}");
+    assert_eq!(pm(&["analyze", "surface", s(&img), "--block", "0"]).status.code(), Some(1));
+}
+
+#[test]
+fn cli_analyze_smart_reports_none_for_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, MIB);
+    let out = pm(&["--disk-file", s(&img), "analyze", "smart", "0"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("No SMART data"), "{}", stdout(&out));
+    let out = pm(&["--disk-file", s(&img), "analyze", "smart", "0", "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "null");
+}
+
+#[test]
+fn cli_analyze_bench_runs_on_a_temp_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = pm(&[
+        "analyze", "bench", s(dir.path()), "--sizes", "4K,8K", "--total", "1M", "--threads", "1",
+        "--queue", "2", "--cooldown", "0",
+    ]);
+    if cfg!(windows) {
+        assert!(out.status.success(), "stderr: {}", stderr(&out));
+        let text = stdout(&out);
+        assert!(text.contains("4.00 KB") && text.contains("8.00 KB"), "{text}");
+        assert!(text.contains("MB/s") && text.contains("IOPS"), "{text}");
+        // the scratch file is gone
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    } else {
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    }
 }

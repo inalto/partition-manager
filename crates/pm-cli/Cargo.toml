@@ -16,6 +16,8 @@ pm-image = { path = "../pm-image" }
 pm-fs = { path = "../pm-fs" }
 pm-platform = { path = "../pm-platform" }
 pm-ops = { path = "../pm-ops" }
+pm-recover = { path = "../pm-recover" }
+pm-analyze = { path = "../pm-analyze" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
