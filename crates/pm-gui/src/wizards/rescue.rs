@@ -11,8 +11,8 @@
 //! the source itself, and the destination must hold the whole source.
 
 use crate::tools::{
-    danger, device_combo, error_text, open_range, wizard_window, write_problem, Device, Footer, Nav, Task, ToolEnv,
-    ToolWindow, WindowKind, WindowOutcome,
+    danger, device_combo, error_text, on_letters_problem, open_range, wizard_window, write_problem, Device, Footer, Nav,
+    Task, ToolEnv, ToolWindow, WindowKind, WindowOutcome,
 };
 use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense};
 use pm_core::{align_up, format_size, parse_size, BlockDevice, CancelToken, Error, ProgressSink};
@@ -84,8 +84,24 @@ pub fn file_dest_problem(path: &str) -> Option<String> {
     }
 }
 
-/// The default mapfile: `<file>.map` for an image file, `rescue-disk<N>[-p<M>].map` in the
-/// current folder for a device.
+/// Why the file `path` (described as `what`) may not be used: it lies on a drive of the
+/// source disk (it would be read while it changes, or written onto the failing drive) or of a
+/// destination disk (which is locked and overwritten during the rescue).
+pub fn rescue_path_problem(live: &Model, src: Device, dest: &Dest, path: &str, what: &str) -> Option<String> {
+    let src_letters = Device::Disk(src.disk()).letters(live);
+    on_letters_problem(path, &src_letters, what, &format!("Disk {} (the source)", src.disk())).or_else(|| match dest {
+        Dest::Device(d) => on_letters_problem(
+            path,
+            &Device::Disk(d.disk()).letters(live),
+            what,
+            &format!("Disk {} (the destination)", d.disk()),
+        ),
+        Dest::File(_) => None,
+    })
+}
+
+/// The default mapfile: `<file>.map` next to an image file; `rescue-disk<N>[-p<M>].map` in the
+/// user's profile folder for a device (empty when there is none: the user chooses).
 pub fn default_mapfile(dest: &Dest) -> String {
     match dest {
         Dest::File(f) if !f.trim().is_empty() => format!("{}.map", f.trim()),
@@ -95,7 +111,10 @@ pub fn default_mapfile(dest: &Dest) -> String {
                 Device::Disk(n) => format!("rescue-disk{n}.map"),
                 Device::Partition(n, p) => format!("rescue-disk{n}-p{p}.map"),
             };
-            std::env::current_dir().map(|c| c.join(&name)).unwrap_or_else(|_| PathBuf::from(name)).display().to_string()
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|h| PathBuf::from(h).join(&name).display().to_string())
+                .unwrap_or_default()
         }
     }
 }
@@ -207,20 +226,64 @@ pub struct RescueOutcome {
     pub elapsed: Duration,
 }
 
-/// Everything the worker needs.
+/// Everything the worker needs. The ranges are the ones the user confirmed; the worker
+/// re-reads the layout and refuses to run when they changed.
 struct Plan {
-    src_disk: u32,
-    src_range: Option<(u64, u64)>,
+    src: Device,
+    src_range: (u64, u64),
     dest: DestPlan,
+    pending: Vec<Operation>,
     opts: RescueOpts,
     used_only: bool,
     mapfile: PathBuf,
 }
 
 enum DestPlan {
-    /// Write to `disk` at `offset` through a write session.
-    Disk { disk: u32, offset: u64 },
+    /// Write to this disk / partition (confirmed at `range`) through a write session.
+    Device { dev: Device, range: (u64, u64) },
     File(PathBuf),
+}
+
+/// Re-check a plan against `fresh` (the layout read on the worker just before writing): the
+/// source and destination still exist with the confirmed ranges, and every check of the
+/// wizard still passes. Returns the source range to read.
+fn recheck(fresh: &Model, plan: &Plan) -> Result<(u64, u64), String> {
+    let changed = |d: Device| {
+        format!(
+            "The layout of Disk {} changed since the rescue was set up ({} moved, changed size or is gone); \
+             nothing was written. Check the disks and set the rescue up again.",
+            d.disk(),
+            match d {
+                Device::Disk(n) => format!("Disk {n}"),
+                Device::Partition(n, p) => format!("partition {p} of Disk {n}"),
+            }
+        )
+    };
+    let src_now = plan.src.range(fresh).ok_or_else(|| changed(plan.src))?;
+    if src_now != plan.src_range {
+        return Err(changed(plan.src));
+    }
+    let dest = match &plan.dest {
+        DestPlan::Device { dev, range } => {
+            if dev.range(fresh) != Some(*range) {
+                return Err(changed(*dev));
+            }
+            if let Some(e) = device_dest_problem(fresh, &plan.pending, plan.src, *dev) {
+                return Err(e);
+            }
+            Dest::Device(*dev)
+        }
+        DestPlan::File(f) => Dest::File(f.display().to_string()),
+    };
+    if let Dest::File(f) = &dest {
+        if let Some(e) = rescue_path_problem(fresh, plan.src, &dest, f, "destination file") {
+            return Err(e);
+        }
+    }
+    if let Some(e) = rescue_path_problem(fresh, plan.src, &dest, &plan.mapfile.display().to_string(), "mapfile") {
+        return Err(e);
+    }
+    Ok(src_now)
 }
 
 fn run_rescue(
@@ -231,7 +294,11 @@ fn run_rescue(
     cancel: &CancelToken,
 ) -> pm_core::Result<RescueOutcome> {
     let started = std::time::Instant::now();
-    let dev = open_range(p, plan.src_disk, plan.src_range, OpenMode::ReadOnly)?;
+    let fresh = Model::from_platform(p)?;
+    let src_range = recheck(&fresh, &plan).map_err(Error::Invalid)?;
+    // never the whole disk for a partition source: exactly the re-checked range
+    let slice = matches!(plan.src, Device::Partition(..)).then_some(src_range);
+    let dev = open_range(p, plan.src.disk(), slice, OpenMode::ReadOnly)?;
     let (len, sector) = (dev.len(), dev.sector_size());
     let mut src = SharedSource { inner: Arc::new(Mutex::new(dev)), len, sector, pos };
     if plan.used_only {
@@ -241,25 +308,21 @@ fn run_rescue(
         plan.opts.used_map = Some(used);
         plan.opts.zero_unused = true;
     }
-    let stats = match plan.dest {
-        DestPlan::Disk { disk, offset } => {
-            // the same rule as the executor, re-checked on fresh data: never the system disk
-            let sys = pm_ops::Model::from_platform(p)?.effective_system_disk();
-            if sys.map_or(true, |s| s == disk) {
-                return Err(Error::Invalid(format!("Disk {disk} is (or may be) the running system disk; refusing to write to it")));
-            }
+    let stats = match &plan.dest {
+        DestPlan::Device { dev, range: (offset, _) } => {
+            let disk = dev.disk();
             let mut session = p.begin_write(disk)?;
-            let r = rescue(&mut src, session.device(), offset, &plan.opts, progress, cancel);
+            let r = rescue(&mut src, session.device(), *offset, &plan.opts, progress, cancel);
             let fin = session.finish();
             let rescan = p.rescan(disk);
             r.and_then(|s| fin.and(rescan).map(|_| s))
         }
         DestPlan::File(path) => {
             let mut out = if path.exists() {
-                pm_image::open(&path, false)?
+                pm_image::open(path, false)?
             } else {
                 let opts = pm_image::CreateOpts { format: pm_image::ImageFormat::Raw, capacity: align_up(len.max(512), 512), sparse: true };
-                pm_image::create(&path, &opts)?
+                pm_image::create(path, &opts)?
             };
             let r = rescue(&mut src, &mut *out, 0, &plan.opts, progress, cancel);
             r.and_then(|s| out.flush().map(|_| s))
@@ -351,9 +414,20 @@ impl RescueWizard {
                 if self.file_check.as_ref().map(|c| &c.0) != Some(f) {
                     self.file_check = Some((f.clone(), file_dest_problem(f)));
                 }
-                self.file_check.as_ref().and_then(|c| c.1.clone())
+                let folder = self.file_check.as_ref().and_then(|c| c.1.clone());
+                folder.or_else(|| rescue_path_problem(env.live, src, &self.dest, f, "destination file"))
             }
         }
+    }
+
+    /// The mapfile check: not on the source or destination disks, readable when it exists.
+    fn mapfile_problem(&mut self, env: &ToolEnv) -> Result<Option<Resume>, String> {
+        if let Some(src) = self.src {
+            if let Some(e) = rescue_path_problem(env.live, src, &self.dest, &self.mapfile, "mapfile") {
+                return Err(e);
+            }
+        }
+        self.resume_info()
     }
 
     fn resume_info(&mut self) -> Result<Option<Resume>, String> {
@@ -371,21 +445,58 @@ impl RescueWizard {
 
     fn start(&mut self, env: &ToolEnv) {
         let (Some(src), Ok(opts)) = (self.src, self.opts()) else { return };
-        let src_range = matches!(src, Device::Partition(..)).then(|| src.range(env.live)).flatten();
+        let gone = || "The source or destination no longer exists; set the rescue up again.".to_string();
+        let Some(src_range) = src.range(env.live) else {
+            self.error = Some(gone());
+            return;
+        };
         let dest = match &self.dest {
-            Dest::Device(d) => {
-                let Some((start, _)) = d.range(env.live) else { return };
-                DestPlan::Disk { disk: d.disk(), offset: start }
-            }
+            Dest::Device(d) => match d.range(env.live) {
+                Some(range) => DestPlan::Device { dev: *d, range },
+                None => {
+                    self.error = Some(gone());
+                    return;
+                }
+            },
             Dest::File(f) => DestPlan::File(PathBuf::from(f.trim())),
         };
-        self.wrote_disk = matches!(dest, DestPlan::Disk { .. });
-        let plan = Plan { src_disk: src.disk(), src_range, dest, opts, used_only: self.used_only, mapfile: PathBuf::from(self.mapfile.trim()) };
+        self.wrote_disk = matches!(dest, DestPlan::Device { .. });
+        let plan = Plan {
+            src,
+            src_range,
+            dest,
+            pending: env.pending.to_vec(),
+            opts,
+            used_only: self.used_only,
+            mapfile: PathBuf::from(self.mapfile.trim()),
+        };
         let p = env.platform.clone();
         let pos = self.pos.clone();
         self.outcome = None;
         self.error = None;
         self.task = Some(Task::spawn("Rescue copy", move |progress, cancel| run_rescue(&*p, plan, pos, progress, cancel)));
+    }
+
+    /// Act on a footer button; returns `true` when the window should close.
+    fn navigate(&mut self, nav: Nav, env: &ToolEnv) -> bool {
+        let idle = self.task.is_none();
+        match nav {
+            Nav::Close => return idle,
+            Nav::Back if idle => {
+                self.outcome = None;
+                self.error = None;
+                self.page = self.page.saturating_sub(1);
+            }
+            Nav::Next if self.page + 1 < PAGES.len() => self.page += 1,
+            // "New run…" on the results: back to the confirmation, never straight to a write
+            Nav::Next if idle && self.outcome.is_some() => {
+                self.outcome = None;
+                self.error = None;
+            }
+            Nav::Next if idle => self.start(env),
+            _ => {}
+        }
+        false
     }
 
     fn page_source(&mut self, ui: &mut egui::Ui, env: &ToolEnv) -> Footer {
@@ -437,12 +548,12 @@ impl RescueWizard {
         Footer::step(false, problem)
     }
 
-    fn page_mapfile(&mut self, ui: &mut egui::Ui) -> Footer {
+    fn page_mapfile(&mut self, ui: &mut egui::Ui, env: &ToolEnv) -> Footer {
         ui.label("The mapfile records which areas are rescued; with it an interrupted rescue can be resumed (by this tool or GNU ddrescue).");
         if ui.add(egui::TextEdit::singleline(&mut self.mapfile).desired_width(460.0)).changed() {
             self.mapfile_edited = true;
         }
-        let r = self.resume_info();
+        let r = self.mapfile_problem(env);
         match &r {
             Ok(Some(res)) => {
                 ui.colored_label(
@@ -534,7 +645,8 @@ impl RescueWizard {
                 map_bar_ui(ui, m);
             }
             ui.label(format!("Mapfile: {}", self.mapfile.trim()));
-            return Footer { back: true, next: Some(("Run again".into(), true)), close: Some("Close".into()), problem: None };
+            // a new run goes through the confirmation (and its checks) again
+            return Footer { back: true, next: Some(("New run…".into(), true)), close: Some("Close".into()), problem: None };
         }
         // the confirmation
         let src = self.src.map_or("-".into(), |s| s.describe(env.live));
@@ -550,7 +662,11 @@ impl RescueWizard {
             }
         });
         ui.add_space(8.0);
-        let problem = self.dest_problem(env).or_else(|| self.opts().err()).or(self.error.clone());
+        let problem = self
+            .dest_problem(env)
+            .or_else(|| self.mapfile_problem(env).err())
+            .or_else(|| self.opts().err())
+            .or(self.error.clone());
         danger(ui, format!("The rescue starts immediately (it is not a pending operation) and overwrites {dst}."));
         Footer { back: true, next: Some(("Start rescue".into(), problem.is_none())), close: Some("Cancel".into()), problem }
     }
@@ -609,19 +725,12 @@ impl ToolWindow for RescueWizard {
         let nav = wizard_window(ctx, "Rescue Copy", &PAGES, page, |ui| match page {
             0 => self.page_source(ui, env),
             1 => self.page_dest(ui, env),
-            2 => self.page_mapfile(ui),
+            2 => self.page_mapfile(ui, env),
             3 => self.page_options(ui),
             _ => self.page_run(ui, env),
         });
-        match nav {
-            Nav::Close if self.task.is_none() => return WindowOutcome::Close,
-            Nav::Back if self.task.is_none() => {
-                self.outcome = None;
-                self.page = self.page.saturating_sub(1);
-            }
-            Nav::Next if page + 1 < PAGES.len() => self.page += 1,
-            Nav::Next if self.task.is_none() => self.start(env),
-            _ => {}
+        if self.navigate(nav, env) {
+            return WindowOutcome::Close;
         }
         if refresh {
             WindowOutcome::Refresh
@@ -702,6 +811,103 @@ mod tests {
         assert_eq!(bar[0], BlockStatus::Finished);
         assert_eq!(bar[6], BlockStatus::Bad, "the worst status of the bucket");
         assert_eq!(bar[9], BlockStatus::NonTried);
+    }
+
+    #[test]
+    fn files_on_the_source_or_destination_disk_are_refused() {
+        let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
+        m.system_disk = Some(7);
+        // E: is partition 3 of Disk 1
+        let src = Device::Partition(1, 1);
+        let to_file = Dest::File("E:\\x.img".into());
+        let e = rescue_path_problem(&m, src, &to_file, "E:\\x.img", "destination file").unwrap();
+        assert!(e.contains("drive E:") && e.contains("Disk 1 (the source)"), "{e}");
+        assert!(rescue_path_problem(&m, Device::Disk(0), &to_file, "E:\\x.img", "destination file").is_none());
+        // the mapfile neither on the source nor on a destination disk
+        let to_disk = Dest::Device(Device::Disk(1));
+        let e = rescue_path_problem(&m, Device::Disk(0), &to_disk, "e:\\r.map", "mapfile").unwrap();
+        assert!(e.contains("the destination"), "{e}");
+        assert!(rescue_path_problem(&m, Device::Disk(0), &to_disk, "D:\\r.map", "mapfile").is_none());
+        // device destinations: the default mapfile is in the profile folder, never the cwd
+        let d = default_mapfile(&Dest::Device(Device::Disk(3)));
+        if let Some(h) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            assert_eq!(d, PathBuf::from(h).join("rescue-disk3.map").display().to_string());
+        }
+    }
+
+    /// The wizard was set up on one layout and the disks changed before the job ran: the
+    /// worker re-reads the layout and refuses without writing anything.
+    #[test]
+    fn a_layout_change_before_the_run_is_refused() {
+        use pm_core::MemDevice;
+        let mock = pm_platform::MockPlatform::new();
+        for d in [gpt_disk(1), mbr_disk(0)] {
+            let mut dev = MemDevice::new(d.size);
+            pm_parttable::write_table(&mut dev, &pm_ops::table_from_disk(&d)).unwrap();
+            mock.add_disk(d.index, dev, d);
+        }
+        mock.set_system_disk(7);
+        let mock = Arc::new(mock);
+        let p: Arc<dyn Platform> = mock.clone();
+        let run = |stale: &Model, src: Device, dst: Device| -> String {
+            let env = ToolEnv { platform: &p, live: stale, pending: &[] };
+            let mut w = RescueWizard::new(Some(src));
+            w.dest = Dest::Device(dst);
+            w.mapfile = String::new();
+            w.start(&env);
+            let Some(t) = w.task.as_mut() else { return w.error.clone().unwrap() };
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(r) = t.poll() {
+                    return match r {
+                        Err(e) => error_text(&e),
+                        Ok(o) => o.stats.err().unwrap_or_else(|| "it ran".into()),
+                    };
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let live = Model::from_platform(&*p).unwrap();
+        // the source partition moved
+        let mut moved = live.clone();
+        moved.partition_mut(1, 3).unwrap().start += MIB;
+        let e = run(&moved, Device::Partition(1, 3), Device::Disk(0));
+        assert!(e.contains("changed since the rescue was set up") && e.contains("partition 3 of Disk 1"), "{e}");
+        // the source partition is gone on the disk (only the stale model has it)
+        let mut extra = live.clone();
+        let mut ghost = extra.partition(1, 3).unwrap().clone();
+        ghost.number = 9;
+        ghost.start = 801 * MIB;
+        ghost.len = 100 * MIB;
+        extra.disk_mut(1).unwrap().partitions.push(ghost);
+        let e = run(&extra, Device::Partition(1, 9), Device::Disk(0));
+        assert!(e.contains("changed since"), "{e}");
+        // the destination partition changed size
+        let mut dst_changed = live.clone();
+        dst_changed.partition_mut(0, 1).unwrap().len += MIB;
+        let e = run(&dst_changed, Device::Partition(1, 5 - 4), Device::Partition(0, 1));
+        assert!(e.contains("partition 1 of Disk 0"), "{e}");
+        // a partition missing from the UI model is never read as the whole disk
+        let e = run(&live, Device::Partition(1, 42), Device::Disk(0));
+        assert!(e.contains("no longer exists"), "{e}");
+        assert!(mock.write_sessions_log().is_empty(), "nothing was written");
+    }
+
+    #[test]
+    fn new_run_goes_back_to_the_confirmation() {
+        use crate::tools::test_env::{model, platform};
+        let (m, p) = (model(), platform());
+        let env = ToolEnv { platform: &p, live: &m, pending: &[] };
+        let mut w = RescueWizard::new(Some(Device::Partition(1, 3)));
+        w.page = PAGES.len() - 1;
+        w.outcome = Some(RescueOutcome { stats: Ok(RescueStats::default()), map: None, len: MIB, elapsed: Duration::ZERO });
+        w.error = Some("old".into());
+        // "New run…" shows the confirmation again instead of writing
+        assert!(!w.navigate(Nav::Next, &env));
+        assert!(w.outcome.is_none() && w.error.is_none());
+        assert!(w.task.is_none(), "no write started");
+        assert_eq!(w.page, PAGES.len() - 1);
     }
 
     #[test]

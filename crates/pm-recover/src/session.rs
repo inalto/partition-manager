@@ -43,12 +43,41 @@ pub struct ScanSession {
     pub created: String,
     pub device: DeviceIdentity,
     pub kind: SessionKind,
+    /// Byte offset of the scanned region on the device `device` identifies (the start of the
+    /// partition when a partition was scanned; 0 for the whole device). Carved offsets and
+    /// unreadable ranges in `kind` are relative to this region. Missing in older files: 0.
+    #[serde(default)]
+    pub offset: u64,
+    /// Length of the scanned region in bytes (0: unknown, the rest of the device from
+    /// `offset`). Missing in older files: 0.
+    #[serde(default)]
+    pub scanned_len: u64,
 }
 
 impl ScanSession {
-    /// A session created now.
+    /// A session of the whole device, created now.
     pub fn new(device: DeviceIdentity, kind: SessionKind) -> ScanSession {
-        ScanSession { created: now_iso8601(), device, kind }
+        ScanSession { created: now_iso8601(), device, kind, offset: 0, scanned_len: 0 }
+    }
+
+    /// The same session over the region `[offset, offset + len)` of the device.
+    pub fn with_region(mut self, offset: u64, len: u64) -> ScanSession {
+        self.offset = offset;
+        self.scanned_len = len;
+        self
+    }
+
+    /// The scanned region `(offset, len)` on a device of `dev_len` bytes, or why it does not
+    /// fit there (e.g. the device is smaller than the one that was scanned).
+    pub fn region(&self, dev_len: u64) -> Result<(u64, u64)> {
+        let len = if self.scanned_len == 0 { dev_len.saturating_sub(self.offset) } else { self.scanned_len };
+        match self.offset.checked_add(len) {
+            Some(end) if end <= dev_len && len > 0 => Ok((self.offset, len)),
+            _ => Err(Error::Invalid(format!(
+                "the scanned region ({len} bytes at offset {}) does not fit the device ({dev_len} bytes)",
+                self.offset
+            ))),
+        }
     }
 
     /// Write the session as JSON. The file is written next to `p` and renamed into place, so an

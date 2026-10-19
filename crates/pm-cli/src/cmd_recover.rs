@@ -240,6 +240,12 @@ fn check_dest(platform: &dyn Platform, device: &str, dest: &Path) -> Result<(), 
     }
 }
 
+/// A session of `kind` recorded on the region of the device `o` covers: offsets in `kind`
+/// are relative to that region (a partition's start, 0 for a whole disk / image / volume).
+fn session_of(identity: DeviceIdentity, kind: SessionKind, o: &Opened) -> ScanSession {
+    ScanSession::new(identity, kind).with_region(o.range.0, o.range.1.saturating_sub(o.range.0))
+}
+
 fn save_session(
     platform: &dyn Platform,
     o: &Opened,
@@ -247,7 +253,7 @@ fn save_session(
     path: &Path,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    ScanSession::new(device_identity(platform, o), kind).save(path).map_err(session_err)?;
+    session_of(device_identity(platform, o), kind, o).save(path).map_err(session_err)?;
     writeln!(out, "Session saved to {}", path.display()).map_err(write_err)
 }
 
@@ -422,6 +428,7 @@ fn files(
     }
     let opened = open_spec(platform, device, OpenMode::ReadOnly)?;
     let offset = opened.range.0;
+    let opened_len = opened.range.1.saturating_sub(opened.range.0);
     let identity = device_identity(platform, &opened);
     let mut fs = pm_fs::open(opened.dev).map_err(|e| match e {
         Error::Unsupported(m) | Error::Parse(m) => CliError::Usage(format!("{device}: no readable filesystem ({m})")),
@@ -431,7 +438,11 @@ fn files(
     list.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
     out.write_all(render_deleted(&list).as_bytes()).map_err(write_err)?;
     if let Some(path) = session {
-        ScanSession::new(identity, SessionKind::Deleted(list.clone())).save(path).map_err(session_err)?;
+        let region = (offset, opened_len);
+        ScanSession::new(identity, SessionKind::Deleted(list.clone()))
+            .with_region(region.0, region.1)
+            .save(path)
+            .map_err(session_err)?;
         writeln!(out, "Session saved to {}", path.display()).map_err(write_err)?;
     }
     let Some(dest) = dest else {
@@ -597,6 +608,18 @@ fn carve_cmd(
 // ------------------------------------------------------------------------------------------
 // open-session
 
+/// Which part of the device a session covers; carved offsets are relative to it.
+fn region_text(s: &ScanSession) -> String {
+    match (s.offset, s.scanned_len) {
+        (0, 0) => "Scanned region: the whole device".to_string(),
+        (off, 0) => format!("Scanned region: from offset {off} to the end of the device (offsets below are relative to it)"),
+        (off, len) => format!(
+            "Scanned region: {} at offset {off} (offsets below are relative to it)",
+            format_size(len)
+        ),
+    }
+}
+
 fn open_session(file: &Path, out: &mut dyn Write) -> Result<(), CliError> {
     let s = ScanSession::load(file).map_err(|e| match e {
         Error::Parse(m) => CliError::Usage(m),
@@ -616,6 +639,7 @@ fn open_session(file: &Path, out: &mut dyn Write) -> Result<(), CliError> {
         d.table_id
     )
     .map_err(write_err)?;
+    writeln!(out, "{}", region_text(&s)).map_err(write_err)?;
     let body = match &s.kind {
         SessionKind::Partitions(c) => render_candidates(c),
         SessionKind::Deleted(f) => render_deleted(f),
@@ -627,6 +651,61 @@ fn open_session(file: &Path, out: &mut dyn Write) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carve of a partition records the partition's region, so the stored (partition-
+    /// relative) offsets read the right bytes through a slice of the whole image.
+    #[test]
+    fn partition_carve_session_records_its_region() {
+        use pm_core::{BlockDevice, MIB};
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        let mut dev = pm_image::create(&img, &pm_image::CreateOpts { format: pm_image::ImageFormat::Raw, capacity: 16 * MIB, sparse: false }).unwrap();
+        let mut t = Table::empty(TableKind::Gpt, 16 * MIB, 512);
+        t.entries.push(pm_parttable::Entry {
+            number: 1,
+            start: 4 * MIB,
+            len: 8 * MIB,
+            ptype: pm_core::PartitionType::Gpt(pm_core::gpt_types::BASIC_DATA),
+            guid: Some(uuid::Uuid::from_u128(9)),
+            name: String::new(),
+            attrs: 0,
+            logical: false,
+        });
+        pm_parttable::write_table(&mut *dev, &t).unwrap();
+        let pdf = b"%PDF-1.4
+1 0 obj << >> endobj
+trailer << >>
+%%EOF
+";
+        dev.write_at(4 * MIB + MIB, pdf).unwrap();
+        dev.flush().unwrap();
+        drop(dev);
+        let session = dir.path().join("s.json");
+        let platform = pm_platform::MockPlatform::new();
+        let cmd = RecoverCommand::Carve {
+            device: format!("{}:1", img.display()),
+            dest: None,
+            types: vec!["document".into()],
+            sector: 512,
+            session: Some(session.clone()),
+            extract: false,
+        };
+        run(&platform, cmd, &CancelToken::new(), &mut Vec::new()).unwrap();
+        let s = ScanSession::load(&session).unwrap();
+        assert_eq!((s.offset, s.scanned_len), (4 * MIB, 8 * MIB));
+        let SessionKind::Carved(r) = &s.kind else { panic!("{:?}", s.kind) };
+        let f = r.files.iter().find(|f| f.ext == "pdf").expect("the PDF is carved");
+        assert_eq!(f.offset, MIB, "relative to the partition");
+        // reading it back the way a restore does: the region of the whole image
+        let whole = pm_image::open(&img, true).unwrap();
+        let (off, len) = s.region(whole.len()).unwrap();
+        let mut region = pm_core::SliceDevice::new(whole, off, len).unwrap();
+        let out = extract_carved(&mut region, f, &dir.path().join("out")).unwrap();
+        assert!(std::fs::read(out).unwrap().starts_with(b"%PDF-1.4"));
+        let mut text = Vec::new();
+        open_session(&session, &mut text).unwrap();
+        assert!(String::from_utf8(text).unwrap().contains("Scanned region: 8.00 MB at offset 4194304"));
+    }
 
     #[test]
     fn categories_parse() {

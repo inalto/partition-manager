@@ -137,3 +137,25 @@ fn matches_compares_model_serial_size() {
     assert_eq!(id.table_id, "8A1B2C3D");
     assert!(ScanSession::new(id, SessionKind::Carved(CarveReport::default())).matches(&ok));
 }
+
+#[test]
+fn session_region_roundtrip_and_legacy_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("part.json");
+    let s = ScanSession::new(identity(), SessionKind::Carved(CarveReport::default())).with_region(1 << 20, 40 << 20);
+    s.save(&p).unwrap();
+    let back = ScanSession::load(&p).unwrap();
+    assert_eq!((back.offset, back.scanned_len), (1 << 20, 40 << 20));
+    assert_eq!(back.region(64 << 20).unwrap(), (1 << 20, 40 << 20));
+    assert!(back.region(32 << 20).is_err(), "the region no longer fits a smaller device");
+    // a file written before the fields existed: the whole device
+    let mut v = serde_json::to_value(&s).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("offset");
+    obj.remove("scanned_len");
+    std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+    let legacy = ScanSession::load(&p).unwrap();
+    assert_eq!((legacy.offset, legacy.scanned_len), (0, 0));
+    assert_eq!(legacy.region(64 << 20).unwrap(), (0, 64 << 20));
+    assert!(legacy.region(0).is_err());
+}

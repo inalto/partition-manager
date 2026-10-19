@@ -29,6 +29,16 @@ impl RestoreTarget {
     }
 }
 
+/// The disk of `m` holding the drive letter of `path`, and that letter.
+pub fn image_disk(m: &Model, path: &str) -> Option<(u32, char)> {
+    let c = crate::tools::path_letter(Path::new(path.trim()))?;
+    m.disks.iter().find(|d| d.partitions.iter().any(|p| p.letter() == Some(c))).map(|d| (d.index, c))
+}
+
+fn image_on_target(d: u32, c: char) -> String {
+    format!("The image file is on drive {c}:, which is on Disk {d}; it cannot be restored onto that disk. Copy it to another disk first.")
+}
+
 /// Format and virtual capacity of the image at `path` (reads its header).
 pub fn identify(path: &Path) -> Result<(ImageFormat, u64), String> {
     let fmt = pm_image::identify(path).map_err(|e| e.to_string())?;
@@ -60,11 +70,15 @@ pub struct ImageRestoreState {
     /// The identified path and its format / capacity (or why it cannot be used).
     pub info: Option<(String, Result<(ImageFormat, u64), String>)>,
     pub target: Option<RestoreTarget>,
+    /// The disk holding the image file, with its drive letter: never a target (restoring
+    /// locks and overwrites the disk the image is read from). Updated from the model when the
+    /// target step is drawn.
+    pub image_disk: Option<(u32, char)>,
 }
 
 impl ImageRestoreState {
     pub fn initial(_ctx: &WizardCtx) -> Option<ImageRestoreState> {
-        Some(ImageRestoreState { path: String::new(), info: None, target: None })
+        Some(ImageRestoreState { path: String::new(), info: None, target: None, image_disk: None })
     }
 
     /// The capacity of the identified image, when the path is the identified one.
@@ -91,6 +105,9 @@ impl ImageRestoreState {
             return Err("Enter the path of an image file.".into());
         }
         let target = self.target.ok_or("Choose where to restore the image.")?;
+        if let Some((d, c)) = self.image_disk.filter(|(d, _)| *d == target.disk()) {
+            return Err(image_on_target(d, c));
+        }
         let (dst_disk, dst_start) = match target {
             RestoreTarget::Disk(d) => (d, None),
             RestoreTarget::Free(d, s, _) => (d, Some(align_up(s, MIB))),
@@ -123,7 +140,15 @@ fn file_ui(s: &mut ImageRestoreState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> St
 fn target_ui(s: &mut ImageRestoreState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
     let m = ctx.model;
     let Some(cap) = s.capacity() else { return StepResult::Invalid("Choose an image file first.".into()) };
-    let list = targets(m, cap, ctx.system_disk);
+    s.image_disk = image_disk(m, &s.path);
+    let blocked = s.image_disk.map(|b| b.0);
+    let list: Vec<RestoreTarget> = targets(m, cap, ctx.system_disk).into_iter().filter(|t| Some(t.disk()) != blocked).collect();
+    if let Some((d, c)) = s.image_disk {
+        ui.weak(format!("Disk {d} is not offered: it holds the image file (drive {c}:)."));
+        if s.target.is_some_and(|t| t.disk() == d) {
+            s.target = None;
+        }
+    }
     if list.is_empty() {
         return StepResult::Invalid(format!("No disk or unallocated space can hold {}.", format_size(cap)));
     }
@@ -220,5 +245,22 @@ mod tests {
         bad.path = dir.path().join("missing.vhd").display().to_string();
         bad.refresh_info();
         assert!(bad.capacity().is_none());
+    }
+
+    #[test]
+    fn image_on_the_target_disk_is_refused() {
+        let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
+        m.system_disk = Some(7);
+        assert_eq!(image_disk(&m, r"E:\img\disk.vhd"), Some((1, 'E')));
+        assert_eq!(image_disk(&m, r"D:\disk.vhd"), None);
+        let ctx = WizardCtx::new(&m, vec![], Selected::None);
+        let mut s = ImageRestoreState::initial(&ctx).unwrap();
+        s.path = r"E:\img\disk.vhd".into();
+        s.image_disk = image_disk(&m, &s.path);
+        s.target = Some(RestoreTarget::Disk(1));
+        let e = s.build().unwrap_err();
+        assert!(e.contains("drive E:") && e.contains("Disk 1"), "{e}");
+        s.target = Some(RestoreTarget::Disk(0));
+        assert!(s.build().is_ok(), "another disk is fine");
     }
 }

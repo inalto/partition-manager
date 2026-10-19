@@ -257,6 +257,27 @@ impl Device {
     }
 }
 
+/// The drive letter of the absolute path `p`, if it has one (`E:\x`, `\\?\E:\x`).
+pub fn path_letter(p: &std::path::Path) -> Option<char> {
+    use std::path::{Component, Prefix};
+    match p.components().next()? {
+        Component::Prefix(x) => match x.kind() {
+            Prefix::Disk(b) | Prefix::VerbatimDisk(b) => Some((b as char).to_ascii_uppercase()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Why the file `path` (described as `what`) may not be used because it lies on one of
+/// `letters`, the drives of `device` (a device being read or written), if it may not.
+pub fn on_letters_problem(path: &str, letters: &[char], what: &str, device: &str) -> Option<String> {
+    let c = path_letter(std::path::Path::new(path.trim()))?;
+    letters
+        .contains(&c)
+        .then(|| format!("The {what} is on drive {c}:, which is on {device}; choose a location on another disk."))
+}
+
 /// Open `disk` of `platform` (on a worker thread), whole or the `range` slice of it.
 pub fn open_range(
     platform: &dyn Platform,

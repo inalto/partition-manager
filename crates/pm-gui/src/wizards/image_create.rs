@@ -4,7 +4,7 @@
 
 use super::{disk_preview, row};
 use crate::selection::Selected;
-use crate::tools::Device;
+use crate::tools::{on_letters_problem, Device};
 use crate::wizard::{shared, StepResult, Wizard, WizardCtx};
 use eframe::egui;
 use pm_core::format_size;
@@ -70,13 +70,23 @@ pub struct ImageCreateState {
     pub mode: CloneMode,
     /// [`path_problem`] of the last checked path (checked when the text changes).
     checked: Option<(String, Option<String>)>,
+    /// Drive letters on the source (the image may not be written there: it would read what
+    /// it writes). Updated from the model whenever a step is drawn.
+    pub source_letters: Vec<char>,
 }
 
 impl ImageCreateState {
     pub fn initial(ctx: &WizardCtx) -> Option<ImageCreateState> {
         let all = Device::all(ctx.model);
         let source = Device::from_selection(ctx.selection).filter(|d| all.contains(d)).or_else(|| all.first().copied())?;
-        Some(ImageCreateState { source, path: String::new(), format: ImageFormat::VhdDynamic, mode: CloneMode::Smart, checked: None })
+        Some(ImageCreateState {
+            source,
+            path: String::new(),
+            format: ImageFormat::VhdDynamic,
+            mode: CloneMode::Smart,
+            checked: None,
+            source_letters: source.letters(ctx.model),
+        })
     }
 
     fn path_check(&mut self) -> Option<String> {
@@ -86,10 +96,18 @@ impl ImageCreateState {
         self.checked.as_ref().and_then(|c| c.1.clone())
     }
 
+    /// Why the image may not be written where `path` says: on the device being imaged.
+    pub fn on_source_problem(&self) -> Option<String> {
+        on_letters_problem(&self.path, &self.source_letters, "image file", "the device being imaged")
+    }
+
     pub fn build(&self) -> Result<Vec<Operation>, String> {
         let t = self.path.trim();
         if t.is_empty() {
             return Err("Enter the path of the image file.".into());
+        }
+        if let Some(e) = self.on_source_problem() {
+            return Err(e);
         }
         let path = PathBuf::from(t);
         let (format, mode) = (self.format, self.mode);
@@ -101,6 +119,7 @@ impl ImageCreateState {
 }
 
 fn source_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
+    s.source_letters = s.source.letters(ctx.model);
     let m: &Model = ctx.model;
     ui.label("Select the disk or partition to image:");
     let mut choice = Some(s.source);
@@ -122,7 +141,8 @@ fn source_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> St
     StepResult::Continue
 }
 
-fn file_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
+fn file_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
+    s.source_letters = s.source.letters(ctx.model);
     egui::Grid::new("image_file").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label("Image file:");
         let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(380.0).hint_text("D:\\Backups\\disk1.vhd"));
@@ -146,7 +166,7 @@ fn file_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> Ste
         ui.weak("Sparse format: unused areas take no space in the file.");
     }
     ui.weak("An existing file of that name is replaced.");
-    StepResult::from_problem(s.path_check())
+    StepResult::from_problem(s.path_check().or_else(|| s.on_source_problem()))
 }
 
 fn mode_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
@@ -234,5 +254,19 @@ mod tests {
         s.format = ImageFormat::VhdFixed;
         let ops = wizard(s).build_ops().unwrap();
         assert_eq!(ops, vec![Operation::ImageDisk { disk: 1, path, format: ImageFormat::VhdFixed, mode: CloneMode::Sector }]);
+    }
+
+    #[test]
+    fn image_file_on_the_source_is_refused() {
+        let m = model_of(vec![gpt_disk(1)]);
+        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3));
+        let mut s = ImageCreateState::initial(&ctx).unwrap();
+        assert_eq!(s.source_letters, ['E']);
+        s.path = r"e:\backup\data.vhd".into();
+        let e = s.build().unwrap_err();
+        assert!(e.contains("drive E:") && e.contains("being imaged"), "{e}");
+        s.path = r"D:\backup\data.vhd".into();
+        assert!(s.on_source_problem().is_none());
+        assert!(s.build().is_ok());
     }
 }

@@ -21,7 +21,7 @@ use pm_recover::{
     carve, deleted_files_at, extract_carved, restore_file, signatures, CarveReport, Category, DeletedFile, DeviceIdentity,
     ScanSession, SessionKind,
 };
-use std::path::{Component, Path, PathBuf, Prefix};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PAGES: [&str; 6] = ["Device", "Scan type", "Scan", "Results", "Destination", "Restore"];
@@ -66,16 +66,7 @@ pub fn deleted_scan_supported(fs: Option<FsKind>) -> bool {
     )
 }
 
-/// The drive letter of the absolute path `dest`, if it has one.
-pub fn dest_letter(dest: &Path) -> Option<char> {
-    match dest.components().next()? {
-        Component::Prefix(p) => match p.kind() {
-            Prefix::Disk(b) | Prefix::VerbatimDisk(b) => Some((b as char).to_ascii_uppercase()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
+pub use crate::tools::path_letter as dest_letter;
 
 /// Why `dest` cannot receive recovered files from a device holding `source_letters`, if it
 /// cannot: recovered data must never be written onto the drive it is recovered from.
@@ -187,10 +178,10 @@ pub struct RestoreSummary {
 
 /// Where the files of a scan are read from when they are restored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReadFrom {
-    disk: u32,
+pub struct ReadFrom {
+    pub disk: u32,
     /// The partition (start, len); `None`: the whole disk.
-    range: Option<(u64, u64)>,
+    pub range: Option<(u64, u64)>,
 }
 
 fn read_from(dev: Device, m: &Model) -> Option<ReadFrom> {
@@ -272,39 +263,46 @@ fn restore_job(
     Ok(sum)
 }
 
-/// A scan result to save: carved offsets are made relative to the disk, so a session always
-/// refers to the whole disk it identifies (deleted files carry their filesystem offset).
-fn session_kind(found: &Found, from: ReadFrom) -> SessionKind {
-    match found {
+/// The session to save for `found`, scanned on `from` of `disk`: its offsets stay relative
+/// to the scanned region, which the session records (`offset`, `scanned_len`).
+fn session_for(found: &Found, from: ReadFrom, disk: &pm_core::DiskInfo) -> ScanSession {
+    let kind = match found {
         Found::Deleted(v) => SessionKind::Deleted(v.clone()),
-        Found::Carved(r) => {
-            let mut r = r.clone();
-            let base = from.range.map_or(0, |x| x.0);
-            for f in &mut r.files {
-                f.offset += base;
-            }
-            for u in &mut r.unreadable {
-                u.0 += base;
-            }
-            SessionKind::Carved(r)
-        }
-    }
+        Found::Carved(r) => SessionKind::Carved(r.clone()),
+    };
+    let (offset, len) = from.range.unwrap_or((0, disk.size));
+    ScanSession::new(DeviceIdentity::from_disk(disk), kind).with_region(offset, len)
 }
 
-/// The device a loaded session's files are read from on the live disks, if connected.
-fn session_device(s: &ScanSession, m: &Model) -> Option<Device> {
+/// Where a loaded session's files are read from on the live disks (`None`: its disk is not
+/// connected), and the device that region is (for the destination check). The region is the
+/// one the session records; sessions without one (older files) fall back to the filesystem
+/// offset of deleted files, or the whole disk. Bounds are checked again when the device is
+/// opened.
+fn session_origin(s: &ScanSession, m: &Model) -> Option<Origin> {
     let d = m.disks.iter().find(|d| s.matches(d))?;
-    match &s.kind {
-        SessionKind::Deleted(v) => {
-            let off = v.first().map_or(0, |f| f.fs_offset);
-            match d.partitions.iter().find(|p| p.start == off) {
-                Some(p) => Some(Device::Partition(d.index, p.number)),
-                None => (off == 0).then_some(Device::Disk(d.index)),
-            }
+    let region = if s.offset != 0 || s.scanned_len != 0 {
+        s.region(d.size).ok()?
+    } else {
+        match &s.kind {
+            SessionKind::Deleted(v) => match v.first().map_or(0, |f| f.fs_offset) {
+                0 => (0, d.size),
+                off => d.partitions.iter().find(|p| p.start == off).map(|p| (p.start, p.len))?,
+            },
+            _ => (0, d.size),
         }
-        _ => Some(Device::Disk(d.index)),
-    }
+    };
+    let dev = d
+        .partitions
+        .iter()
+        .find(|p| (p.start, p.len) == region)
+        .map_or(Device::Disk(d.index), |p| Device::Partition(d.index, p.number));
+    let range = (region != (0, d.size)).then_some(region);
+    Some((dev, ReadFrom { disk: d.index, range }))
 }
+
+/// The device a scan's files come from and where exactly they are read.
+pub type Origin = (Device, ReadFrom);
 
 pub struct DataRecoveryWizard {
     page: usize,
@@ -312,10 +310,10 @@ pub struct DataRecoveryWizard {
     session_path: String,
     pub deleted: bool,
     pub cats: Vec<bool>,
-    scan_task: Option<Task<(Found, Option<Device>)>>,
-    /// The findings and the device they are read from (`None`: a session whose disk is not
-    /// connected; the results can be looked at but not restored).
-    pub found: Option<(Found, Option<Device>)>,
+    scan_task: Option<Task<(Found, Option<Origin>)>>,
+    /// The findings and where they were scanned, fixed at scan time (`None`: a session whose
+    /// disk is not connected; the results can be looked at but not restored).
+    pub found: Option<(Found, Option<Origin>)>,
     rows: Vec<Row>,
     pub checked: Vec<bool>,
     search: String,
@@ -353,7 +351,7 @@ impl DataRecoveryWizard {
         }
     }
 
-    fn set_found(&mut self, found: Found, dev: Option<Device>) {
+    fn set_found(&mut self, found: Found, dev: Option<Origin>) {
         self.rows = rows(&found);
         self.checked = self.rows.iter().map(|r| r.restorable).collect();
         self.found = Some((found, dev));
@@ -363,7 +361,7 @@ impl DataRecoveryWizard {
     /// The letters of the drive the files come from (the destination must avoid them).
     fn source_letters(&self, m: &Model) -> Vec<char> {
         match &self.found {
-            Some((_, Some(d))) => d.letters(m),
+            Some((_, Some((d, _)))) => d.letters(m),
             _ => match &self.source {
                 Some(Source::Device(d)) => d.letters(m),
                 _ => Vec::new(),
@@ -380,7 +378,7 @@ impl DataRecoveryWizard {
                 let Some(from) = read_from(dev, env.live) else { return };
                 let (deleted, cats) = (self.deleted, self.chosen_categories());
                 self.scan_task = Some(Task::spawn("Data recovery scan", move |progress, cancel| {
-                    scan_job(&*p, from, deleted, cats, progress, cancel).map(|f| (f, Some(dev)))
+                    scan_job(&*p, from, deleted, cats, progress, cancel).map(|f| (f, Some((dev, from))))
                 }));
             }
             Some(Source::Session(path)) => {
@@ -388,7 +386,17 @@ impl DataRecoveryWizard {
                 self.scan_task = Some(Task::spawn("Opening session", move |_progress, cancel| {
                     cancel.check()?;
                     let s = ScanSession::load(Path::new(path.trim()))?;
-                    let dev = session_device(&s, &live);
+                    let origin = session_origin(&s, &live);
+                    if let Some((_, from)) = origin {
+                        // the recorded region must fit the device as it is now
+                        let len = p.open_disk(from.disk, OpenMode::ReadOnly)?.len();
+                        s.region(len)?;
+                        if let Some((o, l)) = from.range {
+                            if o.checked_add(l).map_or(true, |e| e > len) {
+                                return Err(Error::Invalid("The scanned region does not fit the disk any more.".into()));
+                            }
+                        }
+                    }
                     let found = match s.kind {
                         SessionKind::Deleted(v) => Found::Deleted(v),
                         SessionKind::Carved(r) => Found::Carved(r),
@@ -396,7 +404,7 @@ impl DataRecoveryWizard {
                             return Err(Error::Invalid("This is a partition-recovery session; it holds no files.".into()))
                         }
                     };
-                    Ok((found, dev))
+                    Ok((found, origin))
                 }));
             }
             None => {}
@@ -408,8 +416,9 @@ impl DataRecoveryWizard {
     }
 
     fn start_restore(&mut self, env: &ToolEnv) {
-        let Some((found, Some(dev))) = self.found.clone() else { return };
-        let Some(from) = read_from(dev, env.live) else { return };
+        // read exactly where the scan read (a layout change since is caught by the bounds
+        // check of the slice when the job opens it)
+        let Some((found, Some((_, from)))) = self.found.clone() else { return };
         let chosen: Vec<usize> = self.checked.iter().enumerate().filter(|(i, c)| **c && self.rows[*i].restorable).map(|(i, _)| i).collect();
         let (p, dest) = (env.platform.clone(), PathBuf::from(self.dest.trim()));
         self.error = None;
@@ -419,9 +428,9 @@ impl DataRecoveryWizard {
     }
 
     fn start_save(&mut self, env: &ToolEnv) {
-        let Some((found, Some(dev))) = &self.found else { return };
-        let (Some(from), Some(disk)) = (read_from(*dev, env.live), env.live.disk(dev.disk())) else { return };
-        let session = ScanSession::new(DeviceIdentity::from_disk(disk), session_kind(found, from));
+        let Some((found, Some((_, from)))) = &self.found else { return };
+        let Some(disk) = env.live.disk(from.disk) else { return };
+        let session = session_for(found, *from, disk);
         let path = PathBuf::from(self.save_path.trim());
         self.save_status = None;
         self.save_task = Some(Task::spawn("Saving session", move |_p, _c| session.save(&path)));
@@ -829,9 +838,22 @@ mod tests {
         assert_eq!(category_of("holiday.JPG"), Category::Image);
         assert_eq!(category_of("noext"), Category::Other);
         assert!(deleted_scan_supported(Some(FsKind::Ntfs)) && !deleted_scan_supported(Some(FsKind::ReFs)));
-        // saved carve sessions are disk-relative
-        let SessionKind::Carved(s) = session_kind(&Found::Carved(rep), ReadFrom { disk: 1, range: Some((MIB, MIB)) }) else { panic!() };
-        assert_eq!(s.files[0].offset, MIB + 4096);
+        // saved sessions keep region-relative offsets and record the region
+        let disk = crate::test_util::gpt_disk(1);
+        let s = session_for(&Found::Carved(rep), ReadFrom { disk: 1, range: Some((117 * MIB, 684 * MIB)) }, &disk);
+        assert_eq!((s.offset, s.scanned_len), (117 * MIB, 684 * MIB));
+        let SessionKind::Carved(r) = &s.kind else { panic!() };
+        assert_eq!(r.files[0].offset, 4096);
+        let m = crate::test_util::model_of(vec![disk.clone()]);
+        assert_eq!(session_origin(&s, &m), Some((Device::Partition(1, 3), ReadFrom { disk: 1, range: Some((117 * MIB, 684 * MIB)) })));
+        // a legacy (region-less) carve session: the whole disk
+        let legacy = ScanSession { offset: 0, scanned_len: 0, ..s.clone() };
+        assert_eq!(session_origin(&legacy, &m), Some((Device::Disk(1), ReadFrom { disk: 1, range: None })));
+        // a region past the end of the disk is not offered for restoring
+        let mut small = disk;
+        small.size = 512 * MIB;
+        let s2 = ScanSession { device: DeviceIdentity::from_disk(&small), ..s };
+        assert!(session_origin(&s2, &crate::test_util::model_of(vec![small])).is_none());
     }
 
     /// Deleted files of a FAT32 volume on a disk image are listed and restored into a folder.
@@ -883,6 +905,18 @@ trailer << >>
         assert!(restored.starts_with(b"%PDF-1.4") && restored.windows(5).any(|w| w == b"%%EOF"), "{restored:?}");
         assert!(restored.len() <= pdf.len() + 2);
         assert!(scan_job(&*p, from, false, vec![], &np, &c).is_err(), "no file type chosen");
+        // a session of the partition scan restores the same bytes from its recorded region
+        let sp = dir.path().join("scan.json");
+        session_for(&carved, from, live.disk(disk).unwrap()).save(&sp).unwrap();
+        let loaded = ScanSession::load(&sp).unwrap();
+        assert_eq!((loaded.offset, loaded.scanned_len), (MIB, 40 * MIB));
+        let (dev, origin) = session_origin(&loaded, &live).unwrap();
+        assert_eq!((dev, origin), (Device::Partition(disk, 1), from));
+        let SessionKind::Carved(r) = loaded.kind else { panic!() };
+        let out2 = dir.path().join("out2");
+        let sum = restore_job(&*p, origin, Found::Carved(r), vec![i], out2.clone(), &np, &c).unwrap();
+        assert_eq!(sum.restored, 1);
+        assert_eq!(std::fs::read(out2.join(format!("{:012x}.pdf", 30 * MIB))).unwrap(), restored);
     }
 
     #[test]
@@ -896,7 +930,7 @@ trailer << >>
             unreadable: vec![],
             bytes_scanned: 1 << 20,
         };
-        w.set_found(Found::Carved(rep), Some(Device::Partition(1, 3)));
+        w.set_found(Found::Carved(rep), Some((Device::Partition(1, 3), ReadFrom { disk: 1, range: Some((117 * MIB, 684 * MIB)) })));
         w.summary = Some(RestoreSummary { restored: 1, failed: 1, errors: vec!["x: failed".into()] });
         for page in 0..PAGES.len() {
             w.page = page;
