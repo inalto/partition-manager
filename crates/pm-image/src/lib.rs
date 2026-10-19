@@ -1,4 +1,4 @@
-//! Virtual disk images (raw, VHD fixed/dynamic, VMDK flat/sparse, qcow2 v3) exposed as
+//! Virtual disk images (raw, VHD fixed/dynamic, VMDK flat/sparse, qcow2 v3; VHDX read-only) exposed as
 //! [`BlockDevice`]s whose `len()` is the virtual disk capacity, plus format
 //! identification and conversion.
 
@@ -8,6 +8,7 @@ mod raw;
 pub mod rescue;
 mod sparse;
 mod vhd;
+mod vhdx;
 mod vmdk;
 
 pub use format::ImageFormat;
@@ -42,6 +43,7 @@ pub fn create(path: &Path, opts: &CreateOpts) -> Result<Box<dyn BlockDevice>> {
         ImageFormat::VmdkFlat => vmdk::create_flat(path, cap),
         ImageFormat::VmdkSparse => vmdk::create_sparse(path, cap),
         ImageFormat::Qcow2 => qcow2::create(path, cap),
+        ImageFormat::Vhdx => Err(Error::Unsupported("VHDX images can be opened but not created".into())),
     }
 }
 
@@ -53,6 +55,7 @@ pub fn open(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>> {
         ImageFormat::VmdkFlat => vmdk::open_flat(path, read_only),
         ImageFormat::VmdkSparse => vmdk::open_sparse(path, read_only),
         ImageFormat::Qcow2 => qcow2::open(path, read_only),
+        ImageFormat::Vhdx => vhdx::open(path, read_only),
     }
 }
 

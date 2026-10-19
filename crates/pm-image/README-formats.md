@@ -12,6 +12,7 @@ tools. None of them are needed to build or test this crate.
 | VMDK flat (`.vmdk`) | `ImageFormat::VmdkFlat` | text descriptor `<name>.vmdk` (`monolithicFlat`) + raw extent `<name>-flat.vmdk` |
 | VMDK sparse (`.vmdk`) | `ImageFormat::VmdkSparse` | `KDMV` header v1, embedded descriptor (`monolithicSparse`), redundant + primary grain directory/tables, 64 KiB grains |
 | qcow2 v3 (`.qcow2`) | `ImageFormat::Qcow2` | 64 KiB clusters, L1/L2 tables, 16-bit refcounts, no compression/encryption/snapshots/backing file |
+| VHDX (`.vhdx`), read-only | `ImageFormat::Vhdx` (open only) | file identifier, two headers (CRC-32C), region table, BAT + metadata regions; fixed and dynamic, no differencing, log not replayed |
 
 ## Verifying with qemu-img
 
@@ -53,6 +54,14 @@ qemu-img info --image-opts driver=vpc,force_size_calc=current_size,file.filename
 
 ## Not supported
 
-Differencing VHDs, VHDX (planned), split / streamOptimized / compressed VMDKs, VMDK
+Differencing VHDs, writing or creating VHDX (read-only opener only; differencing VHDX refused), split / streamOptimized / compressed VMDKs, VMDK
 descriptors with more than one extent, qcow2 compression, encryption, backing files,
 and writing to qcow2 images that contain snapshots.
+
+## VHDX (read-only)
+
+`pm_image::open` / `identify` recognise `vhdxfile` at offset 0. The opener picks the header
+with a valid CRC-32C and the highest sequence number, reads the region table and the
+metadata table (block size, virtual disk size, logical sector size) and then the BAT.
+Unallocated, zero and unmapped blocks read as zeros. Verify a VHDX with
+`qemu-img info disk.vhdx` or attach it on Windows with `Mount-DiskImage`.

@@ -1,6 +1,6 @@
 //! Image format identification by extension and by content sniffing.
 
-use crate::{qcow2, vhd, vmdk};
+use crate::{qcow2, vhd, vhdx, vmdk};
 use pm_core::{BlockDevice, Error, FileDevice, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -13,11 +13,13 @@ pub enum ImageFormat {
     VmdkFlat,
     VmdkSparse,
     Qcow2,
+    /// Hyper-V VHDX: can be opened (read-only) but not created.
+    Vhdx,
 }
 
 impl ImageFormat {
     /// Default format for a file extension (case-insensitive): `.img`/`.raw`/`.dd` → Raw,
-    /// `.vhd` → dynamic VHD, `.vmdk` → sparse VMDK, `.qcow2` → qcow2.
+    /// `.vhd` → dynamic VHD, `.vmdk` → sparse VMDK, `.qcow2` → qcow2, `.vhdx` → VHDX (read-only).
     pub fn from_extension(p: &Path) -> Option<Self> {
         let ext = p.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
@@ -25,6 +27,7 @@ impl ImageFormat {
             "vhd" => Some(ImageFormat::VhdDynamic),
             "vmdk" => Some(ImageFormat::VmdkSparse),
             "qcow2" => Some(ImageFormat::Qcow2),
+            "vhdx" => Some(ImageFormat::Vhdx),
             _ => None,
         }
     }
@@ -36,6 +39,7 @@ impl ImageFormat {
             ImageFormat::VhdFixed | ImageFormat::VhdDynamic => "vhd",
             ImageFormat::VmdkFlat | ImageFormat::VmdkSparse => "vmdk",
             ImageFormat::Qcow2 => "qcow2",
+            ImageFormat::Vhdx => "vhdx",
         }
     }
 
@@ -47,6 +51,7 @@ impl ImageFormat {
             ImageFormat::VmdkFlat => "VMDK (flat)",
             ImageFormat::VmdkSparse => "VMDK (sparse)",
             ImageFormat::Qcow2 => "QCOW2",
+            ImageFormat::Vhdx => "VHDX (read-only)",
         }
     }
 
@@ -69,6 +74,9 @@ pub(crate) fn sniff(path: &Path) -> Result<ImageFormat> {
     dev.read_at(0, &mut head)?;
     if head.starts_with(vmdk::SPARSE_MAGIC) {
         return Ok(ImageFormat::VmdkSparse);
+    }
+    if head.starts_with(vhdx::SIGNATURE) {
+        return Ok(ImageFormat::Vhdx);
     }
     if head.starts_with(qcow2::MAGIC) {
         return Ok(ImageFormat::Qcow2);
