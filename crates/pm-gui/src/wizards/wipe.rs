@@ -5,7 +5,7 @@
 use super::{danger, partition_desc, row};
 use crate::items::is_container;
 use crate::selection::Selected;
-use crate::wizard::{shared, StepResult, Wizard, WizardCtx};
+use crate::wizard::{shared, FnStep, Shared, StepResult, Wizard, WizardCtx, WizardStep};
 use eframe::egui;
 use pm_core::{format_size, MIB};
 use pm_ops::{Operation, WipeMethod};
@@ -153,14 +153,25 @@ fn confirm_summary(_s: &WipeState) -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// Going Back from the confirmation forgets what was typed: a changed target or method must
+/// be confirmed again.
+fn forget_confirmation(s: &mut WipeState, forward: bool) {
+    if !forward {
+        s.confirm.clear();
+    }
+}
+
+fn wizard_over(st: Shared<WipeState>) -> Wizard {
+    let title = if st.borrow().target_partition { "Wipe Partition" } else { "Wipe Disk" };
+    let steps: Vec<Box<dyn WizardStep>> = vec![
+        Box::new(FnStep::new("Target and method", st.clone(), target_ui, target_summary)),
+        Box::new(FnStep::new("Confirm", st.clone(), confirm_ui, confirm_summary).with_on_leave(forget_confirmation)),
+    ];
+    Wizard::new(title, steps, Box::new(move |_| st.borrow().build()))
+}
+
 pub fn wizard(state: WipeState) -> Wizard {
-    let title = if state.target_partition { "Wipe Partition" } else { "Wipe Disk" };
-    Wizard::over_state(
-        title,
-        shared(state),
-        vec![("Target and method", target_ui, target_summary), ("Confirm", confirm_ui, confirm_summary)],
-        WipeState::build,
-    )
+    wizard_over(shared(state))
 }
 
 /// `partition`: opened from "Wipe Partition" (needs a selected partition).
@@ -196,6 +207,25 @@ mod tests {
         s.confirm = "WIPE".into();
         assert_eq!(wizard(s).build_ops().unwrap(), vec![Operation::WipeDisk { disk: 1, method: WipeMethod::Zero }]);
         assert!(WipeState::initial(&WizardCtx::new(&m, vec![], Selected::Disk(1)), true).is_none());
+    }
+
+    #[test]
+    fn going_back_from_the_confirmation_clears_it() {
+        let mut m = model_of(vec![gpt_disk(1)]);
+        m.system_disk = Some(7);
+        let st = shared(WipeState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 3)), true).unwrap());
+        let mut w = wizard_over(st.clone());
+        w.goto(1);
+        st.borrow_mut().confirm = "WIPE".into();
+        // back from the summary page to the confirmation keeps it (still on screen)
+        w.goto(2);
+        w.back();
+        assert_eq!((w.idx(), st.borrow().confirm.as_str()), (1, "WIPE"));
+        assert!(w.build_ops().is_ok());
+        // back from the confirmation to the target forgets it
+        w.back();
+        assert_eq!((w.idx(), st.borrow().confirm.as_str()), (0, ""));
+        assert!(w.build_ops().unwrap_err().contains("WIPE"));
     }
 
     #[test]

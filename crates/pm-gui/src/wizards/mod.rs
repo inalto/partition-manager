@@ -102,15 +102,50 @@ pub fn partition_desc(disk: u32, p: &PartitionInfo) -> String {
     format!("Partition {} ({}, {}, {}) on Disk {disk}", p.number, partition_name(p), fs_text(p), format_size(p.len))
 }
 
-/// A size text field: shows `value` formatted while not being edited; returns the parsed
-/// value when the user leaves the field (Enter or click elsewhere).
-pub fn size_edit(ui: &mut egui::Ui, buf: &mut String, value: u64) -> Option<u64> {
-    let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(110.0));
-    let parsed = if resp.lost_focus() { parse_size_mb(buf) } else { None };
-    if !resp.has_focus() {
-        *buf = format_size(value);
+/// `bytes` as MB with enough decimals to round-trip through [`parse_size_mb`] to the byte.
+pub fn precise_mb(bytes: u64) -> String {
+    let s = format!("{:.7}", bytes as f64 / MIB as f64);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Text of a size field. Unfocused it shows the value rounded ([`format_size`]); on focus
+/// it switches to the full-precision MB value, and a value is applied only when the user
+/// actually changed the text, so tabbing through a field never moves anything.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SizeText {
+    pub text: String,
+    /// The text when the field gained focus (`None` while unfocused).
+    at_focus: Option<String>,
+}
+
+impl SizeText {
+    /// One frame of the field showing `value`, given its focus events; returns the new value
+    /// when the user leaves the field after changing it.
+    pub fn update(&mut self, gained: bool, lost: bool, focused: bool, value: u64) -> Option<u64> {
+        let mut out = None;
+        if lost {
+            if let Some(orig) = self.at_focus.take() {
+                if orig != self.text {
+                    out = parse_size_mb(&self.text);
+                }
+            }
+        }
+        if gained {
+            self.text = precise_mb(value);
+            self.at_focus = Some(self.text.clone());
+        } else if !focused {
+            self.text = format_size(value);
+            self.at_focus = None;
+        }
+        out
     }
-    parsed
+}
+
+/// A size text field over `st` (see [`SizeText`]); returns the value the user entered, once,
+/// when they leave the field (Enter or click elsewhere).
+pub fn size_edit(ui: &mut egui::Ui, st: &mut SizeText, value: u64) -> Option<u64> {
+    let resp = ui.add(egui::TextEdit::singleline(&mut st.text).desired_width(110.0));
+    st.update(resp.gained_focus(), resp.lost_focus(), resp.has_focus(), value)
 }
 
 /// Combo box of `letters` plus "None".
@@ -183,6 +218,31 @@ mod tests {
         assert_eq!(parse_size_mb(""), None);
         assert_eq!(parse_size_mb("abc"), None);
         assert_eq!(parse_size_mb("1.2.3"), None);
+    }
+
+    #[test]
+    fn size_field_applies_only_user_changes() {
+        let value = 1_234_567_891; // 1.15 GB: not a round number of MB
+        let mut st = SizeText::default();
+        assert_eq!(st.update(false, false, false, value), None);
+        assert_eq!(st.text, format_size(value));
+        // tabbing through: focus, then leave without typing → nothing applied
+        assert_eq!(st.update(true, false, true, value), None);
+        assert_eq!(st.text, precise_mb(value), "full precision while editing");
+        assert_eq!(st.update(false, true, false, value), None);
+        // retyping the very same text applies nothing either
+        st.update(true, false, true, value);
+        st.text = precise_mb(value);
+        assert_eq!(st.update(false, true, false, value), None);
+        assert_eq!(st.text, format_size(value));
+        // the precise text round-trips to the byte
+        assert_eq!(parse_size_mb(&precise_mb(value)), Some(value));
+        // a real edit is applied once
+        st.update(true, false, true, value);
+        st.text = "500".into();
+        assert_eq!(st.update(false, false, true, value), None, "not while still typing");
+        assert_eq!(st.update(false, true, false, value), Some(500 * MIB));
+        assert_eq!(st.update(false, true, false, value), None, "only once");
     }
 
     #[test]

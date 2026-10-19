@@ -241,7 +241,7 @@ mod tests {
         frame(&mut app);
         assert!(app.state.wizard.is_some());
         app.state.handle(Cmd::CloseWizard);
-        app.state.handle(Cmd::Action(crate::actions::Action::DeletePartition, crate::selection::Selected::Partition(1, 3)));
+        app.state.handle(Cmd::Push(vec![pm_ops::Operation::DeletePartition { disk: 1, number: 3 }]));
         app.state.handle(Cmd::Apply);
         app.state.handle(Cmd::SetTheme(Theme::Dark));
         frame(&mut app);

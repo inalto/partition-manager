@@ -2,16 +2,17 @@
 //! (≤ 32 characters, ≤ 11 on FAT/exFAT) → [`Operation::SetLabel`], or a drive letter from the
 //! free letters or "None" → [`Operation::SetLetter`].
 //!
-//! The executor does not support `SetLabel` yet (no platform API); queueing it is refused
-//! and the reason appears on the summary page. The wizard needs no change once it is.
+//! The executor does not support `SetLabel` yet (no platform API): the step checks its
+//! operation like the queue will and shows the refusal right away, with Next disabled. The
+//! wizard needs no change once the executor supports it.
 
 use super::{label_problem, letter_combo, max_label_len, partition_desc, row};
 use crate::items::is_container;
 use crate::selection::Selected;
-use crate::wizard::{shared, StepResult, Wizard, WizardCtx};
+use crate::wizard::{check_ops, shared, StepResult, Wizard, WizardCtx};
 use eframe::egui;
 use pm_core::FsKind;
-use pm_ops::Operation;
+use pm_ops::{Model, Operation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -78,9 +79,18 @@ impl LabelLetterState {
             Mode::Letter => Operation::SetLetter { disk, number, letter: self.letter },
         }])
     }
+
+    /// What keeps the step from going on: the input problems, then whatever the queue would
+    /// refuse (e.g. `SetLabel`, which the executor does not support yet).
+    pub fn step_problem(&self, model: &Model) -> Option<String> {
+        if let Some(p) = self.problem() {
+            return Some(p);
+        }
+        self.build().and_then(|ops| check_ops(model, &ops)).err()
+    }
 }
 
-fn step_ui(s: &mut LabelLetterState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
+fn step_ui(s: &mut LabelLetterState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
     ui.label(&s.desc);
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -105,7 +115,7 @@ fn step_ui(s: &mut LabelLetterState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> Ste
             ui.weak(format!("Current drive letter: {now}."));
         }
     }
-    StepResult::from_problem(s.problem())
+    StepResult::from_problem(s.step_problem(ctx.model))
 }
 
 fn summary(s: &LabelLetterState) -> Vec<(String, String)> {
@@ -133,7 +143,6 @@ pub fn new(ctx: &WizardCtx, mode: Mode) -> Option<Wizard> {
 mod tests {
     use super::*;
     use crate::test_util::{gpt_disk, model_of};
-    use crate::wizard::check_ops;
 
     #[test]
     fn build_label_and_letter_ops() {
@@ -143,9 +152,10 @@ mod tests {
         assert_eq!(s.letters, ['E', 'G'], "own letter stays selectable");
         s.label = " Archive ".into();
         assert_eq!(s.build().unwrap(), vec![Operation::SetLabel { disk: 1, number: 3, label: "Archive".into() }]);
-        // the executor refuses SetLabel for now: shown on the summary page, not a crash
+        // the executor refuses SetLabel for now: shown on the first step already, not a crash
         let e = check_ops(&m, &s.build().unwrap()).unwrap_err();
         assert!(e.contains("set label"), "{e}");
+        assert_eq!(s.step_problem(&m), Some(e));
         s.label = "x".repeat(33);
         assert!(s.build().unwrap_err().contains("32"));
 
@@ -155,6 +165,7 @@ mod tests {
         let ops = s.build().unwrap();
         assert_eq!(ops, vec![Operation::SetLetter { disk: 1, number: 3, letter: Some('G') }]);
         assert!(check_ops(&m, &ops).is_ok());
+        assert_eq!(s.step_problem(&m), None, "letter mode is supported");
         s.letter = None;
         assert_eq!(wizard(s).build_ops().unwrap(), vec![Operation::SetLetter { disk: 1, number: 3, letter: None }]);
     }

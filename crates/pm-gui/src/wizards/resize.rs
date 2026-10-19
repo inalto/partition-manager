@@ -9,7 +9,7 @@
 //! math lives in [`super::resize_bar`].
 
 use super::resize_bar::{Extent, Handle};
-use super::{disk_preview, partition_desc, row, size_edit};
+use super::{disk_preview, partition_desc, row, size_edit, SizeText};
 use crate::items::is_container;
 use crate::selection::Selected;
 use crate::theme::{map_colors, mix, Theme};
@@ -36,7 +36,7 @@ pub struct BarState {
     /// Used bytes from the start of the block (hatched), when known.
     pub used: Option<u64>,
     drag: Option<BarDrag>,
-    texts: [String; 3],
+    texts: [SizeText; 3],
 }
 
 impl BarState {

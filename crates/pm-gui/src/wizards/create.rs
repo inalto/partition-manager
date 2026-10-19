@@ -149,6 +149,10 @@ impl CreateState {
         if self.fs == Some(FsKind::Fat32) && self.bar.len > FAT32_MAX {
             return Some("FAT32 is limited to 32 GB here; choose NTFS or exFAT.".into());
         }
+        if self.fs.is_none() {
+            // no volume: no letter or label to check (they are not used)
+            return None;
+        }
         if let Some(c) = self.letter {
             if !self.letters.contains(&c) {
                 return Some(format!("Drive letter {c}: is not free."));
@@ -157,18 +161,28 @@ impl CreateState {
         label_problem(self.fs, &self.label)
     }
 
+    /// The drive letter and label that go into the operation: none without a filesystem
+    /// (an unformatted partition has no volume to name or mount).
+    pub fn letter_and_label(&self) -> (Option<char>, String) {
+        match self.fs {
+            Some(_) => (self.letter, self.label.trim().to_string()),
+            None => (None, String::new()),
+        }
+    }
+
     pub fn build(&self) -> Result<Vec<Operation>, String> {
         if let Some(p) = self.props_problem() {
             return Err(p);
         }
+        let (letter, label) = self.letter_and_label();
         Ok(vec![Operation::CreatePartition {
             disk: self.disk,
             start: self.bar.start,
             len: self.bar.len,
             ptype: self.ptype,
             fs: self.fs,
-            label: self.label.trim().to_string(),
-            letter: self.letter,
+            label,
+            letter,
             name: if self.table == TableKind::Gpt { self.name.trim().to_string() } else { String::new() },
         }])
     }
@@ -265,7 +279,7 @@ fn props_ui(s: &mut CreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResu
         ui.end_row();
 
         ui.label("Drive letter:");
-        letter_combo(ui, "create_letter", &mut s.letter, &s.letters);
+        ui.add_enabled_ui(s.fs.is_some(), |ui| letter_combo(ui, "create_letter", &mut s.letter, &s.letters));
         ui.end_row();
 
         if s.table == TableKind::Gpt {
@@ -274,6 +288,10 @@ fn props_ui(s: &mut CreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResu
             ui.end_row();
         }
     });
+    if s.fs.is_none() {
+        ui.add_space(4.0);
+        ui.weak("Without a file system the partition gets no label and no drive letter.");
+    }
     if s.bar.len > FAT32_MAX {
         ui.add_space(4.0);
         ui.weak("FAT32 is not offered: the partition is larger than 32 GB.");
@@ -290,11 +308,12 @@ fn size_summary(s: &CreateState) -> Vec<(String, String)> {
 }
 
 fn props_summary(s: &CreateState) -> Vec<(String, String)> {
+    let (letter, label) = s.letter_and_label();
     let mut rows = vec![
         row("Type", s.ptype.name()),
         row("File system", fs_name(s.fs)),
-        row("Label", if s.label.is_empty() { "(none)".to_string() } else { s.label.clone() }),
-        row("Drive letter", s.letter.map_or("None".to_string(), |c| format!("{c}:"))),
+        row("Label", if label.is_empty() { "(none)".to_string() } else { label }),
+        row("Drive letter", letter.map_or("None".to_string(), |c| format!("{c}:"))),
     ];
     if s.table == TableKind::Gpt && !s.name.trim().is_empty() {
         rows.push(row("Name", s.name.trim()));
@@ -374,6 +393,29 @@ mod tests {
         );
         assert!(check_ops(&m, &ops).is_ok());
         assert_eq!(wizard(s).build_ops().unwrap(), ops);
+    }
+
+    #[test]
+    fn create_without_fs_has_no_letter_or_label() {
+        let m = model_of(vec![gpt_disk(1)]);
+        let mut s = CreateState::initial(&gpt_free_ctx(&m)).unwrap();
+        assert_eq!(s.letter, Some('G'), "a letter is preselected for a formatted partition");
+        s.label = "Raw".into();
+        s.set_fs(None);
+        let ops = s.build().unwrap();
+        let Operation::CreatePartition { fs, letter, label, .. } = &ops[0] else { panic!() };
+        assert_eq!((fs, letter, label.as_str()), (&None, &None, ""));
+        assert!(check_ops(&m, &ops).is_ok());
+        // a stale, now-taken letter or an over-long label do not block an unformatted partition
+        s.letter = Some('E');
+        s.label = "x".repeat(40);
+        assert!(s.build().is_ok());
+        // choosing a filesystem again restores the user's letter and label
+        s.letter = Some('G');
+        s.label = "Data".into();
+        s.set_fs(Some(FsKind::Ntfs));
+        let Operation::CreatePartition { letter, label, .. } = &s.build().unwrap()[0] else { panic!() };
+        assert_eq!((letter, label.as_str()), (&Some('G'), "Data"));
     }
 
     #[test]

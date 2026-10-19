@@ -86,6 +86,9 @@ pub trait WizardStep {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult;
     /// Key / value rows for the summary page.
     fn summary(&self) -> Vec<(String, String)>;
+    /// The user leaves this step with Next (`forward`) or Back, e.g. to forget a typed
+    /// confirmation when going back. Does nothing by default.
+    fn on_leave(&mut self, _forward: bool) {}
 }
 
 /// Builds the operations from the filled-in steps. Called for the summary page (every frame
@@ -104,6 +107,20 @@ pub struct FnStep<S> {
     pub state: Shared<S>,
     pub ui: StepUi<S>,
     pub summary: StepSummary<S>,
+    /// Called when the user leaves the step (see [`WizardStep::on_leave`]).
+    pub on_leave: Option<fn(&mut S, bool)>,
+}
+
+impl<S> FnStep<S> {
+    pub fn new(title: impl Into<String>, state: Shared<S>, ui: StepUi<S>, summary: StepSummary<S>) -> FnStep<S> {
+        FnStep { title: title.into(), state, ui, summary, on_leave: None }
+    }
+
+    /// Run `f(state, forward)` when the user leaves the step.
+    pub fn with_on_leave(mut self, f: fn(&mut S, bool)) -> FnStep<S> {
+        self.on_leave = Some(f);
+        self
+    }
 }
 
 impl<S> WizardStep for FnStep<S> {
@@ -115,6 +132,11 @@ impl<S> WizardStep for FnStep<S> {
     }
     fn summary(&self) -> Vec<(String, String)> {
         (self.summary)(&self.state.borrow())
+    }
+    fn on_leave(&mut self, forward: bool) {
+        if let Some(f) = self.on_leave {
+            f(&mut self.state.borrow_mut(), forward);
+        }
     }
 }
 
@@ -182,7 +204,7 @@ impl Wizard {
         let boxed: Vec<Box<dyn WizardStep>> = steps
             .into_iter()
             .map(|(t, ui, summary)| {
-                Box::new(FnStep { title: t.to_string(), state: state.clone(), ui, summary }) as Box<dyn WizardStep>
+                Box::new(FnStep::new(t, state.clone(), ui, summary)) as Box<dyn WizardStep>
             })
             .collect();
         Wizard::new(title, boxed, Box::new(move |_| build(&state.borrow())))
@@ -225,6 +247,9 @@ impl Wizard {
 
     pub fn back(&mut self) {
         if self.idx > 0 {
+            if let Some(step) = self.steps.get_mut(self.idx) {
+                step.on_leave(false);
+            }
             self.goto(self.idx - 1);
         }
     }
@@ -232,6 +257,7 @@ impl Wizard {
     /// Next page, if the current step reported `Continue` on the last frame.
     pub fn next(&mut self) {
         if !self.on_summary() && self.valid == StepResult::Continue {
+            self.steps[self.idx].on_leave(true);
             self.goto(self.idx + 1);
         }
     }

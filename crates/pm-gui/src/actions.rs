@@ -177,7 +177,6 @@ impl Action {
         let part = sel.partition_in(model);
         let one = |op: Operation| Some(Effect::Push(vec![op]));
         match self {
-            DeletePartition => one(Operation::DeletePartition { disk: d, number: part?.number }),
             SetActive => one(Operation::SetActive { disk: d, number: part?.number }),
             AlignAllPartitions => one(Operation::AlignPartitions { disk: d }),
             RebuildMbr => one(Operation::RebuildMbr { disk: d }),
@@ -200,7 +199,7 @@ impl Action {
             Explore => Some(Effect::Explore { path: format!("{}:\\", part?.letter()?) }),
             MigrateOs | CopyDisk | CopyPartition | PartitionRecovery | SurfaceTest | CreatePartition
             | FormatPartition | ResizeMove | ChangeLabel | ChangeLetter | ChangeType | WipePartition
-            | ConvertMbrToGpt | ConvertGptToMbr | InitializeDisk => {
+            | ConvertMbrToGpt | ConvertGptToMbr | InitializeDisk | DeletePartition => {
                 Some(Effect::Wizard(self))
             }
         }
@@ -309,7 +308,7 @@ mod tests {
         let m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
         assert_eq!(
             Action::DeletePartition.effect(&Selected::Partition(1, 3), &m),
-            Some(Effect::Push(vec![Operation::DeletePartition { disk: 1, number: 3 }]))
+            Some(Effect::Wizard(Action::DeletePartition))
         );
         assert_eq!(
             Action::ConvertGptToMbr.effect(&Selected::Disk(1), &m),

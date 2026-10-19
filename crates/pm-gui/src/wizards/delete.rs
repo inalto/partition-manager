@@ -1,9 +1,8 @@
 //! Delete Partition wizard: one confirmation page with the partition's details and a red
 //! warning → [`Operation::DeletePartition`].
 //!
-//! The sidebar's Delete action queues the deletion directly (it is a pending operation that
-//! Undo reverts, as in MiniTool); this wizard is the confirming variant for callers that want
-//! one (`wizards::for_action(Action::DeletePartition, ..)`).
+//! Opened by the sidebar / context-menu Delete action. "Delete All Partitions" still queues
+//! its batch directly.
 
 use super::{danger, row};
 use crate::format_util::{fs_text, partition_name, type_text};

@@ -9,8 +9,7 @@ use crate::jobs::{spawn_job, JobHandle, JobOutput};
 use crate::selection::Selected;
 use crate::theme::Theme;
 use crate::wizard::{Wizard, WizardCtx};
-use pm_core::VolumeId;
-use pm_ops::{execute, ExecOpts, ExecReport, Model, OpQueue, Operation, WipeMethod};
+use pm_ops::{execute, ExecOpts, ExecReport, Model, OpQueue, Operation};
 use pm_platform::Platform;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,9 +50,6 @@ pub enum Dialog {
     /// non-destructive family (resize, letter, label, mount).
     /// The destructive / system-disk flags are recomputed from the live queue every frame.
     Confirm { allow_system: bool },
-    WipeMethod { disk: u32, method: WipeMethod },
-    MountLetter { volume: VolumeId, letters: Vec<char>, choice: Option<char> },
-    Unmount { volume: VolumeId, mount_points: Vec<String>, choice: usize },
     /// Result of an Apply run.
     Report { report: ExecReport, dry_run: bool, note: Option<String> },
 }
@@ -487,7 +483,8 @@ pub fn rebase(queue: &mut OpQueue, base: Model) -> usize {
 mod tests {
     use super::*;
     use crate::test_util::{gpt_disk, mbr_disk, model_of};
-    use pm_core::{FsKind, MemDevice, VolumeInfo, MIB};
+    use pm_core::{FsKind, MemDevice, VolumeId, VolumeInfo, MIB};
+    use pm_ops::WipeMethod;
     use pm_platform::MockPlatform;
 
     fn wait_idle(s: &mut AppState) {
@@ -566,6 +563,10 @@ mod tests {
     fn selection_follows_deleted_partition_to_its_disk() {
         let mut s = mock_state();
         s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(1, 3)));
+        assert!(s.queue.is_empty(), "Delete opens its confirmation wizard first");
+        let ops = s.wizard.as_ref().unwrap().wizard.build_ops().unwrap();
+        assert_eq!(ops, vec![Operation::DeletePartition { disk: 1, number: 3 }]);
+        s.handle(Cmd::FinishWizard(ops));
         assert_eq!(s.queue.len(), 1);
         assert_eq!(s.selected, Selected::Disk(1));
     }
@@ -588,6 +589,7 @@ mod tests {
             (Action::WipeDisk, Selected::Disk(1)),
             (Action::Unmount, Selected::Partition(1, 3)),
             (Action::ConvertMbrToGpt, Selected::Disk(0)),
+            (Action::DeletePartition, Selected::Partition(1, 3)),
         ] {
             s.handle(Cmd::Action(a, sel));
             let w = s.wizard.as_ref().unwrap_or_else(|| panic!("{a:?}: no wizard"));
@@ -632,7 +634,7 @@ mod tests {
     fn apply_dry_run_keeps_queue_and_reports() {
         let mut s = mock_state();
         s.dry_run = true;
-        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        s.handle(Cmd::Push(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
         s.handle(Cmd::Apply);
         assert!(matches!(s.dialog, Some(Dialog::Confirm { .. })));
         s.handle(Cmd::ConfirmApply { allow_system: false });
@@ -665,7 +667,7 @@ mod tests {
     #[test]
     fn confirm_apply_without_the_dialog_does_nothing() {
         let mut s = mock_state();
-        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        s.handle(Cmd::Push(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
         s.handle(Cmd::ConfirmApply { allow_system: true });
         assert!(s.job.is_none(), "no Apply without the confirmation");
         assert_eq!(s.queue.len(), 1);
@@ -680,7 +682,7 @@ mod tests {
     #[test]
     fn refresh_is_refused_while_a_dialog_is_open() {
         let mut s = mock_state();
-        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        s.handle(Cmd::Push(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
         s.handle(Cmd::Apply);
         assert!(matches!(s.dialog, Some(Dialog::Confirm { .. })));
         s.handle(Cmd::Refresh);
@@ -695,7 +697,7 @@ mod tests {
     #[test]
     fn failed_apply_refreshes_and_drops_the_queue() {
         let mut s = mock_state();
-        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        s.handle(Cmd::Push(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
         assert_eq!(s.queue.len(), 1);
         // a worker that dies mid-Apply ("job stopped unexpectedly")
         let handle = spawn_job("Applying changes", |_p, _c| panic!("worker died"));
