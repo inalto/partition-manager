@@ -2,7 +2,9 @@
 //! back to a device, and convert between image formats.
 
 use crate::cli::{CliError, CopyMode};
-use crate::cmd_clone::{copy_device, copy_planned, existing_canonical, open_checked, plan_used_map, summary, SharedSource};
+use crate::cmd_clone::{
+    copy_device, copy_planned, existing_canonical, finish, open_checked, plan_used_map, summary, SharedSource,
+};
 use crate::device_arg::{open_spec, vmdk_extent_files};
 use crate::partial::Partial;
 use crate::progress::StderrProgress;
@@ -101,9 +103,10 @@ pub fn run_restore(
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let (source, target) = open_checked(platform, file, dst, dst_offset)?;
+    let (source, target, session) = open_checked(platform, file, dst, dst_offset)?;
     let start = Instant::now();
     let (copied, smart) = copy_device(source, target, dst_offset, CopyMode::Sector, cancel)?;
+    finish(session)?;
     writeln!(out, "{}", summary("Restored", copied, start.elapsed(), smart)).map_err(write_err)
 }
 

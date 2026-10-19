@@ -121,7 +121,7 @@ pub fn vmdk_extent_files(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Where the volume `id` lives on a physical disk, according to the platform.
-fn volume_extent(p: &dyn Platform, id: &VolumeId) -> Option<(u32, u64, u64)> {
+pub fn volume_extent(p: &dyn Platform, id: &VolumeId) -> Option<(u32, u64, u64)> {
     if let Ok(vols) = p.enumerate_volumes() {
         if let Some(v) = vols.iter().find(|v| &v.id == id) {
             if let (Some(d), true) = (v.disk, v.len > 0) {

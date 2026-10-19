@@ -2,11 +2,12 @@
 //! `pm restore` and `pm rescue` share (read-only source wrapper, safety checks, used-map planning).
 
 use crate::cli::{CliError, CopyMode};
-use crate::device_arg::{open_spec, Opened};
+use crate::cli::arg_error;
+use crate::device_arg::{open_spec, parse_device, resolve_volume, volume_extent, DeviceArg, Opened};
 use crate::progress::StderrProgress;
 use pm_core::{format_size, BlockDevice, CancelToken, Error};
 use pm_fs::UsedMap;
-use pm_platform::{OpenMode, Platform};
+use pm_platform::{OpenMode, Platform, WriteSession};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -72,11 +73,20 @@ pub fn check_copy(platform: &dyn Platform, src: &Opened, dst: &Opened, dst_offse
             "--dst-offset {dst_offset} is not a multiple of the destination sector size ({sector})"
         )));
     }
-    if let (Some(disk), Some(system)) = (dst.disk_index(), platform.system_disk()) {
-        if disk == system {
-            return Err(CliError::Usage(format!(
-                "Disk {disk} is the running system disk; refusing to write to it"
-            )));
+    if let Some(disk) = dst.disk_index() {
+        // fail closed: an undeterminable system disk refuses every disk destination
+        match system_disk(platform) {
+            Some(system) if system != disk => {}
+            Some(_) => {
+                return Err(CliError::Usage(format!(
+                    "Disk {disk} is the running system disk; refusing to write to it"
+                )))
+            }
+            None => {
+                return Err(CliError::Usage(format!(
+                    "Disk {disk}: cannot determine the running system disk; refusing to write to it"
+                )))
+            }
         }
     }
     if dst.overlaps(dst_offset, len, src) {
@@ -97,24 +107,221 @@ pub fn check_copy(platform: &dyn Platform, src: &Opened, dst: &Opened, dst_offse
     Ok(())
 }
 
+/// The disk Windows is running from, as the executor determines it
+/// ([`pm_ops::Model::effective_system_disk`]); `None` when it cannot be determined.
+fn system_disk(platform: &dyn Platform) -> Option<u32> {
+    pm_ops::Model::from_platform(platform).ok()?.effective_system_disk()
+}
+
+/// A write session shared by the destination device writing through it and the
+/// [`SessionGuard`] that finishes it.
+#[derive(Clone)]
+struct SessionSlot(Arc<Mutex<Option<Box<dyn WriteSession>>>>);
+
+impl SessionSlot {
+    fn with<T>(&self, f: impl FnOnce(&mut dyn BlockDevice) -> pm_core::Result<T>) -> pm_core::Result<T> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(s) => f(s.device()),
+            None => Err(Error::Invalid("the write session is already finished".into())),
+        }
+    }
+}
+
+/// `[start, start + len)` of the disk of a write session: how a copy writes to a disk, a
+/// partition or a volume (never through a raw handle opened outside a session).
+struct SessionSlice {
+    slot: SessionSlot,
+    start: u64,
+    len: u64,
+    sector: u32,
+}
+
+impl SessionSlice {
+    fn at(&self, offset: u64, n: usize) -> pm_core::Result<u64> {
+        match offset.checked_add(n as u64) {
+            Some(end) if end <= self.len => Ok(self.start + offset),
+            _ => Err(Error::Invalid(format!(
+                "access at {offset}+{n} outside the {}-byte destination",
+                self.len
+            ))),
+        }
+    }
+}
+
+impl BlockDevice for SessionSlice {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn sector_size(&self) -> u32 {
+        self.sector
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> pm_core::Result<()> {
+        let at = self.at(offset, buf.len())?;
+        self.slot.with(|d| d.read_at(at, buf))
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> pm_core::Result<()> {
+        let at = self.at(offset, buf.len())?;
+        self.slot.with(|d| d.write_at(at, buf))
+    }
+    fn flush(&mut self) -> pm_core::Result<()> {
+        self.slot.with(|d| d.flush())
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+}
+
+/// Finishes the write session of a copy's destination: through [`SessionGuard::finish`]
+/// (whose error is reported) or, on an error, cancellation or panic, when dropped.
+pub struct SessionGuard {
+    slot: SessionSlot,
+}
+
+impl SessionGuard {
+    fn take(&self) -> Option<Box<dyn WriteSession>> {
+        self.slot.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Finish the session (bring the disk back, re-read its layout).
+    pub fn finish(self) -> Result<(), CliError> {
+        match self.take() {
+            Some(s) => s.finish().map_err(CliError::Runtime),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self.take() {
+            let disk = s.disk();
+            if let Err(e) = s.finish() {
+                log::warn!("finishing the write session of Disk {disk}: {e}");
+            }
+        }
+    }
+}
+
+fn unplaced_volume(spec: &str) -> CliError {
+    CliError::Usage(format!(
+        "{spec}: the volume's place on a physical disk is unknown (spanned or virtual volume); \
+         refusing to write to it"
+    ))
+}
+
+/// Open the destination `spec` for writing. Disks, their partitions and volumes are written
+/// through a write session on the disk (volumes locked and dismounted, the disk offline for
+/// the copy); a volume whose place on a physical disk is unknown (spanned, virtual) is
+/// refused. Image files are opened directly. `probe` is the same destination opened
+/// read-only; its identity is kept.
+fn open_destination(
+    platform: &dyn Platform,
+    spec: &str,
+    probe: &Opened,
+) -> Result<(Opened, Option<SessionGuard>), CliError> {
+    let arg = parse_device(spec).map_err(arg_error)?;
+    let (disk, part, volume) = match &arg {
+        DeviceArg::Disk(i) => (*i, None, None),
+        DeviceArg::Partition(parent, n) => match **parent {
+            DeviceArg::Disk(i) => (i, Some(*n), None),
+            _ => return Ok((open_spec(platform, spec, OpenMode::ReadWrite)?, None)),
+        },
+        DeviceArg::Volume(_) => match probe.disk_extent {
+            Some((d, s, e)) => (d, None, Some((s, e))),
+            None => return Err(unplaced_volume(spec)),
+        },
+        DeviceArg::File(_) => return Ok((open_spec(platform, spec, OpenMode::ReadWrite)?, None)),
+    };
+    let session = platform.begin_write(disk).map_err(CliError::Runtime)?;
+    let guard = SessionGuard { slot: SessionSlot(Arc::new(Mutex::new(Some(session)))) };
+    let (disk_len, sector) =
+        guard.slot.with(|d| Ok((d.len(), d.sector_size()))).map_err(CliError::Runtime)?;
+    let (start, end) = match (volume, part) {
+        (Some(extent), _) => extent,
+        (None, Some(n)) => {
+            let table = guard.slot.with(|d| pm_parttable::read_table(d)).map_err(CliError::Runtime)?;
+            let e = table.entries.iter().find(|e| e.number == n).ok_or_else(|| {
+                CliError::Usage(format!("Disk {disk} has no partition {n} any more"))
+            })?;
+            (e.start, e.start + e.len)
+        }
+        (None, None) => (0, disk_len),
+    };
+    if start > end || end > disk_len {
+        return Err(CliError::Usage(format!("{spec}: lies outside Disk {disk}")));
+    }
+    let dev = SessionSlice { slot: guard.slot.clone(), start, len: end - start, sector };
+    let range = if volume.is_some() { probe.range } else { (start, end) };
+    let opened = Opened {
+        dev: Box::new(dev),
+        identity: probe.identity.clone(),
+        range,
+        disk_extent: Some((disk, start, end)),
+        files: Vec::new(),
+    };
+    Ok((opened, Some(guard)))
+}
+
 /// Open a copy's source and destination. The source is opened read-only. The destination is
 /// first opened read-only to learn its size and identity; only when every check in
-/// [`check_copy`] passes is it reopened read-write, so a refused copy never takes a write
-/// handle (which on a real disk can lock or dismount volumes).
+/// [`check_copy`] passes is it opened for writing — through a write session for disks,
+/// partitions and volumes ([`SessionGuard`], which the caller finishes with [`finish`]) — so
+/// a refused copy never takes a write handle (which on a real disk can lock or dismount
+/// volumes).
 pub fn open_checked(
+    platform: &dyn Platform,
+    src_spec: &str,
+    dst_spec: &str,
+    dst_offset: u64,
+) -> Result<(Opened, Opened, Option<SessionGuard>), CliError> {
+    let (src, probe) = probe_checked(platform, src_spec, dst_spec, dst_offset)?;
+    let (dst, guard) = open_writable(platform, &src, probe, dst_spec, dst_offset)?;
+    Ok((src, dst, guard))
+}
+
+/// The read-only half of [`open_checked`]: the source and the destination opened read-only
+/// (`probe`), with every check of [`check_copy`] passed. Nothing is written or locked.
+pub fn probe_checked(
     platform: &dyn Platform,
     src_spec: &str,
     dst_spec: &str,
     dst_offset: u64,
 ) -> Result<(Opened, Opened), CliError> {
     let src = open_spec(platform, src_spec, OpenMode::ReadOnly)?;
+    if let Ok(DeviceArg::Volume(v)) = parse_device(dst_spec) {
+        // refused before anything is opened on the destination
+        let id = resolve_volume(platform, &v).map_err(|e| match e {
+            Error::NotFound(m) => CliError::Usage(m),
+            other => CliError::Runtime(other),
+        })?;
+        if volume_extent(platform, &id).is_none() {
+            return Err(unplaced_volume(dst_spec));
+        }
+    }
     let probe = open_spec(platform, dst_spec, OpenMode::ReadOnly)?;
     check_copy(platform, &src, &probe, dst_offset)?;
+    Ok((src, probe))
+}
+
+/// The writing half of [`open_checked`]: open the destination `probe` describes for writing
+/// and check it again (the device could have changed between the two opens).
+pub fn open_writable(
+    platform: &dyn Platform,
+    src: &Opened,
+    probe: Opened,
+    dst_spec: &str,
+    dst_offset: u64,
+) -> Result<(Opened, Option<SessionGuard>), CliError> {
+    let (dst, guard) = open_destination(platform, dst_spec, &probe)?;
     drop(probe);
-    let dst = open_spec(platform, dst_spec, OpenMode::ReadWrite)?;
-    // the device could have changed between the two opens
-    check_copy(platform, &src, &dst, dst_offset)?;
-    Ok((src, dst))
+    check_copy(platform, src, &dst, dst_offset)?;
+    Ok((dst, guard))
+}
+
+/// Finish the destination's write session, if there is one.
+pub fn finish(guard: Option<SessionGuard>) -> Result<(), CliError> {
+    guard.map_or(Ok(()), SessionGuard::finish)
 }
 
 /// The used-block map of the filesystem on `src`, or the reason there is none.
@@ -189,9 +396,10 @@ pub fn run(
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let (source, target) = open_checked(platform, src, dst, dst_offset)?;
+    let (source, target, session) = open_checked(platform, src, dst, dst_offset)?;
     let start = Instant::now();
     let (copied, smart) = copy_device(source, target, dst_offset, mode, cancel)?;
+    finish(session)?;
     writeln!(out, "{}", summary("Cloned", copied, start.elapsed(), smart))
         .map_err(|e| CliError::Runtime(Error::io(0, 0, e)))
 }
@@ -304,6 +512,7 @@ mod tests {
             Default::default(),
         );
         p.add_disk(2, disk(3, &[]), Default::default());
+        p.set_system_disk(9);
         p.add_volume(volume('D', "aaaa"), 1, 2 * MIB, 2 * MIB); // [2M, 4M) of disk 1
         p.add_volume(volume('F', "ffff"), 1, 5 * MIB, MIB / 2); // [5M, 5.5M) of disk 1
         let before = p.disk_bytes(1);
@@ -323,5 +532,79 @@ mod tests {
         assert_eq!(after[3 * MIB as usize..(3 * MIB + 512 * 1024) as usize], before[5 * MIB as usize..(5 * MIB + 512 * 1024) as usize]);
         clone(&p, "D:", "disk:2").unwrap();
         assert_eq!(p.disk_bytes(2)[..2 * MIB as usize], after[2 * MIB as usize..4 * MIB as usize]);
+    }
+
+    #[test]
+    fn disk_destinations_are_written_in_a_finished_write_session() {
+        let p = MockPlatform::new();
+        p.add_disk(1, disk(2, &[(1, MIB, 2 * MIB), (2, 3 * MIB, 2 * MIB)]), Default::default());
+        p.add_disk(2, disk(3, &[]), Default::default());
+        p.set_system_disk(9);
+        let src = p.disk_bytes(1);
+        clone(&p, "disk:1", "disk:2").unwrap();
+        assert_eq!(p.disk_bytes(2), src);
+        assert_eq!(p.write_sessions_log(), vec![2]);
+        assert_eq!(p.finished_sessions_log(), vec![2]);
+
+        // a partition is written through the session of its disk, inside its bounds
+        clone(&p, "disk:1:1", "disk:2:2").unwrap();
+        let b = p.disk_bytes(2);
+        assert_eq!(b[3 * MIB as usize..5 * MIB as usize], src[MIB as usize..3 * MIB as usize]);
+        assert_eq!(p.write_sessions_log(), vec![2, 2]);
+        assert_eq!(p.finished_sessions_log(), vec![2, 2]);
+
+        // a volume through the session of the disk it lives on
+        p.add_volume(volume('G', "gggg"), 2, 3 * MIB, 2 * MIB);
+        clone(&p, "disk:1:2", "G:").unwrap();
+        assert_eq!(p.write_sessions_log(), vec![2, 2, 2]);
+        assert_eq!(p.finished_sessions_log(), vec![2, 2, 2]);
+
+        // a cancelled copy still finishes the session it took
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(run(&p, "disk:1", "disk:2", CopyMode::Sector, 0, &cancel, &mut Vec::new()).is_err());
+        assert_eq!(p.write_sessions_log(), vec![2, 2, 2, 2]);
+        assert_eq!(p.finished_sessions_log(), vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn unknown_system_disk_refuses_every_disk_destination() {
+        let p = MockPlatform::new();
+        p.add_disk(1, disk(2, &[]), Default::default());
+        p.add_disk(2, disk(3, &[(1, MIB, 2 * MIB)]), Default::default());
+        let before = p.disk_bytes(2);
+        for dst in ["disk:2", "disk:2:1"] {
+            assert_refused(clone(&p, "disk:1", dst), "cannot determine the running system disk");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("a.img");
+        FileDevice::create(&img, MIB).unwrap();
+        assert_refused(
+            crate::cmd_image::run_restore(
+                &p,
+                &format!("file:{}", img.display()),
+                "disk:2",
+                0,
+                &CancelToken::new(),
+                &mut Vec::new(),
+            ),
+            "cannot determine the running system disk",
+        );
+        assert_eq!(p.disk_bytes(2), before, "nothing written");
+        assert!(p.write_sessions_log().is_empty(), "no session taken");
+        // image files are not disks: still fine
+        let out = dir.path().join("b.img");
+        FileDevice::create(&out, 8 * MIB).unwrap();
+        clone(&p, "disk:1", &format!("file:{}", out.display())).unwrap();
+    }
+
+    #[test]
+    fn spanned_volume_destination_is_refused() {
+        let p = MockPlatform::new();
+        p.add_disk(1, disk(2, &[]), Default::default());
+        p.set_system_disk(9);
+        p.add_spanned_volume(volume('S', "span"));
+        assert_refused(clone(&p, "disk:1", "S:"), "place on a physical disk is unknown");
+        assert!(p.write_sessions_log().is_empty());
     }
 }

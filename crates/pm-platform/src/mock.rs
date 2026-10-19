@@ -77,6 +77,14 @@ impl MockPlatform {
         st.volumes.push(v);
     }
 
+    /// Add a volume that lives on no single disk (spanned / virtual): its `disk` is `None`.
+    pub fn add_spanned_volume(&self, mut v: VolumeInfo) {
+        v.disk = None;
+        let mut st = self.st();
+        st.volumes.retain(|x| x.id != v.id);
+        st.volumes.push(v);
+    }
+
     /// Make [`Platform::smart`] return `data` for disk `index` (other disks report `None`).
     pub fn set_smart(&self, index: u32, data: SmartData) {
         self.st().smart.insert(index, data);

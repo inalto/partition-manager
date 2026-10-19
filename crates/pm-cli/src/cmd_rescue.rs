@@ -2,7 +2,7 @@
 //! mapfile and a live status block on stderr.
 
 use crate::cli::{CliError, RescueArgs};
-use crate::cmd_clone::{existing_canonical, fs_used_map, open_checked, SharedSource};
+use crate::cmd_clone::{existing_canonical, finish, fs_used_map, open_writable, probe_checked, SharedSource};
 use crate::device_arg::Identity;
 use pm_core::{format_size, BlockDevice, CancelToken, Error, ProgressReport, ProgressSink};
 use pm_image::{rescue, RescueOpts};
@@ -231,9 +231,10 @@ pub fn run(
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    // Source and destination are checked (and the destination opened read-only) before the
-    // destination is opened for writing; the remaining checks below also precede any write.
-    let (source, mut target) = open_checked(platform, &a.src, &a.dst, a.dst_offset)?;
+    // Source and destination are checked (the destination opened read-only) and so are the
+    // rescue's own arguments before the destination is opened for writing.
+    let (source, probe) = probe_checked(platform, &a.src, &a.dst, a.dst_offset)?;
+    let target = &probe;
     if let Some(dir) = a.mapfile.parent().filter(|d| !d.as_os_str().is_empty()) {
         if !dir.is_dir() {
             return Err(CliError::Usage(format!(
@@ -252,6 +253,7 @@ pub fn run(
     }
     let mut opts = opts_from_args(a, source.dev.sector_size())?;
     let len = source.dev.len();
+    let (mut target, session) = open_writable(platform, &source, probe, &a.dst, a.dst_offset)?;
     let shared = SharedSource::new(source.dev);
     if a.used_map {
         let used = fs_used_map(&shared).map_err(|e| {
@@ -273,6 +275,8 @@ pub fn run(
         Error::Invalid(m) => CliError::Usage(m),
         other => CliError::Runtime(other),
     })?;
+    drop(target);
+    finish(session)?;
 
     let skipped = len.saturating_sub(stats.rescued).saturating_sub(stats.bad_bytes);
     let mut text = format!(
