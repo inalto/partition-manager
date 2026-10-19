@@ -244,6 +244,16 @@ enum DestPlan {
     File(PathBuf),
 }
 
+/// Why `path` cannot be the mapfile, if it cannot: it must be an absolute path (a relative one
+/// would resolve against the process's working folder, which the drive checks cannot see).
+pub fn mapfile_path_problem(path: &str) -> Option<String> {
+    let t = path.trim();
+    if t.is_empty() {
+        return Some("Enter the mapfile path.".into());
+    }
+    (!Path::new(t).is_absolute()).then(|| "The mapfile needs a full path: enter an absolute path, e.g. D:\\Rescue\\disk1.map.".into())
+}
+
 /// Re-check a plan against `fresh` (the layout read on the worker just before writing): the
 /// source and destination still exist with the confirmed ranges, and every check of the
 /// wizard still passes. Returns the source range to read.
@@ -280,7 +290,8 @@ fn recheck(fresh: &Model, plan: &Plan) -> Result<(u64, u64), String> {
             return Err(e);
         }
     }
-    if let Some(e) = rescue_path_problem(fresh, plan.src, &dest, &plan.mapfile.display().to_string(), "mapfile") {
+    let mapfile = plan.mapfile.display().to_string();
+    if let Some(e) = mapfile_path_problem(&mapfile).or_else(|| rescue_path_problem(fresh, plan.src, &dest, &mapfile, "mapfile")) {
         return Err(e);
     }
     Ok(src_now)
@@ -307,6 +318,10 @@ fn run_rescue(
         })?;
         plan.opts.used_map = Some(used);
         plan.opts.zero_unused = true;
+    }
+    // once more right before the first write: the used-map scan can take a while
+    if recheck(&Model::from_platform(p)?, &plan).map_err(Error::Invalid)? != src_range {
+        return Err(Error::Invalid("The source changed while the rescue was starting; nothing was written.".into()));
     }
     let stats = match &plan.dest {
         DestPlan::Device { dev, range: (offset, _) } => {
@@ -422,6 +437,9 @@ impl RescueWizard {
 
     /// The mapfile check: not on the source or destination disks, readable when it exists.
     fn mapfile_problem(&mut self, env: &ToolEnv) -> Result<Option<Resume>, String> {
+        if let Some(e) = mapfile_path_problem(&self.mapfile) {
+            return Err(e);
+        }
         if let Some(src) = self.src {
             if let Some(e) = rescue_path_problem(env.live, src, &self.dest, &self.mapfile, "mapfile") {
                 return Err(e);
@@ -892,6 +910,38 @@ mod tests {
         let e = run(&live, Device::Partition(1, 42), Device::Disk(0));
         assert!(e.contains("no longer exists"), "{e}");
         assert!(mock.write_sessions_log().is_empty(), "nothing was written");
+    }
+
+    #[test]
+    fn mapfile_must_be_an_absolute_path() {
+        use crate::tools::test_env::{model, platform};
+        assert!(mapfile_path_problem("rescue.map").unwrap().contains("absolute path"));
+        assert!(mapfile_path_problem(r"..\rescue.map").is_some());
+        assert!(mapfile_path_problem("").is_some());
+        assert!(mapfile_path_problem(r"D:\Rescue\disk1.map").is_none());
+        // in the wizard: relative refused, absolute on another drive accepted
+        let (m, p) = (model(), platform());
+        let env = ToolEnv { platform: &p, live: &m, pending: &[] };
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RescueWizard::new(Some(Device::Partition(1, 3)));
+        w.dest = Dest::Device(Device::Disk(0));
+        w.mapfile = "rescue.map".into();
+        assert!(w.mapfile_problem(&env).unwrap_err().contains("absolute path"));
+        w.mapfile = dir.path().join("disk1.map").display().to_string();
+        assert_eq!(w.mapfile_problem(&env), Ok(None), "a new mapfile on a drive of neither disk");
+        // the worker applies the same rule
+        let plan = Plan {
+            src: Device::Partition(1, 3),
+            src_range: Device::Partition(1, 3).range(&m).unwrap(),
+            dest: DestPlan::Device { dev: Device::Disk(0), range: Device::Disk(0).range(&m).unwrap() },
+            pending: vec![],
+            opts: RescueOpts::default(),
+            used_only: false,
+            mapfile: PathBuf::from("rescue.map"),
+        };
+        assert!(recheck(&m, &plan).unwrap_err().contains("absolute path"));
+        let plan = Plan { mapfile: dir.path().join("disk1.map"), ..plan };
+        assert!(recheck(&m, &plan).is_ok());
     }
 
     #[test]

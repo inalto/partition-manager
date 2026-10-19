@@ -258,6 +258,10 @@ impl Device {
 }
 
 /// The drive letter of the absolute path `p`, if it has one (`E:\x`, `\\?\E:\x`).
+///
+/// Limitation of every letter-based check built on this: a path reaching a volume through a
+/// folder mount point, a junction, a UNC share or a `\\?\Volume{…}` name has no (or another)
+/// drive letter and is not recognised as being on that volume.
 pub fn path_letter(p: &std::path::Path) -> Option<char> {
     use std::path::{Component, Prefix};
     match p.components().next()? {
@@ -271,6 +275,9 @@ pub fn path_letter(p: &std::path::Path) -> Option<char> {
 
 /// Why the file `path` (described as `what`) may not be used because it lies on one of
 /// `letters`, the drives of `device` (a device being read or written), if it may not.
+/// Only drive-letter paths are recognised (see [`path_letter`]): folder mount points,
+/// junctions, UNC and `\\?\Volume{…}` paths are not covered. Relative paths have no letter;
+/// callers that must not miss them require absolute paths.
 pub fn on_letters_problem(path: &str, letters: &[char], what: &str, device: &str) -> Option<String> {
     let c = path_letter(std::path::Path::new(path.trim()))?;
     letters

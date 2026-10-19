@@ -253,6 +253,13 @@ VMDK files attach to VMware or VirtualBox (`VBoxManage showmediuminfo disk.vmdk`
   disk that is not in use.
 - **Hard links, junctions and storage aliases** are not detected by the source/destination
   overlap checks of the direct-copy commands.
+- **Drive-letter checks only.** The GUI's "not on the source / target disk" checks for image
+  files, rescue mapfiles and recovery destinations look at drive letters: a path that reaches
+  the same volume through a folder mount point, a junction, a UNC share or a
+  `\\?\Volume{…}` name is not recognised.
+- **Old scan sessions.** Scan sessions saved before they recorded the scanned region load as
+  whole-device sessions. A carve session saved by an older `pm recover carve` on a
+  *partition* therefore restores the wrong bytes: delete it and scan again.
 - **Linux/macOS.** The `pm-platform` crate has a `NullPlatform` stub (every OS call fails
   with `Unsupported`) so the workspace's engines compile and test on other systems, but there
   is no real Linux implementation yet: the Linux build is a stub. Benchmarking is Windows
