@@ -92,6 +92,7 @@ fn parse_header(b: &[u8]) -> Option<u64> {
 pub(crate) struct VhdxDevice {
     file: FileDevice,
     block_size: u64,
+    file_len: u64,
     virtual_size: u64,
     sector_size: u32,
     chunk_ratio: u64,
@@ -226,7 +227,7 @@ impl VhdxDevice {
         file.read_at(bat_off, &mut raw)?;
         let bat = raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
 
-        Ok(VhdxDevice { file, block_size, virtual_size, sector_size, chunk_ratio, bat })
+        Ok(VhdxDevice { file, block_size, file_len: flen, virtual_size, sector_size, chunk_ratio, bat })
     }
 }
 
@@ -255,6 +256,12 @@ impl BlockDevice for VhdxDevice {
                 STATE_NOT_PRESENT | STATE_UNDEFINED | STATE_ZERO | STATE_UNMAPPED => dst.fill(0),
                 STATE_FULLY_PRESENT => {
                     let base = entry & !0xF_FFFF;
+                    // The payload must lie after the 1 MiB header area and inside the file.
+                    let in_range = base >= MIN_BLOCK_SIZE
+                        && base.checked_add(self.block_size).map_or(false, |e| e <= self.file_len);
+                    if !in_range {
+                        return Err(Error::Parse(format!("VHDX: BAT entry out of range (block {block})")));
+                    }
                     self.file.read_at(base + within, dst)?;
                 }
                 STATE_PARTIALLY_PRESENT => {
@@ -437,5 +444,73 @@ mod tests {
         let path = write_fixture(&dir, "partial.vhdx", &f);
         let mut dev = crate::open(&path, true).unwrap();
         assert!(matches!(dev.read_at(MIB, &mut [0u8; 1]), Err(Error::Unsupported(_))));
+    }
+
+    fn set_bat(f: &mut [u8], index: usize, value: u64) {
+        let o = MIB as usize + index * 8;
+        f[o..o + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn vhdx_bat_entry_out_of_range_is_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, u64); 4] = [
+            // base + block_size overflows u64 (and base + within would wrap to a low offset)
+            ("overflow", 0xFFFF_FFFF_FFF0_0000 | STATE_FULLY_PRESENT),
+            ("past_eof", (10 * MIB) | STATE_FULLY_PRESENT),
+            ("straddles_eof", (4 * MIB) | STATE_FULLY_PRESENT),
+            ("in_header_area", STATE_FULLY_PRESENT),
+        ];
+        for (name, entry) in cases {
+            let mut f = build_fixture(false);
+            set_bat(&mut f, 0, entry);
+            let path = write_fixture(&dir, &format!("{name}.vhdx"), &f);
+            let mut dev = crate::open(&path, true).unwrap();
+            let mut b = [0u8; 16];
+            for off in [0u64, 100] {
+                assert!(
+                    matches!(dev.read_at(off, &mut b), Err(Error::Parse(m)) if m.contains("out of range")),
+                    "{name} at {off}"
+                );
+            }
+        }
+    }
+
+    /// 4 GiB + 1 MiB virtual disk with 1 MiB blocks and 512-byte sectors: chunk ratio 4096, so
+    /// BAT entry 4096 is a sector-bitmap entry and payload block 4096 is entry 4097.
+    #[test]
+    fn vhdx_skips_sector_bitmap_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = build_fixture(false);
+        f.resize((5 * MIB) as usize, 0);
+        let vsize = 4097 * MIB;
+        let item = 2 * MIB as usize + 0x10008;
+        f[item..item + 8].copy_from_slice(&vsize.to_le_bytes());
+        let p0 = pattern(MIB as usize);
+        let p4096: Vec<u8> = p0.iter().map(|b| b ^ 0x5A).collect();
+        f[4 * MIB as usize..5 * MIB as usize].copy_from_slice(&p4096);
+        // entry 0: block 0 (pattern at 3 MiB); entry 1: ZERO (from the fixture);
+        // entry 4096: a bitmap entry that, if misread as a payload entry, points at block 0's data;
+        // entry 4097: payload block 4096 at 4 MiB.
+        set_bat(&mut f, 4096, (3 * MIB) | STATE_FULLY_PRESENT);
+        set_bat(&mut f, 4097, (4 * MIB) | STATE_FULLY_PRESENT);
+        let path = write_fixture(&dir, "big.vhdx", &f);
+
+        let mut dev = crate::open(&path, true).unwrap();
+        assert_eq!(dev.len(), vsize);
+        let mut b = vec![0u8; MIB as usize];
+        dev.read_at(0, &mut b).unwrap();
+        assert_eq!(b, p0);
+        dev.read_at(MIB, &mut b).unwrap(); // ZERO block
+        assert!(b.iter().all(|&x| x == 0));
+        dev.read_at(4095 * MIB, &mut b).unwrap(); // NOT_PRESENT block
+        assert!(b.iter().all(|&x| x == 0));
+        dev.read_at(4096 * MIB, &mut b).unwrap();
+        assert_eq!(b, p4096);
+        // crossing from the unallocated block 4095 into block 4096
+        let mut c = [0u8; 8];
+        dev.read_at(4096 * MIB - 4, &mut c).unwrap();
+        assert_eq!(&c[..4], &[0; 4]);
+        assert_eq!(&c[4..], &p4096[..4]);
     }
 }

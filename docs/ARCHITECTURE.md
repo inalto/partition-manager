@@ -24,8 +24,8 @@ the exact direct dependencies.
  foundation                        +-------> pm-core <---+
 ```
 
-Edges not drawn: `pm-image`, `pm-recover`, `pm-platform` and `pm-ops` also use `pm-fs` and
-`pm-parttable` where the table below says so.
+Edges not drawn: several crates also use `pm-fs` and `pm-parttable` where the table below
+says so.
 
 The exact direct edges (from the crate manifests):
 
@@ -36,8 +36,8 @@ The exact direct edges (from the crate manifests):
 | `pm-fs` | `pm-core` |
 | `pm-image` | `pm-core`, `pm-fs` |
 | `pm-platform` | `pm-core`, `pm-fs`, `pm-parttable` |
-| `pm-recover` | `pm-core`, `pm-fs`, `pm-image`, `pm-parttable` |
-| `pm-analyze` | `pm-core`, `pm-image`, `pm-platform` |
+| `pm-recover` | `pm-core`, `pm-fs`, `pm-parttable` (`pm-image` in dev-dependencies only) |
+| `pm-analyze` | `pm-core`, `pm-platform` (`pm-image` in dev-dependencies only) |
 | `pm-ops` | `pm-core`, `pm-fs`, `pm-image`, `pm-parttable`, `pm-platform` |
 | `pm-cli` | `pm-core`, `pm-fs`, `pm-image`, `pm-parttable`, `pm-platform`, `pm-ops`, `pm-recover`, `pm-analyze` |
 | `pm-gui` | the same set as `pm-cli` |

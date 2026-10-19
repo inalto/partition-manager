@@ -44,7 +44,9 @@ can be practised risk-free on image files with `--disk-file`.
 - **CLI needs `--yes`.** `pm create`, `format`, `resize`, `apply`, ... print the operation and
   write nothing without `--yes`.
 - **System-disk guard.** The running system disk is refused for destructive operations at
-  three layers (planner, executor pre-flight, CLI argument checks). Resize, label, letter,
+  several layers (the planner and the executor pre-flight; the direct-copy commands add
+  their own check; all four safety layers are listed in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). Resize, label, letter,
   mount and creating a partition in free space on it need an explicit `--allow-system-disk`.
   If the system disk cannot be determined, every disk is treated as protected.
 - **Lock and dismount.** Writes happen inside a write session that locks and dismounts every

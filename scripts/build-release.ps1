@@ -39,12 +39,19 @@ try {
     Write-Host ''
     & (Join-Path $dist 'pm.exe') --version
 
-    # The GUI must ask for elevation: the manifest is stored as UTF-8 XML in the resources.
-    $bytes = [System.IO.File]::ReadAllBytes((Join-Path $dist 'partition-manager.exe'))
-    $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-    $elevated = $text.Contains('requireAdministrator')
-    Write-Host ('partition-manager.exe manifest requireAdministrator: {0}' -f $elevated)
-    if (-not $elevated) { throw 'partition-manager.exe does not embed the requireAdministrator manifest' }
+    # The GUI must ask for elevation. build.rs replaces MinGW's default asInvoker manifest with
+    # ours, so the string must occur exactly once; two would mean a doubled manifest. The CLI
+    # must not carry one at all.
+    function Count-Marker([string]$Path, [string]$Marker) {
+        $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($Path))
+        return ([regex]::Matches($text, [regex]::Escape($Marker))).Count
+    }
+    $guiCount = Count-Marker (Join-Path $dist 'partition-manager.exe') 'requireAdministrator'
+    $cliCount = Count-Marker (Join-Path $dist 'pm.exe') 'requireAdministrator'
+    Write-Host ('requireAdministrator in partition-manager.exe: {0} (expected 1)' -f $guiCount)
+    Write-Host ('requireAdministrator in pm.exe: {0} (expected 0)' -f $cliCount)
+    if ($guiCount -ne 1) { throw "partition-manager.exe must embed exactly one requireAdministrator manifest (found $guiCount)" }
+    if ($cliCount -ne 0) { throw "pm.exe must not embed an elevation manifest (found $cliCount)" }
 }
 finally {
     Pop-Location
