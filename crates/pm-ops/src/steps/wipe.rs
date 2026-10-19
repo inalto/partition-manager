@@ -97,7 +97,7 @@ pub(crate) fn wipe_disk(ctx: &mut Ctx, disk: u32, method: WipeMethod) -> Result<
         let dev = s.device();
         let len = dev.len();
         wipe_range(dev, 0, len, method, &sink, cancel)?;
-        zero_table_areas(dev, false)?;
+        zero_table_areas(dev, false, &pm_parttable::Table::empty(pm_core::TableKind::None, len, 512))?;
         dev.flush()
     })?;
     ctx.rescan(disk)

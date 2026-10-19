@@ -59,7 +59,7 @@ pub(crate) fn clone_disk(
         if table.kind == TableKind::Mbr {
             // a former GPT would otherwise survive behind the new MBR; cleared before the
             // copies, which may legitimately cover the last sectors of the disk
-            zero_table_areas(s.device(), true)?;
+            zero_table_areas(s.device(), true, &table)?;
         }
         for ((sp, e), plan) in copies.iter().zip(&plans) {
             let sink = ctx.step(&format!("copy partition {} to partition {}", sp.number, e.number));

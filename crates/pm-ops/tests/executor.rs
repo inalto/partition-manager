@@ -1230,3 +1230,35 @@ fn partitions_created_earlier_in_the_run_keep_their_identity() {
     assert_eq!(r.failed, None, "{:?}", r.log);
     assert_eq!(r.completed, 4);
 }
+
+#[test]
+fn converting_a_4kn_gpt_to_mbr_keeps_data_at_the_end_of_the_disk() {
+    const SS: u64 = 4096;
+    let len = 64 * MIB;
+    let mut dev = MemDevice::new(len).with_sector_size(SS as u32);
+    let mut t = Table::empty(TableKind::Gpt, len, SS as u32);
+    // as Windows lays out a 4Kn GPT: the backup array (4 sectors) and header end the disk
+    t.gpt_last_usable = len - 5 * SS;
+    t.entries = vec![entry(1, MIB, t.gpt_last_usable - MIB, gpt_types::BASIC_DATA, 0)];
+    write_table(&mut dev, &t).unwrap();
+    let tail_start = t.gpt_last_usable - 33 * SS;
+    let tail = pattern((33 * SS) as usize, 4);
+    dev.write_at(tail_start, &tail).unwrap();
+    let p = MockPlatform::new();
+    p.add_disk(1, dev, meta(1));
+    p.set_system_disk(ELSEWHERE);
+
+    let r = run(&p, &[Operation::ConvertTable { disk: 1, to: TableKind::Mbr }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let b = p.disk_bytes(1);
+    assert!(
+        b[tail_start as usize..(tail_start + 33 * SS) as usize] == tail[..],
+        "the end of the partition survives the GPT cleanup"
+    );
+    // the backup GPT itself is gone, and so is the primary header
+    assert!(b[(len - SS) as usize..].iter().all(|&x| x == 0));
+    assert!(b[SS as usize..(2 * SS) as usize].iter().all(|&x| x == 0));
+    let t = table_of(&p, 1);
+    assert_eq!(t.kind, TableKind::Mbr);
+    assert_eq!(t.entries.len(), 1);
+}

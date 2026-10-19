@@ -6,16 +6,15 @@ use crate::operation::table_name;
 use super::resize::{is_container_part, unknown_fs_shrink};
 use super::{ensure_no_filesystem, entry_mut, entry_of, format, move_data, with_session, Ctx};
 use pm_core::units::MIB;
-use pm_core::{DiskInfo, Error, FsKind, PartitionInfo, PartitionType, Result, TableKind};
+use pm_core::{BlockDevice, DiskInfo, Error, FsKind, PartitionInfo, PartitionType, Result, TableKind};
 use pm_parttable::{align_table, gpt_to_mbr, mbr_to_gpt, Table};
 
-/// Sectors at the start of a disk that hold the MBR, the GPT header and its entry array.
-const GPT_HEAD_SECTORS: u64 = 34;
-/// Sectors at the end of a disk that hold the backup GPT entry array and header.
-const GPT_TAIL_SECTORS: u64 = 33;
+/// Largest GPT entry array believed from a header (a corrupt header must not make us zero
+/// half the disk): 16 MiB.
+const GPT_MAX_ARRAY: u64 = 16 * MIB;
 
 /// Zero `[start, start + len)` of `dev` (clipped to the device).
-pub(crate) fn zero(dev: &mut dyn pm_core::BlockDevice, start: u64, len: u64) -> Result<()> {
+pub(crate) fn zero(dev: &mut dyn BlockDevice, start: u64, len: u64) -> Result<()> {
     let end = start.saturating_add(len).min(dev.len());
     if start >= end {
         return Ok(());
@@ -23,15 +22,87 @@ pub(crate) fn zero(dev: &mut dyn pm_core::BlockDevice, start: u64, len: u64) -> 
     dev.write_at(start, &vec![0u8; (end - start) as usize])
 }
 
-/// Zero the primary GPT area (LBA 0..34, or LBA 1..34 with `keep_mbr`) and the backup GPT
-/// (last 33 sectors) of `dev`.
-pub(crate) fn zero_table_areas(dev: &mut dyn pm_core::BlockDevice, keep_mbr: bool) -> Result<()> {
+/// A GPT header: `(its own LBA, the other header's LBA, entry array start LBA, array bytes)`.
+fn gpt_header(dev: &mut dyn BlockDevice, lba: u64, ss: u64) -> Option<(u64, u64, u64, u64)> {
+    let mut b = vec![0u8; ss as usize];
+    dev.read_at(lba.checked_mul(ss)?, &mut b).ok()?;
+    if b.get(..8)? != b"EFI PART" {
+        return None;
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as u64;
+    let bytes = u32_at(80).checked_mul(u32_at(84))?;
+    (u64_at(24) == lba && bytes <= GPT_MAX_ARRAY).then(|| (lba, u64_at(32), u64_at(72), bytes))
+}
+
+/// The byte ranges `dev`'s GPT structures occupy: header and entry array of the primary GPT
+/// (from LBA 1, or LBA 0 too unless `keep_mbr`) and of the backup GPT, as their headers
+/// describe them. Where a header cannot be read, the areas a GPT written for this disk's
+/// sector size would use ([`Table::empty`]'s usable bounds) are taken instead.
+fn gpt_areas(dev: &mut dyn BlockDevice, keep_mbr: bool) -> Vec<(u64, u64)> {
     let ss = (dev.sector_size() as u64).max(512);
     let len = dev.len();
-    let from = if keep_mbr { ss } else { 0 };
-    zero(dev, from, GPT_HEAD_SECTORS * ss - from)?;
-    let tail = (GPT_TAIL_SECTORS * ss).min(len);
-    zero(dev, len - tail, tail)
+    let last = (len / ss).saturating_sub(1);
+    let default = Table::empty(TableKind::Gpt, len, ss as u32);
+    let mut areas = Vec::new();
+    if !keep_mbr {
+        areas.push((0, ss));
+    }
+    let array = |areas: &mut Vec<(u64, u64)>, h: (u64, u64, u64, u64)| {
+        areas.push((h.0 * ss, (h.0 + 1) * ss));
+        let start = h.2.saturating_mul(ss);
+        areas.push((start, start.saturating_add(h.3.div_ceil(ss) * ss)));
+    };
+    let primary = gpt_header(dev, 1, ss);
+    match primary {
+        Some(h) => array(&mut areas, h),
+        None => areas.push((ss, default.gpt_first_usable)),
+    }
+    let mut backups = vec![last];
+    if let Some((_, alt, _, _)) = primary {
+        if alt != last && alt > 1 && alt < last {
+            backups.push(alt);
+        }
+    }
+    let mut found = false;
+    for lba in backups {
+        if let Some(h) = gpt_header(dev, lba, ss) {
+            array(&mut areas, h);
+            found = true;
+        }
+    }
+    if !found {
+        areas.push((default.gpt_last_usable, len));
+    }
+    areas
+}
+
+/// Zero the GPT structures of `dev` ([`gpt_areas`]: primary and backup header and entry
+/// array, LBA 0 too unless `keep_mbr`) without touching any byte of a partition of `keep`
+/// (the table now on, or about to be on, the disk).
+pub(crate) fn zero_table_areas(dev: &mut dyn BlockDevice, keep_mbr: bool, keep: &Table) -> Result<()> {
+    let len = dev.len();
+    let protected: Vec<(u64, u64)> = keep.entries.iter().map(|e| (e.start, e.end())).collect();
+    for (start, end) in gpt_areas(dev, keep_mbr) {
+        let mut pieces = vec![(start.min(len), end.min(len))];
+        for &(ps, pe) in &protected {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(s, e)| {
+                    if pe <= s || ps >= e {
+                        vec![(s, e)]
+                    } else {
+                        vec![(s, ps.max(s)), (pe.min(e), e)]
+                    }
+                })
+                .filter(|(s, e)| s < e)
+                .collect();
+        }
+        for (s, e) in pieces {
+            zero(dev, s, e - s)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn initialize(ctx: &mut Ctx, disk: u32, kind: TableKind) -> Result<()> {
@@ -42,7 +113,7 @@ pub(crate) fn initialize(ctx: &mut Ctx, disk: u32, kind: TableKind) -> Result<()
         s.commit_table(&t)?;
         if kind == TableKind::Mbr {
             // a former GPT would otherwise survive behind the new MBR
-            zero_table_areas(s.device(), true)?;
+            zero_table_areas(s.device(), true, &t)?;
             s.device().flush()?;
         }
         Ok(())
@@ -135,7 +206,7 @@ pub(crate) fn convert(ctx: &mut Ctx, disk: u32, to: TableKind) -> Result<()> {
         if to == TableKind::Mbr {
             // the primary and backup GPT would otherwise survive next to the new MBR; they
             // are cleared only once the MBR is written, so the disk always has a table
-            zero_table_areas(s.device(), true)?;
+            zero_table_areas(s.device(), true, &converted)?;
             s.device().flush()?;
         }
         Ok(())
