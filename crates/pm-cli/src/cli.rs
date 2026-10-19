@@ -1,5 +1,7 @@
 //! Command line definition (clap) and the CLI error type with its exit-code mapping.
 
+use crate::cmd_apply::ApplyArgs;
+use crate::cmd_ops::OpCommand;
 use clap::{Args, Parser, Subcommand};
 use pm_image::ImageFormat;
 use std::fmt;
@@ -15,6 +17,12 @@ pub const EXIT_RUNTIME: i32 = 2;
 #[derive(Parser, Debug)]
 #[command(name = "pm", version, about = "Partition Manager command line", propagate_version = true)]
 pub struct Cli {
+    /// Use this raw image file as a disk instead of the physical disks (repeatable: the first
+    /// is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`,
+    /// then works on the files; no administrator rights are needed. Mounting, formatting and
+    /// everything else that needs a volume layer is not available on image files.
+    #[arg(long = "disk-file", global = true, value_name = "PATH")]
+    pub disk_files: Vec<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -149,6 +157,13 @@ pub enum Command {
         /// Existing or new directory to extract into
         dest: PathBuf,
     },
+    /// Apply the operations listed in a JSON file (see `--emit-json` of the operation commands)
+    ///
+    /// The operations are validated against the current disks first. Nothing is written
+    /// unless --yes is given; --dry-run validates and shows what would be done.
+    Apply(ApplyArgs),
+    #[command(flatten)]
+    Op(OpCommand),
 }
 
 /// `--smart` / `--sector` (neither: smart when a filesystem is recognised, else sector).
@@ -221,7 +236,7 @@ pub struct RescueArgs {
 }
 
 /// A byte count such as `4096`, `64K`, `1.5G`.
-fn size_arg(s: &str) -> Result<u64, String> {
+pub fn size_arg(s: &str) -> Result<u64, String> {
     pm_core::parse_size(s).map_err(|e| e.to_string())
 }
 
@@ -270,13 +285,15 @@ pub enum CliError {
     Usage(String),
     /// Platform or runtime failure (exit 2).
     Runtime(pm_core::Error),
+    /// An operation ran and failed; the text is the whole message (exit 2).
+    Failed(String),
 }
 
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Usage(_) => EXIT_USAGE,
-            CliError::Runtime(_) => EXIT_RUNTIME,
+            CliError::Runtime(_) | CliError::Failed(_) => EXIT_RUNTIME,
         }
     }
 
@@ -297,7 +314,7 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CliError::Usage(m) => f.write_str(m),
+            CliError::Usage(m) | CliError::Failed(m) => f.write_str(m),
             CliError::Runtime(e) => {
                 write!(f, "{e}")?;
                 if self.is_access_denied() {

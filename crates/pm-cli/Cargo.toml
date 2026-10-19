@@ -15,6 +15,7 @@ pm-parttable = { path = "../pm-parttable" }
 pm-image = { path = "../pm-image" }
 pm-fs = { path = "../pm-fs" }
 pm-platform = { path = "../pm-platform" }
+pm-ops = { path = "../pm-ops" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

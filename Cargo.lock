@@ -375,6 +375,7 @@ dependencies = [
  "pm-core",
  "pm-fs",
  "pm-image",
+ "pm-ops",
  "pm-parttable",
  "pm-platform",
  "serde",
@@ -451,6 +452,7 @@ dependencies = [
  "pm-core",
  "pm-parttable",
  "serde",
+ "tempfile",
  "uuid",
  "windows-sys 0.59.0",
 ]

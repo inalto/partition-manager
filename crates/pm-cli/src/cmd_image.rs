@@ -18,7 +18,7 @@ fn write_err(e: std::io::Error) -> CliError {
 }
 
 /// The explicit format, else the one the file extension implies.
-fn pick_format(explicit: Option<ImageFormat>, file: &Path) -> Result<ImageFormat, CliError> {
+pub(crate) fn pick_format(explicit: Option<ImageFormat>, file: &Path) -> Result<ImageFormat, CliError> {
     explicit.or_else(|| ImageFormat::from_extension(file)).ok_or_else(|| {
         CliError::Usage(format!(
             "cannot tell the image format of '{}' from its extension; pass --format raw|vhd|vhd-fixed|vmdk|vmdk-flat|qcow2",

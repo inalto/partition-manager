@@ -4,11 +4,13 @@
 //! real implementation (Windows) or [`NullPlatform`] elsewhere; [`MockPlatform`] backs the tests.
 
 pub mod aligned;
+pub mod file_platform;
 pub mod mock;
 pub mod traits;
 #[cfg(windows)]
 pub mod windows;
 
+pub use file_platform::{FilePlatform, NO_SYSTEM_DISK};
 pub use mock::MockPlatform;
 pub use traits::*;
 #[cfg(windows)]

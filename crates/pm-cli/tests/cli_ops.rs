@@ -1,0 +1,274 @@
+//! End-to-end tests for `pm apply`, the operation subcommands, `pm recover` and `pm analyze`:
+//! run the `pm` binary on image files through `--disk-file` (no admin, no real disks).
+
+mod common;
+
+use common::*;
+use pm_core::{gpt_types, FileDevice, PartitionType, TableKind, MIB};
+use pm_ops::Operation;
+use pm_parttable::{read_table, Table};
+use std::path::Path;
+
+fn blank(path: &Path, len: u64) {
+    FileDevice::create(path, len).unwrap();
+}
+
+fn table_of(path: &Path) -> Table {
+    let mut dev = FileDevice::open(path, true).unwrap();
+    read_table(&mut dev).unwrap()
+}
+
+fn write_ops(path: &Path, ops: &[Operation]) {
+    std::fs::write(path, serde_json::to_string_pretty(ops).unwrap()).unwrap();
+}
+
+fn create_op(start: u64, len: u64, name: &str) -> Operation {
+    Operation::CreatePartition {
+        disk: 0,
+        start,
+        len,
+        ptype: PartitionType::Gpt(gpt_types::BASIC_DATA),
+        fs: None,
+        label: String::new(),
+        letter: None,
+        name: name.into(),
+    }
+}
+
+#[test]
+fn cli_apply_json_creates_partitions_on_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, 64 * MIB);
+    let ops = dir.path().join("ops.json");
+    write_ops(
+        &ops,
+        &[
+            Operation::InitializeDisk { disk: 0, kind: TableKind::Gpt },
+            create_op(MIB, 20 * MIB, "First"),
+            create_op(22 * MIB, 30 * MIB, "Second"),
+        ],
+    );
+
+    let out = pm(&["--disk-file", s(&img), "apply", s(&ops), "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Initialize Disk 0 as GPT"), "{text}");
+    assert!(text.contains("Create partition on Disk 0"), "{text}");
+
+    let out = pm(&["table", s(&img)]);
+    let text = stdout(&out);
+    assert!(text.contains("GPT") && text.contains("First") && text.contains("Second"), "{text}");
+    assert!(text.contains(&MIB.to_string()) && text.contains(&(22 * MIB).to_string()), "{text}");
+    let t = table_of(&img);
+    assert_eq!(t.entries.len(), 2);
+    assert_eq!((t.entries[0].start, t.entries[0].len), (MIB, 20 * MIB));
+    assert_eq!((t.entries[1].start, t.entries[1].len), (22 * MIB, 30 * MIB));
+
+    // `pm list` sees the same disk through the file platform
+    let out = pm(&["--disk-file", s(&img), "list", "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let disks: Vec<pm_core::DiskInfo> = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(disks.len(), 1);
+    assert_eq!(disks[0].partitions.len(), 2);
+}
+
+#[test]
+fn cli_apply_accepts_hand_written_json_and_a_single_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, 16 * MIB);
+    let ops = dir.path().join("ops.json");
+    std::fs::write(&ops, r#"{"InitializeDisk": {"disk": 0, "kind": "Mbr"}}"#).unwrap();
+    // the global option may follow the subcommand
+    let out = pm(&["apply", s(&ops), "--yes", "--disk-file", s(&img)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(table_of(&img).kind, TableKind::Mbr);
+}
+
+#[test]
+fn cli_apply_dry_run_leaves_image_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, 64 * MIB);
+    let ops = dir.path().join("ops.json");
+    write_ops(&ops, &[Operation::InitializeDisk { disk: 0, kind: TableKind::Gpt }, create_op(MIB, 20 * MIB, "A")]);
+    let before = read_all(&img);
+
+    let out = pm(&["--disk-file", s(&img), "apply", s(&ops), "--dry-run"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("would: Initialize Disk 0 as GPT"), "{}", stdout(&out));
+    assert_eq!(read_all(&img), before);
+
+    // --dry-run wins over --yes
+    let out = pm(&["--disk-file", s(&img), "apply", s(&ops), "--dry-run", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(read_all(&img), before);
+
+    // without --yes nothing is written either, and the user is told how to proceed
+    let out = pm(&["--disk-file", s(&img), "apply", s(&ops)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Re-run with --yes to apply"), "{}", stdout(&out));
+    assert_eq!(read_all(&img), before);
+}
+
+#[test]
+fn cli_apply_planning_error_exits_1_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, 64 * MIB);
+    let ops = dir.path().join("ops.json");
+    // the second partition overlaps the first
+    write_ops(
+        &ops,
+        &[
+            Operation::InitializeDisk { disk: 0, kind: TableKind::Gpt },
+            create_op(MIB, 20 * MIB, "A"),
+            create_op(10 * MIB, 20 * MIB, "B"),
+        ],
+    );
+    let before = read_all(&img);
+    let out = pm(&["--disk-file", s(&img), "apply", s(&ops), "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("overlaps"), "{}", stderr(&out));
+    assert_eq!(read_all(&img), before);
+
+    // unparsable file
+    std::fs::write(&ops, "not json").unwrap();
+    let out = pm(&["--disk-file", s(&img), "apply", s(&ops), "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    // a missing --disk-file image
+    let out = pm(&["--disk-file", s(&dir.path().join("nope.img")), "list"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+}
+
+#[test]
+fn cli_ops_subcommands_build_and_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    blank(&img, 64 * MIB);
+    let run = |extra: &[&str]| {
+        let mut a = vec!["--disk-file", s(&img)];
+        a.extend_from_slice(extra);
+        pm(&a)
+    };
+
+    let out = run(&["init-disk", "0", "--gpt", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let out = run(&["create", "disk:0", "--start", "1M", "--len", "20M", "--name", "Alpha", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let out = run(&["create", "0", "--start", "22M", "--len", "10M", "--type", "linux", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let t = table_of(&img);
+    assert_eq!(t.entries.len(), 2);
+    assert_eq!(t.entries[0].name, "Alpha");
+    assert_eq!(t.entries[1].ptype, PartitionType::Gpt(gpt_types::LINUX_FS));
+
+    // no --yes: nothing happens
+    let before = read_all(&img);
+    let out = run(&["delete", "0", "2"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Re-run with --yes"), "{}", stdout(&out));
+    assert_eq!(read_all(&img), before);
+
+    let out = run(&["set-type", "0", "2", "--type", "basic", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(table_of(&img).entries[1].ptype, PartitionType::Gpt(gpt_types::BASIC_DATA));
+
+    let out = run(&["resize", "0", "1", "--start", "1M", "--len", "21M", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(table_of(&img).entries[0].len, 21 * MIB);
+
+    let out = run(&["delete", "0", "2", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(table_of(&img).entries.len(), 1);
+
+    // --emit-json prints the operation and touches nothing
+    let before = read_all(&img);
+    let out = run(&["wipe-disk", "0", "--method", "dod3", "--emit-json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let op: Operation = serde_json::from_str(&stdout(&out)).expect("operation JSON");
+    assert!(matches!(op, Operation::WipeDisk { disk: 0, method: pm_ops::WipeMethod::Dod3 }), "{op:?}");
+    assert_eq!(read_all(&img), before);
+
+    // operations that need a volume layer are refused up front with a clear message
+    let out = run(&["format", "0", "1", "--fs", "ntfs", "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("image files"), "{}", stderr(&out));
+    let out = run(&["create", "0", "--start", "40M", "--len", "10M", "--fs", "ntfs", "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(read_all(&img), before);
+
+    // bad arguments are usage errors
+    assert_eq!(run(&["init-disk", "0", "--yes"]).status.code(), Some(1));
+    assert_eq!(run(&["create", "0", "--start", "1M", "--len", "x"]).status.code(), Some(1));
+    assert_eq!(run(&["delete", "7", "1", "--yes"]).status.code(), Some(1));
+}
+
+#[test]
+fn cli_clone_disk_image_to_image_proportional() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.img");
+    let dst = dir.path().join("dst.img");
+    gpt_fat32_image(&src, 64 * MIB, MIB, 40 * MIB);
+    blank(&dst, 128 * MIB);
+    let ls_src = pm(&["ls", &format!("{}:1", s(&src))]);
+    assert!(ls_src.status.success(), "stderr: {}", stderr(&ls_src));
+    assert!(stdout(&ls_src).contains("HELLO.TXT"), "{}", stdout(&ls_src));
+
+    let out = pm(&[
+        "--disk-file", s(&src), "--disk-file", s(&dst),
+        "clone-disk", "0", "1", "--sizing", "proportional", "--yes",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Clone Disk 0"), "{}", stdout(&out));
+
+    let t = table_of(&dst);
+    assert_eq!(t.kind, TableKind::Gpt);
+    assert_eq!(t.entries.len(), 1);
+    assert!(t.entries[0].len >= 40 * MIB, "{:?}", t.entries[0]);
+    assert_eq!(t.entries[0].name, "Data");
+
+    let ls_dst = pm(&["ls", &format!("{}:1", s(&dst))]);
+    assert!(ls_dst.status.success(), "stderr: {}", stderr(&ls_dst));
+    assert_eq!(stdout(&ls_dst), stdout(&ls_src));
+    let cat = pm(&["cat", &format!("{}:1", s(&dst)), "/DATA.BIN"]);
+    assert_eq!(cat.stdout, data_bin());
+    // the source is untouched
+    assert_eq!(table_of(&src).entries.len(), 1);
+}
+
+#[test]
+fn cli_clone_disk_dry_run_writes_nothing_and_self_clone_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.img");
+    let dst = dir.path().join("dst.img");
+    gpt_fat32_image(&src, 64 * MIB, MIB, 40 * MIB);
+    blank(&dst, 128 * MIB);
+    let before = read_all(&dst);
+    let out = pm(&["--disk-file", s(&src), "--disk-file", s(&dst), "clone-disk", "0", "1", "--dry-run"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("would: Clone Disk 0"), "{}", stdout(&out));
+    assert_eq!(read_all(&dst), before);
+
+    let out = pm(&["--disk-file", s(&src), "clone-disk", "0", "0", "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+}
+
+#[test]
+fn cli_image_and_restore_ops_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.img");
+    let dst = dir.path().join("dst.img");
+    let saved = dir.path().join("saved.img");
+    gpt_fat32_image(&src, 64 * MIB, MIB, 40 * MIB);
+    blank(&dst, 64 * MIB);
+
+    let out = pm(&["--disk-file", s(&src), "image-disk", "0", s(&saved), "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(saved.exists());
+    let out = pm(&["--disk-file", s(&dst), "restore-image", s(&saved), "0", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let out = pm(&["cat", &format!("{}:1", s(&dst)), "/HELLO.TXT"]);
+    assert_eq!(out.stdout, HELLO);
+}

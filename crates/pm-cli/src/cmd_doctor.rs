@@ -55,6 +55,7 @@ pub fn report(platform: &dyn Platform) -> String {
         }
     }
     match platform.system_disk() {
+        Some(pm_platform::NO_SYSTEM_DISK) => s.push_str("System disk:  none (image files)\n"),
         Some(i) => s.push_str(&format!("System disk:  {i}\n")),
         None => s.push_str("System disk:  unknown\n"),
     }
