@@ -1,0 +1,778 @@
+//! Executor and queue tests on [`MockPlatform`]: every disk is an in-memory device, every
+//! platform side effect is recorded.
+
+use pm_core::{
+    gpt_types, BlockDevice, CancelToken, DiskInfo, FnProgress, FsKind, MemDevice, NullProgress,
+    PartitionType, ProgressReport, SliceDevice, TableKind, VolumeId, VolumeInfo, MIB,
+};
+use pm_fs::{format_fat32, FormatOpts};
+use pm_image::ImageFormat;
+use pm_ops::{
+    execute, BootFix, CloneMode, ExecOpts, ExecReport, Model, OpQueue, Operation, Sizing,
+    WipeMethod,
+};
+use pm_parttable::{read_table, write_table, Entry, Table};
+use pm_platform::{MockPlatform, MountPoint, OpenMode, Platform};
+use std::sync::Mutex;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------- fixtures
+
+const DISK_LEN: u64 = 48 * MIB;
+/// A disk index that does not exist: makes the system disk known without it being a test disk.
+const ELSEWHERE: u32 = 9;
+
+fn meta(index: u32) -> DiskInfo {
+    DiskInfo {
+        index,
+        model: format!("Mock Disk {index}"),
+        ..Default::default()
+    }
+}
+
+fn entry(number: u32, start: u64, len: u64, ptype: Uuid, attrs: u64) -> Entry {
+    Entry {
+        number,
+        start,
+        len,
+        ptype: PartitionType::Gpt(ptype),
+        guid: Some(Uuid::new_v4()),
+        name: format!("part{number}"),
+        attrs,
+        logical: false,
+    }
+}
+
+/// A `len`-byte device filled with `fill`, with a GPT holding `entries` (none: no table).
+fn gpt_dev(len: u64, fill: u8, entries: Option<Vec<Entry>>) -> MemDevice {
+    let mut dev = MemDevice::from_vec(vec![fill; len as usize]);
+    if let Some(entries) = entries {
+        let mut t = Table::empty(TableKind::Gpt, len, 512);
+        t.entries = entries;
+        write_table(&mut dev, &t).unwrap();
+    }
+    dev
+}
+
+fn volume(id: &str, fs: Option<FsKind>, mounts: &[&str], total: u64, free: u64) -> VolumeInfo {
+    VolumeInfo {
+        id: VolumeId(id.into()),
+        fs,
+        label: String::new(),
+        mount_points: mounts.iter().map(|m| m.to_string()).collect(),
+        total,
+        free,
+        ..Default::default()
+    }
+}
+
+fn opts() -> ExecOpts {
+    ExecOpts { dry_run: false, allow_system_disk: false }
+}
+
+fn run(p: &MockPlatform, ops: &[Operation]) -> ExecReport {
+    execute(p, ops, &opts(), &NullProgress, &CancelToken::new()).expect("execute returns a report")
+}
+
+fn table_of(p: &MockPlatform, disk: u32) -> Table {
+    let mut dev = MemDevice::from_vec(p.disk_bytes(disk));
+    read_table(&mut dev).unwrap()
+}
+
+fn assert_sessions_finished(p: &MockPlatform) {
+    assert_eq!(
+        p.write_sessions_log(),
+        p.finished_sessions_log(),
+        "every write session must be finished"
+    );
+}
+
+fn create(disk: u32, start: u64, len: u64, fs: Option<FsKind>, letter: Option<char>) -> Operation {
+    Operation::CreatePartition {
+        disk,
+        start,
+        len,
+        ptype: PartitionType::Gpt(gpt_types::BASIC_DATA),
+        fs,
+        label: "Data".into(),
+        letter,
+        name: "Data".into(),
+    }
+}
+
+/// Format `[start, start + len)` of `dev` as FAT32 with 512-byte clusters.
+fn format_fat(dev: &mut MemDevice, start: u64, len: u64, label: &str) {
+    let mut slice = SliceDevice::new(&mut *dev, start, len).unwrap();
+    format_fat32(
+        &mut slice,
+        &FormatOpts { label: label.into(), cluster_size: Some(512), volume_id: Some(0x1234_5678) },
+    )
+    .unwrap();
+}
+
+/// Minimal FAT32 writer: a file `name83` (8.3, space padded) in the root directory, stored in
+/// the first free clusters. Enough for the readers in pm-fs.
+fn fat_add_file(dev: &mut MemDevice, part: u64, name83: &[u8; 11], data: &[u8]) {
+    let mut bs = [0u8; 512];
+    dev.read_at(part, &mut bs).unwrap();
+    let u16_at = |o: usize| u16::from_le_bytes([bs[o], bs[o + 1]]) as u64;
+    let u32_at = |o: usize| u32::from_le_bytes([bs[o], bs[o + 1], bs[o + 2], bs[o + 3]]) as u64;
+    let (bps, spc, reserved, nfats, fat_sz, root) =
+        (u16_at(11), bs[13] as u64, u16_at(14), bs[16] as u64, u32_at(36), u32_at(44));
+    let cluster_bytes = bps * spc;
+    let fat_off = |k: u64| part + (reserved + k * fat_sz) * bps;
+    let data_start = part + (reserved + nfats * fat_sz) * bps;
+    let cluster_off = |c: u64| data_start + (c - 2) * cluster_bytes;
+    let fat_get = |dev: &mut MemDevice, c: u64| {
+        let mut b = [0u8; 4];
+        dev.read_at(fat_off(0) + 4 * c, &mut b).unwrap();
+        u32::from_le_bytes(b) & 0x0FFF_FFFF
+    };
+    let n = (data.len() as u64).div_ceil(cluster_bytes).max(1);
+    let mut first = 3;
+    while (first..first + n).any(|c| fat_get(dev, c) != 0) {
+        first += 1;
+    }
+    for i in 0..n {
+        let c = first + i;
+        let next: u32 = if i + 1 == n { 0x0FFF_FFFF } else { (c + 1) as u32 };
+        for k in 0..nfats {
+            dev.write_at(fat_off(k) + 4 * c, &next.to_le_bytes()).unwrap();
+        }
+    }
+    let mut padded = data.to_vec();
+    padded.resize((n * cluster_bytes) as usize, 0);
+    dev.write_at(cluster_off(first), &padded).unwrap();
+    // directory entry in the first free slot of the root cluster
+    let mut dir = vec![0u8; cluster_bytes as usize];
+    dev.read_at(cluster_off(root), &mut dir).unwrap();
+    let slot = (0..dir.len() / 32).find(|i| dir[i * 32] == 0).expect("free root slot");
+    let mut de = [0u8; 32];
+    de[..11].copy_from_slice(name83);
+    de[11] = 0x20;
+    de[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
+    de[26..28].copy_from_slice(&(first as u16).to_le_bytes());
+    de[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    dev.write_at(cluster_off(root) + slot as u64 * 32, &de).unwrap();
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+}
+
+/// Root listing `(name, size)` and the content of every file of the filesystem at
+/// `[start, start + len)` of disk `disk`.
+fn fs_files(p: &MockPlatform, disk: u32, start: u64, len: u64) -> Vec<(String, Vec<u8>)> {
+    let dev = p.open_disk(disk, OpenMode::ReadOnly).unwrap();
+    let slice = SliceDevice::new(dev, start, len).unwrap();
+    let mut fs = pm_fs::open(Box::new(slice)).unwrap();
+    let root = fs.root();
+    let mut out = Vec::new();
+    for e in fs.list(&root).unwrap() {
+        if e.is_dir || e.deleted {
+            continue;
+        }
+        let mut v = Vec::new();
+        fs.extract(&e, &mut v).unwrap();
+        out.push((e.name.clone(), v));
+    }
+    out.sort();
+    out
+}
+
+fn used_ranges(p: &MockPlatform, disk: u32, start: u64, len: u64) -> Vec<(u64, u64)> {
+    let dev = p.open_disk(disk, OpenMode::ReadOnly).unwrap();
+    let slice = SliceDevice::new(dev, start, len).unwrap();
+    let mut fs = pm_fs::open(Box::new(slice)).unwrap();
+    fs.used_map().unwrap().ranges().collect()
+}
+
+// ---------------------------------------------------------------- tests
+
+#[test]
+fn execute_create_partition_writes_table_in_session() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    // the volume Windows would mount once the partition exists
+    p.add_volume(volume("vol-new", None, &[], 0, 0), 1, MIB, 32 * MIB);
+
+    let op = create(1, MIB, 32 * MIB, Some(FsKind::Ntfs), Some('F'));
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(r.completed, 1);
+
+    assert_eq!(p.write_sessions_log(), vec![1]);
+    assert_sessions_finished(&p);
+    let t = table_of(&p, 1);
+    assert_eq!(t.kind, TableKind::Gpt);
+    assert_eq!(t.entries.len(), 1);
+    let e = &t.entries[0];
+    assert_eq!((e.number, e.start, e.len), (1, MIB, 32 * MIB));
+    assert_eq!(e.ptype, PartitionType::Gpt(gpt_types::BASIC_DATA));
+    assert_eq!(e.name, "Data");
+
+    let calls = p.calls();
+    let fmt = calls
+        .iter()
+        .position(|c| c == "format vol-new NTFS label=Data quick=true")
+        .unwrap_or_else(|| panic!("format call missing: {calls:?}"));
+    let rescan = calls.iter().position(|c| c == "rescan 1").expect("rescan recorded");
+    assert!(rescan < fmt, "the layout is re-read before formatting: {calls:?}");
+    assert_eq!(p.mounted(), vec![(VolumeId("vol-new".into()), MountPoint::Letter('F'))]);
+    assert!(r.log.iter().any(|l| l.contains("partition table")), "{:?}", r.log);
+}
+
+#[test]
+fn execute_order_and_stop_on_first_failure() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("vol-2", None, &[], 0, 0), 1, 9 * MIB, 8 * MIB);
+    p.fail_calls_matching("format");
+
+    let ops = [
+        create(1, MIB, 8 * MIB, None, None),
+        create(1, 9 * MIB, 8 * MIB, Some(FsKind::Fat32), None),
+        create(1, 17 * MIB, 8 * MIB, None, None),
+    ];
+    let r = run(&p, &ops);
+    assert_eq!(r.completed, 1);
+    let (idx, msg) = r.failed.clone().expect("second op fails");
+    assert_eq!(idx, 1);
+    assert!(msg.contains("mock failure"), "{msg}");
+
+    let t = table_of(&p, 1);
+    let starts: Vec<(u32, u64)> = t.entries.iter().map(|e| (e.number, e.start)).collect();
+    // op 1 done, op 2 wrote its table before the format failed, op 3 never ran
+    assert_eq!(starts, vec![(1, MIB), (2, 9 * MIB)]);
+    assert_eq!(p.write_sessions_log(), vec![1, 1]);
+    assert_sessions_finished(&p);
+    assert!(r.log.iter().any(|l| l.contains("mock failure")), "{:?}", r.log);
+    assert!(!r.log.iter().any(|l| l.contains("[3/3]")), "op 3 must not run: {:?}", r.log);
+}
+
+#[test]
+fn execute_dry_run_touches_nothing() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0x5A, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let before = p.disk_bytes(1);
+
+    let ops = [
+        create(1, MIB, 8 * MIB, Some(FsKind::Fat32), Some('F')),
+        Operation::FormatPartition {
+            disk: 1,
+            number: 1,
+            fs: FsKind::Ntfs,
+            label: "X".into(),
+            cluster: None,
+            quick: true,
+        },
+        Operation::DeletePartition { disk: 1, number: 1 },
+        Operation::WipeDisk { disk: 1, method: WipeMethod::Zero },
+    ];
+    let o = ExecOpts { dry_run: true, allow_system_disk: false };
+    let r = execute(&p, &ops, &o, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(r.completed, 4);
+    assert_eq!(r.log.len(), 4, "{:?}", r.log);
+    assert!(r.log.iter().all(|l| l.contains("would: ")), "{:?}", r.log);
+
+    assert_eq!(p.disk_bytes(1), before, "dry run wrote to the disk");
+    assert!(p.write_sessions_log().is_empty());
+    assert!(p.calls().is_empty(), "{:?}", p.calls());
+    assert!(p.mounted().is_empty());
+
+    // a dry run still re-validates: deleting a partition that does not exist fails
+    let bad = [Operation::DeletePartition { disk: 1, number: 7 }];
+    let r = execute(&p, &bad, &o, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(r.completed, 0);
+    assert_eq!(r.failed.as_ref().map(|f| f.0), Some(0));
+}
+
+/// Source: disk 0 (pattern 0x55) with a FAT32 partition holding two files; target: disk 1
+/// pre-filled with 0xAA and no partition table.
+fn clone_fixture() -> (MockPlatform, u64, u64) {
+    let (start, len) = (MIB, 40 * MIB);
+    let mut src = gpt_dev(DISK_LEN, 0x55, Some(vec![entry(1, start, len, gpt_types::BASIC_DATA, 0)]));
+    format_fat(&mut src, start, len, "SRC");
+    fat_add_file(&mut src, start, b"HELLO   TXT", b"hello, clone");
+    fat_add_file(&mut src, start, b"DATA    BIN", &pattern(3000, 7));
+    let p = MockPlatform::new();
+    p.add_disk(0, src, meta(0));
+    p.add_disk(1, MemDevice::from_vec(vec![0xAA; DISK_LEN as usize]), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    (p, start, len)
+}
+
+#[test]
+fn execute_clone_disk_copies_used_clusters_only() {
+    // Smart: only the clusters the filesystem uses are copied.
+    let (p, start, len) = clone_fixture();
+    let op = Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Exact,
+        mode: CloneMode::Smart,
+        boot_fix: BootFix::None,
+    };
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(r.completed, 1);
+    assert_sessions_finished(&p);
+
+    let (st, dt) = (table_of(&p, 0), table_of(&p, 1));
+    assert_eq!(dt.kind, TableKind::Gpt);
+    assert_eq!(dt.entries.len(), 1);
+    assert_eq!((dt.entries[0].start, dt.entries[0].len), (start, len));
+    assert_ne!(dt.disk_guid, st.disk_guid, "fresh disk GUID");
+    assert_ne!(dt.entries[0].guid, st.entries[0].guid, "fresh partition GUID");
+
+    let (s, d) = (p.disk_bytes(0), p.disk_bytes(1));
+    let used = used_ranges(&p, 0, start, len);
+    let mut used_total = 0;
+    for &(o, l) in &used {
+        let (a, b) = ((start + o) as usize, (start + o + l) as usize);
+        assert_eq!(&d[a..b], &s[a..b], "used range {o}+{l} copied");
+        used_total += l;
+    }
+    assert!(used_total < len / 2, "the fixture filesystem is mostly empty");
+    // a cluster in the middle of the (nearly empty) data area is unused: still 0xAA on the
+    // target, 0x55 on the source
+    let mid = start + len / 2;
+    assert!(!used.iter().any(|&(o, l)| start + o < mid + 512 && mid < start + o + l));
+    let mid = mid as usize..mid as usize + 512;
+    assert!(s[mid.clone()].iter().all(|&b| b == 0x55));
+    assert!(d[mid].iter().all(|&b| b == 0xAA), "unused clusters are not copied");
+    assert_eq!(fs_files(&p, 1, start, len), fs_files(&p, 0, start, len));
+    assert_eq!(fs_files(&p, 1, start, len).len(), 2);
+
+    // Sector: every byte of the partition is copied.
+    let (p, start, len) = clone_fixture();
+    let op = Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Exact,
+        mode: CloneMode::Sector,
+        boot_fix: BootFix::None,
+    };
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let (s, d) = (p.disk_bytes(0), p.disk_bytes(1));
+    let part = start as usize..(start + len) as usize;
+    assert!(d[part.clone()] == s[part], "sector clone copies everything");
+    assert_eq!(fs_files(&p, 1, start, len).len(), 2);
+    assert_sessions_finished(&p);
+}
+
+#[test]
+fn execute_migrate_regenerates_disk_guid_and_calls_bcdboot() {
+    const REQUIRED: u64 = 1;
+    let (efi, msr, win, re) = ((MIB, 2 * MIB), (3 * MIB, MIB), (4 * MIB, 36 * MIB), (40 * MIB, 2 * MIB));
+    let mut src = gpt_dev(
+        DISK_LEN,
+        0,
+        Some(vec![
+            entry(1, efi.0, efi.1, gpt_types::EFI_SYSTEM, 0),
+            entry(2, msr.0, msr.1, gpt_types::MSR, 0),
+            entry(3, win.0, win.1, gpt_types::BASIC_DATA, REQUIRED),
+            entry(4, re.0, re.1, gpt_types::WINDOWS_RECOVERY, 0),
+        ]),
+    );
+    format_fat(&mut src, win.0, win.1, "WINDOWS");
+    fat_add_file(&mut src, win.0, b"BOOTMGR    ", b"not really bootmgr");
+    let p = MockPlatform::new();
+    p.add_disk(0, src, meta(0));
+    p.add_disk(1, MemDevice::new(DISK_LEN), meta(1));
+    p.set_system_disk(0);
+    p.add_volume(volume("src-win", Some(FsKind::Fat32), &["C:\\"], win.1, win.1 / 2), 0, win.0, win.1);
+    // the volumes Windows exposes once the clone's table is committed
+    p.add_volume(volume("dst-efi", None, &[], 0, 0), 1, efi.0, efi.1);
+    p.add_volume(volume("dst-win", None, &[], 0, 0), 1, win.0, win.1);
+
+    let op = Operation::MigrateOs {
+        src_disk: 0,
+        dst_disk: 1,
+        only_system_parts: true,
+        sizing: Sizing::Exact,
+        boot_fix: BootFix::Uefi,
+    };
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(r.completed, 1);
+    assert_sessions_finished(&p);
+    assert_eq!(p.write_sessions_log(), vec![1], "only the destination is written");
+
+    let (st, dt) = (table_of(&p, 0), table_of(&p, 1));
+    assert_eq!(dt.entries.len(), 4);
+    assert_ne!(dt.disk_guid, st.disk_guid, "fresh disk GUID");
+    for e in &dt.entries {
+        assert!(!st.entries.iter().any(|s| s.guid == e.guid), "partition {} GUID reused", e.number);
+    }
+    let w = dt.entries.iter().find(|e| e.start == win.0).unwrap();
+    assert_eq!(w.attrs & REQUIRED, REQUIRED, "attributes are kept");
+    assert_eq!(fs_files(&p, 1, win.0, win.1), fs_files(&p, 0, win.0, win.1));
+
+    let calls = p.calls();
+    let bcd = format!("run_tool BcdBoot {:?}", ["E:\\Windows", "/s", "F:", "/f", "UEFI"]);
+    assert!(calls.contains(&bcd), "{bcd} not in {calls:?}");
+    assert!(!calls.iter().any(|c| c.starts_with("run_tool BootSect")), "{calls:?}");
+    assert!(p.mounted().is_empty(), "temporary letters removed: {:?}", p.mounted());
+    assert!(!r.log.iter().any(|l| l.contains("boot fix failed")), "{:?}", r.log);
+
+    // a failing boot fix is reported but does not fail the migration
+    let p2 = MockPlatform::new();
+    let mut src2 = gpt_dev(
+        DISK_LEN,
+        0,
+        Some(vec![
+            entry(1, efi.0, efi.1, gpt_types::EFI_SYSTEM, 0),
+            entry(3, win.0, win.1, gpt_types::BASIC_DATA, REQUIRED),
+        ]),
+    );
+    format_fat(&mut src2, win.0, win.1, "WINDOWS");
+    p2.add_disk(0, src2, meta(0));
+    p2.add_disk(1, MemDevice::new(DISK_LEN), meta(1));
+    p2.set_system_disk(0);
+    p2.add_volume(volume("dst-efi", None, &[], 0, 0), 1, efi.0, efi.1);
+    p2.add_volume(volume("dst-win", None, &[], 0, 0), 1, MIB * 3, win.1);
+    p2.fail_calls_matching("run_tool BcdBoot");
+    let op = Operation::MigrateOs {
+        src_disk: 0,
+        dst_disk: 1,
+        only_system_parts: false,
+        sizing: Sizing::Fit,
+        boot_fix: BootFix::All,
+    };
+    let r = run(&p2, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(r.log.iter().any(|l| l.contains("boot fix failed")), "{:?}", r.log);
+    assert!(p2.mounted().is_empty(), "temporary letters removed after a failure");
+    assert_sessions_finished(&p2);
+}
+
+#[test]
+fn queue_push_undo_discard_preview() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let base = Model::from_platform(&p).unwrap();
+    let mut q = OpQueue::new(base.clone());
+    assert_eq!(q.len(), 0);
+    assert!(q.is_empty());
+
+    q.push(create(1, MIB, 8 * MIB, None, None)).unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q.preview().disk(1).unwrap().partitions.len(), 1);
+
+    // an overlapping partition is rejected and leaves the queue alone
+    assert!(q.push(create(1, 4 * MIB, 8 * MIB, None, None)).is_err());
+    assert_eq!(q.len(), 1);
+
+    q.push(Operation::DeletePartition { disk: 1, number: 1 }).unwrap();
+    assert_eq!(q.ops().len(), 2);
+    assert!(q.preview().disk(1).unwrap().partitions.is_empty());
+
+    let undone = q.undo().unwrap();
+    assert_eq!(undone, Operation::DeletePartition { disk: 1, number: 1 });
+    assert_eq!(q.len(), 1);
+    assert_eq!(q.preview().disk(1).unwrap().partitions.len(), 1);
+
+    q.discard();
+    assert!(q.is_empty());
+    assert!(q.undo().is_none());
+    assert!(q.preview().disk(1).unwrap().partitions.is_empty());
+
+    q.push(create(1, MIB, 8 * MIB, None, None)).unwrap();
+    let mut other = base.clone();
+    other.disks.retain(|d| d.index != 1);
+    q.reset(other);
+    assert!(q.is_empty());
+    assert!(q.preview().disk(1).is_none());
+}
+
+#[test]
+fn execute_refuses_system_disk_at_execution_time() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 8 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+    // the queue was built when disk 1 was not the system disk ...
+    p.set_system_disk(ELSEWHERE);
+    let mut q = OpQueue::new(Model::from_platform(&p).unwrap());
+    q.push(Operation::WipePartition { disk: 1, number: 1, method: WipeMethod::Zero }).unwrap();
+    q.push(create(1, 9 * MIB, 8 * MIB, None, None)).unwrap();
+    // ... but now it is
+    p.set_system_disk(1);
+    let before = p.disk_bytes(1);
+    let r = run(&p, q.ops());
+    assert_eq!(r.completed, 0);
+    let (i, msg) = r.failed.clone().unwrap();
+    assert_eq!(i, 0);
+    assert!(msg.contains("system disk"), "{msg}");
+    assert!(p.write_sessions_log().is_empty());
+    assert_eq!(p.disk_bytes(1), before);
+
+    // allow_system_disk relaxes only the non-destructive family
+    let allow = ExecOpts { dry_run: false, allow_system_disk: true };
+    let r = execute(&p, q.ops(), &allow, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(r.failed.as_ref().map(|f| f.0), Some(0), "wipe stays refused: {:?}", r.log);
+    let r = execute(&p, &q.ops()[1..], &allow, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(r.failed, None, "create is allowed with allow_system_disk: {:?}", r.log);
+    assert_eq!(table_of(&p, 1).entries.len(), 2);
+    assert_sessions_finished(&p);
+}
+
+#[test]
+fn execute_wipe_partition_and_disk() {
+    let p = MockPlatform::new();
+    let (start, len) = (2 * MIB, 6 * MIB);
+    p.add_disk(1, gpt_dev(DISK_LEN, 0x55, Some(vec![entry(1, start, len, gpt_types::BASIC_DATA, 0)])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let before = p.disk_bytes(1);
+
+    let r = run(&p, &[Operation::WipePartition { disk: 1, number: 1, method: WipeMethod::Zero }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let after = p.disk_bytes(1);
+    let range = start as usize..(start + len) as usize;
+    assert!(after[range.clone()].iter().all(|&b| b == 0));
+    assert_eq!(&after[..start as usize], &before[..start as usize]);
+    assert_eq!(&after[range.end..], &before[range.end..]);
+
+    let r = run(&p, &[Operation::WipePartition { disk: 1, number: 1, method: WipeMethod::Dod3 }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let after = p.disk_bytes(1);
+    let wiped = &after[range.clone()];
+    assert!(wiped.iter().any(|&b| b != 0) && wiped.iter().any(|&b| b != 0xFF), "last pass is random");
+    assert_eq!(&after[range.end..], &before[range.end..]);
+
+    let r = run(&p, &[Operation::WipeDisk { disk: 1, method: WipeMethod::Random }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(table_of(&p, 1).kind, TableKind::None, "no table left after a disk wipe");
+    let all = p.disk_bytes(1);
+    assert!(all[..512].iter().all(|&b| b == 0), "sector 0 zeroed");
+    assert!(all[DISK_LEN as usize - 33 * 512..].iter().all(|&b| b == 0), "backup GPT zeroed");
+    assert!(all[(start + MIB) as usize..(start + 2 * MIB) as usize].iter().any(|&b| b != 0x55));
+    assert_sessions_finished(&p);
+}
+
+#[test]
+fn execute_wipe_cancel_still_finishes_session() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0x55, Some(vec![entry(1, MIB, 40 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let cancel = CancelToken::new();
+    let c2 = cancel.clone();
+    let seen = Mutex::new(Vec::<String>::new());
+    let sink = FnProgress(|r: &ProgressReport| {
+        seen.lock().unwrap().push(r.phase.clone());
+        c2.cancel();
+    });
+    let op = Operation::WipePartition { disk: 1, number: 1, method: WipeMethod::Zero };
+    let r = execute(&p, &[op], &opts(), &sink, &cancel).unwrap();
+    assert_eq!(r.completed, 0);
+    let (_, msg) = r.failed.unwrap();
+    assert!(msg.contains("cancel"), "{msg}");
+    assert_sessions_finished(&p);
+    let phases = seen.lock().unwrap();
+    assert!(phases.iter().any(|ph| ph.starts_with("[1/1] Wipe partition 1 on Disk 1")), "{phases:?}");
+}
+
+#[test]
+fn execute_resize_ntfs_shrinks_volume_first_and_grows_table_first() {
+    let fixture = || {
+        let p = MockPlatform::new();
+        p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 20 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+        p.set_system_disk(ELSEWHERE);
+        p.add_volume(volume("v1", Some(FsKind::Ntfs), &["F:\\"], 20 * MIB, 15 * MIB), 1, MIB, 20 * MIB);
+        p
+    };
+    let shrink = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 10 * MIB };
+    let grow = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 30 * MIB };
+
+    // shrink: the filesystem goes first, so a failing shrink leaves the table alone
+    let p = fixture();
+    p.fail_calls_matching("shrink");
+    let r = run(&p, &[shrink.clone()]);
+    assert!(r.failed.is_some());
+    assert_eq!(table_of(&p, 1).entries[0].len, 20 * MIB);
+    assert!(p.write_sessions_log().is_empty());
+    let p = fixture();
+    let r = run(&p, &[shrink]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(p.calls().contains(&format!("shrink v1 {}", 10 * MIB)), "{:?}", p.calls());
+    assert_eq!(table_of(&p, 1).entries[0].len, 10 * MIB);
+
+    // grow: the partition goes first, so a failing extend leaves the bigger partition
+    let p = fixture();
+    p.fail_calls_matching("extend");
+    let r = run(&p, &[grow.clone()]);
+    assert!(r.failed.is_some());
+    assert_eq!(table_of(&p, 1).entries[0].len, 30 * MIB);
+    assert_sessions_finished(&p);
+    let p = fixture();
+    let r = run(&p, &[grow]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(p.calls().contains(&format!("extend v1 {}", 30 * MIB)), "{:?}", p.calls());
+
+    // other filesystems cannot be resized
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 20 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("v1", Some(FsKind::Fat32), &[], 20 * MIB, 15 * MIB), 1, MIB, 20 * MIB);
+    let r = run(&p, &[Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 30 * MIB }]);
+    let (_, msg) = r.failed.unwrap();
+    assert!(msg.contains("resize of FAT32 is not supported"), "{msg}");
+    assert!(p.write_sessions_log().is_empty());
+}
+
+#[test]
+fn execute_move_copies_data_overlap_safe() {
+    for (old, new) in [(2 * MIB, 3 * MIB), (4 * MIB, 3 * MIB), (2 * MIB, 20 * MIB)] {
+        let len = 6 * MIB;
+        let mut dev = gpt_dev(DISK_LEN, 0, Some(vec![entry(1, old, len, gpt_types::BASIC_DATA, 0)]));
+        let data = pattern(len as usize, 3);
+        dev.write_at(old, &data).unwrap();
+        let p = MockPlatform::new();
+        p.add_disk(1, dev, meta(1));
+        p.set_system_disk(ELSEWHERE);
+        let r = run(&p, &[Operation::ResizeMove { disk: 1, number: 1, new_start: new, new_len: len }]);
+        assert_eq!(r.failed, None, "{old}->{new}: {:?}", r.log);
+        let b = p.disk_bytes(1);
+        assert!(b[new as usize..(new + len) as usize] == data[..], "{old}->{new}: data moved intact");
+        let e = &table_of(&p, 1).entries[0];
+        assert_eq!((e.start, e.len), (new, len));
+        assert_sessions_finished(&p);
+    }
+}
+
+#[test]
+fn execute_align_moves_data_before_table() {
+    // a legacy partition starting at sector 63
+    let (old, len) = (63 * 512, 8 * MIB);
+    let mut dev = gpt_dev(DISK_LEN, 0, None);
+    let mut t = Table::empty(TableKind::Gpt, DISK_LEN, 512);
+    t.gpt_first_usable = 34 * 512;
+    t.entries = vec![entry(1, old, len, gpt_types::BASIC_DATA, 0)];
+    write_table(&mut dev, &t).unwrap();
+    let data = pattern(len as usize, 9);
+    dev.write_at(old, &data).unwrap();
+    let p = MockPlatform::new();
+    p.add_disk(1, dev, meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let r = run(&p, &[Operation::AlignPartitions { disk: 1 }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let e = &table_of(&p, 1).entries[0];
+    assert_eq!(e.start, MIB);
+    let b = p.disk_bytes(1);
+    assert!(b[MIB as usize..(MIB + e.len) as usize] == data[..e.len as usize], "data follows the partition");
+    assert_sessions_finished(&p);
+}
+
+#[test]
+fn execute_image_and_restore_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("part.img");
+    let (p, start, len) = clone_fixture();
+    // give the target a table with room for the restored partition
+    p.add_disk(1, gpt_dev(DISK_LEN, 0xAA, Some(vec![])), meta(1));
+    let image = Operation::ImagePartition {
+        disk: 0,
+        number: 1,
+        path: img.clone(),
+        format: ImageFormat::Raw,
+        mode: CloneMode::Smart,
+    };
+    let r = run(&p, &[image]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(img.exists());
+    assert!(!dir.path().join("part.img.partial").exists(), "partial renamed");
+    assert_eq!(r.rescue_stats.len(), 1);
+    assert!(p.write_sessions_log().is_empty(), "imaging never writes a disk");
+
+    let restore = Operation::RestoreImage { path: img.clone(), dst_disk: 1, dst_start: Some(start) };
+    let r = run(&p, &[restore]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let e = &table_of(&p, 1).entries[0];
+    assert_eq!((e.start, e.len), (start, len));
+    assert_eq!(fs_files(&p, 1, start, len), fs_files(&p, 0, start, len));
+    assert_sessions_finished(&p);
+
+    // a failing image leaves no file behind
+    let missing = dir.path().join("nope").join("x.img");
+    let r = run(&p, &[Operation::ImageDisk { disk: 0, path: missing.clone(), format: ImageFormat::Raw, mode: CloneMode::Sector }]);
+    assert!(r.failed.is_some());
+    assert!(!missing.exists());
+}
+
+#[test]
+fn execute_mount_unmount_and_letters() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 8 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("v1", Some(FsKind::Ntfs), &[], 8 * MIB, 4 * MIB), 1, MIB, 8 * MIB);
+    let v = VolumeId("v1".into());
+    let r = run(
+        &p,
+        &[
+            Operation::Mount { volume: v.clone(), at: MountPoint::Letter('E') },
+            Operation::SetLetter { disk: 1, number: 1, letter: Some('G') },
+        ],
+    );
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(p.mounted(), vec![(v.clone(), MountPoint::Letter('G'))]);
+    let r = run(&p, &[Operation::Unmount { volume: v.clone(), at: MountPoint::Letter('G') }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(p.mounted().is_empty());
+    assert!(p.write_sessions_log().is_empty());
+
+    let r = run(&p, &[Operation::SetLabel { disk: 1, number: 1, label: "X".into() }]);
+    let (_, msg) = r.failed.unwrap();
+    assert!(msg.contains("unsupported"), "{msg}");
+}
+
+#[test]
+fn execute_table_ops_initialize_convert_active_type_delete() {
+    let p = MockPlatform::new();
+    p.add_disk(1, MemDevice::new(DISK_LEN), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let r = run(
+        &p,
+        &[
+            Operation::InitializeDisk { disk: 1, kind: TableKind::Gpt },
+            create(1, MIB, 8 * MIB, None, None),
+            create(1, 9 * MIB, 8 * MIB, None, None),
+            Operation::ConvertTable { disk: 1, to: TableKind::Mbr },
+        ],
+    );
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let t = table_of(&p, 1);
+    assert_eq!(t.kind, TableKind::Mbr);
+    let spans: Vec<(u64, u64)> = t.entries.iter().map(|e| (e.start, e.len)).collect();
+    assert_eq!(spans, vec![(MIB, 8 * MIB), (9 * MIB, 8 * MIB)]);
+    let b = p.disk_bytes(1);
+    assert!(b[512..34 * 512].iter().all(|&x| x == 0), "primary GPT cleared");
+    assert!(b[DISK_LEN as usize - 33 * 512..].iter().all(|&x| x == 0), "backup GPT cleared");
+
+    let r = run(
+        &p,
+        &[
+            Operation::SetActive { disk: 1, number: 2 },
+            Operation::SetType { disk: 1, number: 1, ptype: PartitionType::Mbr(0x0C) },
+            Operation::DeletePartition { disk: 1, number: 2 },
+            Operation::SetActive { disk: 1, number: 1 },
+        ],
+    );
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let t = table_of(&p, 1);
+    assert_eq!(t.entries.len(), 1);
+    assert_eq!(t.entries[0].ptype, PartitionType::Mbr(0x0C));
+    assert_eq!(t.entries[0].attrs & 1, 1, "partition 1 active");
+
+    let r = run(&p, &[Operation::ConvertTable { disk: 1, to: TableKind::Gpt }, Operation::RebuildMbr { disk: 1 }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    let t = table_of(&p, 1);
+    assert_eq!(t.kind, TableKind::Gpt);
+    assert_eq!((t.entries[0].start, t.entries[0].len), (MIB, 8 * MIB));
+    assert_sessions_finished(&p);
+    assert_eq!(p.write_sessions_log().len(), 10, "one session per table operation");
+}

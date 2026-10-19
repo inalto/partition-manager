@@ -23,6 +23,8 @@ struct State {
     volumes: Vec<VolumeInfo>,
     mounted: Vec<(VolumeId, MountPoint)>,
     sessions: Vec<u32>,
+    /// Disk indexes of sessions whose `finish` was called (shared with the sessions).
+    finished: Arc<Mutex<Vec<u32>>>,
     calls: Vec<String>,
     fail_prefixes: Vec<String>,
     system_disk: Option<u32>,
@@ -92,6 +94,14 @@ impl MockPlatform {
     /// Disk indexes passed to [`Platform::begin_write`], in order.
     pub fn write_sessions_log(&self) -> Vec<u32> {
         self.st().sessions.clone()
+    }
+
+    /// Disk indexes of write sessions on which [`WriteSession::finish`] was called, in order.
+    /// A session dropped without `finish` does not appear here.
+    pub fn finished_sessions_log(&self) -> Vec<u32> {
+        let finished = self.st().finished.clone();
+        let log = finished.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        log
     }
 
     /// Recorded side-effect calls, e.g. `"format <id> NTFS label=Data quick=true"`,
@@ -184,6 +194,7 @@ impl BlockDevice for MockDiskDevice {
 struct MockSession {
     disk: u32,
     dev: MockDiskDevice,
+    finished: Arc<Mutex<Vec<u32>>>,
 }
 
 impl WriteSession for MockSession {
@@ -197,6 +208,7 @@ impl WriteSession for MockSession {
         write_table(&mut self.dev, t)
     }
     fn finish(self: Box<Self>) -> Result<()> {
+        self.finished.lock().unwrap_or_else(|e| e.into_inner()).push(self.disk);
         Ok(())
     }
 }
@@ -270,10 +282,15 @@ impl Platform for MockPlatform {
 
     fn begin_write(&self, disk: u32) -> Result<Box<dyn WriteSession>> {
         let dev = self.disk(disk)?;
-        self.st().sessions.push(disk);
+        let finished = {
+            let mut st = self.st();
+            st.sessions.push(disk);
+            st.finished.clone()
+        };
         Ok(Box::new(MockSession {
             disk,
             dev: MockDiskDevice(dev),
+            finished,
         }))
     }
 

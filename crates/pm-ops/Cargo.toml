@@ -10,6 +10,7 @@ pm-core = { path = "../pm-core" }
 pm-parttable = { path = "../pm-parttable" }
 pm-platform = { path = "../pm-platform" }
 pm-image = { path = "../pm-image" }
+pm-fs = { path = "../pm-fs" }
 serde = { workspace = true }
 uuid = { workspace = true }
 
