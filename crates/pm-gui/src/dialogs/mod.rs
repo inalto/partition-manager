@@ -1,4 +1,4 @@
-//! Modal dialogs, the progress dialog, the properties window and tool placeholders.
+//! Modal dialogs, the progress dialog and the properties window (tool windows: `crate::tools`).
 //!
 //! Like the views, dialogs read the state and push [`Cmd`]s; the only thing they mutate is
 //! their own [`Dialog`] (the user's choice in a radio list, a checkbox).
@@ -7,7 +7,7 @@ pub mod confirm;
 pub mod progress;
 pub mod properties;
 
-use crate::app::{AppState, Cmd, Dialog, Tool};
+use crate::app::{AppState, Cmd, Dialog};
 use crate::theme::DANGER;
 use crate::views::icons;
 use eframe::egui::{self, Align2, RichText};
@@ -70,19 +70,4 @@ fn message(ctx: &egui::Context, title: &str, msg: &str, _out: &mut Vec<Cmd>) -> 
         }
     });
     keep
-}
-
-/// Placeholder window for a toolbar tool (filled in by a later step).
-pub fn tool_window(ctx: &egui::Context, tool: Tool, out: &mut Vec<Cmd>) {
-    let mut open = true;
-    egui::Window::new(tool.label())
-        .open(&mut open)
-        .collapsible(false)
-        .default_width(360.0)
-        .show(ctx, |ui| {
-            ui.label(format!("{} opens here in a later step.", tool.label()));
-        });
-    if !open {
-        out.push(Cmd::CloseTool);
-    }
 }

@@ -18,6 +18,11 @@ path = "src/main.rs"
 pm-core = { path = "../pm-core" }
 pm-platform = { path = "../pm-platform" }
 pm-ops = { path = "../pm-ops" }
+pm-parttable = { path = "../pm-parttable" }
+pm-fs = { path = "../pm-fs" }
+pm-image = { path = "../pm-image" }
+pm-recover = { path = "../pm-recover" }
+pm-analyze = { path = "../pm-analyze" }
 eframe.workspace = true
 egui_extras.workspace = true
 log.workspace = true
@@ -26,5 +31,5 @@ log.workspace = true
 embed-resource.workspace = true
 
 [dev-dependencies]
-pm-parttable = { path = "../pm-parttable" }
 uuid.workspace = true
+tempfile.workspace = true

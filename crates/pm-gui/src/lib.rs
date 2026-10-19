@@ -16,6 +16,7 @@ pub mod jobs;
 pub mod main_window;
 pub mod selection;
 pub mod theme;
+pub mod tools;
 pub mod views;
 pub mod wizard;
 pub mod wizards;

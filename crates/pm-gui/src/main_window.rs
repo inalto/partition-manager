@@ -6,6 +6,7 @@ use crate::args::Args;
 use crate::dialogs::{self, progress, properties};
 use crate::theme::{self, Theme, DANGER};
 use crate::views::{disk_map, disk_table, icons, legend, sidebar, toolbar};
+use crate::tools::WindowOutcome;
 use crate::wizard::WizardOutcome;
 use eframe::egui::{self, Color32, RichText};
 use pm_platform::Platform;
@@ -50,6 +51,11 @@ impl PartitionApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             s.toast("Apply is running: wait for it to finish or press Cancel first");
         }
+        // the same for a tool that is writing (rescue, partition recovery, file restore)
+        if s.windows.iter().any(|w| w.writing()) && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            s.toast("A recovery job is writing: wait for it to finish or cancel it first");
+        }
 
         let mut cmds: Vec<Cmd> = Vec::new();
         let enabled = !s.modal();
@@ -89,9 +95,20 @@ impl PartitionApp {
                 None => cmds.push(Cmd::CloseProperties),
             }
         }
-        if let Some(t) = s.tool {
-            dialogs::tool_window(ctx, t, &mut cmds);
+        let mut windows = std::mem::take(&mut s.windows);
+        {
+            let env = s.tool_env();
+            windows.retain_mut(|w| match w.show(ctx, &env) {
+                WindowOutcome::Open => true,
+                WindowOutcome::Close => false,
+                WindowOutcome::Refresh => {
+                    cmds.push(Cmd::Refresh);
+                    true
+                }
+            });
         }
+        windows.append(&mut s.windows);
+        s.windows = windows;
         if let Some(job) = &s.job {
             if matches!(job.kind, JobKind::Apply { .. }) {
                 progress::show(ctx, job, &mut cmds);
@@ -241,6 +258,13 @@ mod tests {
         frame(&mut app);
         assert!(app.state.wizard.is_some());
         app.state.handle(Cmd::CloseWizard);
+        // tool windows and job wizards draw over it too
+        for t in [crate::app::Tool::SpaceAnalyzer, crate::app::Tool::Smart, crate::app::Tool::DataRecovery] {
+            app.state.handle(Cmd::OpenTool(t));
+        }
+        frame(&mut app);
+        assert_eq!(app.state.windows.len(), 3);
+        app.state.windows.clear();
         app.state.handle(Cmd::Push(vec![pm_ops::Operation::DeletePartition { disk: 1, number: 3 }]));
         app.state.handle(Cmd::Apply);
         app.state.handle(Cmd::SetTheme(Theme::Dark));

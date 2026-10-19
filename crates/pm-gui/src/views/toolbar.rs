@@ -37,10 +37,13 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
         }
         ui.separator();
         for t in Tool::ALL {
-            if ui.button(t.label()).clicked() {
+            if t == Tool::BackupImage {
+                ui.menu_button(t.label(), |ui| tool_menu(ui, &Tool::IMAGE_MENU, out));
+            } else if ui.button(t.label()).clicked() {
                 out.push(Cmd::OpenTool(t));
             }
         }
+        ui.menu_button("Disk tools", |ui| tool_menu(ui, &Tool::MORE, out));
         ui.separator();
         if ui
             .add_enabled(!s.busy(), Button::new(format!("{} Refresh", icons::REFRESH)))
@@ -64,4 +67,13 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
             }
         });
     });
+}
+
+fn tool_menu(ui: &mut egui::Ui, tools: &[Tool], out: &mut Vec<Cmd>) {
+    for t in tools {
+        if ui.button(t.label()).clicked() {
+            out.push(Cmd::OpenTool(*t));
+            ui.close_menu();
+        }
+    }
 }

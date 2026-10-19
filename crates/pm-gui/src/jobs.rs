@@ -25,6 +25,8 @@ pub enum JobOutput {
     },
     /// Free-form result text (tool windows).
     Text(String),
+    /// A typed result of a tool window or wizard job (see `crate::tools::Task`).
+    Any(Box<dyn std::any::Any + Send>),
 }
 
 /// [`ProgressSink`] that stores the latest report for the UI to read.

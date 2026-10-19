@@ -7,14 +7,22 @@
 //! them.
 
 pub mod convert;
+pub mod copy_disk;
+pub mod copy_partition;
 pub mod create;
+pub mod data_recovery;
 pub mod delete;
 pub mod format;
+pub mod image_create;
+pub mod image_restore;
 pub mod initialize;
 pub mod label_letter;
+pub mod migrate_os;
 pub mod mount;
+pub mod partition_recovery;
 pub mod resize;
 pub mod resize_bar;
+pub mod rescue;
 pub mod wipe;
 
 use crate::actions::Action;
@@ -65,6 +73,19 @@ pub fn for_action(action: Action, ctx: &WizardCtx) -> Option<Wizard> {
         _ => None,
     }
 }
+
+/// The disk-copy wizards for the sidebar actions [`CLONE_ACTIONS`] (queued like the others).
+pub fn clone_for_action(action: Action, ctx: &WizardCtx) -> Option<Wizard> {
+    match action {
+        Action::MigrateOs => migrate_os::new(ctx),
+        Action::CopyDisk => copy_disk::new(ctx),
+        Action::CopyPartition => copy_partition::new(ctx),
+        _ => None,
+    }
+}
+
+/// The actions [`clone_for_action`] has a wizard for.
+pub const CLONE_ACTIONS: [Action; 3] = [Action::MigrateOs, Action::CopyDisk, Action::CopyPartition];
 
 /// Largest volume Windows formats as FAT32.
 pub const FAT32_MAX: u64 = 32 * GIB;

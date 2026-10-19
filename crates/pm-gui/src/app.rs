@@ -8,6 +8,7 @@ use crate::actions::{Action, Effect};
 use crate::jobs::{spawn_job, JobHandle, JobOutput};
 use crate::selection::Selected;
 use crate::theme::Theme;
+use crate::tools::{Device, ToolEnv, ToolWindow};
 use crate::wizard::{Wizard, WizardCtx};
 use pm_ops::{execute, ExecOpts, ExecReport, Model, OpQueue, Operation};
 use pm_platform::Platform;
@@ -17,19 +18,29 @@ use std::time::{Duration, Instant};
 /// How long a toast stays on screen.
 const TOAST_TIME: Duration = Duration::from_secs(3);
 
-/// Tool windows opened from the toolbar (placeholders until their own step lands).
+/// Tools opened from the toolbar: tool windows and wizards that are not sidebar actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     DataRecovery,
     PartitionRecovery,
     DiskBenchmark,
     SpaceAnalyzer,
+    /// The "Backup / Image" menu ([`Tool::IMAGE_MENU`]).
     BackupImage,
+    CreateImage,
+    RestoreImage,
+    RescueCopy,
+    SurfaceTest,
+    Smart,
 }
 
 impl Tool {
+    /// The toolbar buttons (Backup / Image is a menu of [`Tool::IMAGE_MENU`]).
     pub const ALL: [Tool; 5] =
         [Tool::DataRecovery, Tool::PartitionRecovery, Tool::DiskBenchmark, Tool::SpaceAnalyzer, Tool::BackupImage];
+    pub const IMAGE_MENU: [Tool; 3] = [Tool::CreateImage, Tool::RestoreImage, Tool::RescueCopy];
+    /// The "Disk tools" menu.
+    pub const MORE: [Tool; 2] = [Tool::SurfaceTest, Tool::Smart];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -38,6 +49,11 @@ impl Tool {
             Tool::DiskBenchmark => "Disk Benchmark",
             Tool::SpaceAnalyzer => "Space Analyzer",
             Tool::BackupImage => "Backup / Image",
+            Tool::CreateImage => "Create Image",
+            Tool::RestoreImage => "Restore Image",
+            Tool::RescueCopy => "Rescue Copy (ddrescue)",
+            Tool::SurfaceTest => "Surface Test",
+            Tool::Smart => "SMART",
         }
     }
 }
@@ -72,7 +88,6 @@ pub enum Cmd {
     CancelJob,
     CloseDialog,
     OpenTool(Tool),
-    CloseTool,
     CloseProperties,
     SetTheme(Theme),
     SetDryRun(bool),
@@ -134,7 +149,8 @@ pub struct AppState {
     pub dialog: Option<Dialog>,
     /// Disk whose properties window is open.
     pub properties: Option<u32>,
-    pub tool: Option<Tool>,
+    /// Open tool windows and job wizards (drawn in order; modal ones disable the main window).
+    pub windows: Vec<Box<dyn ToolWindow>>,
     /// The open wizard (modal).
     pub wizard: Option<OpenWizard>,
     /// The next successful refresh drops the pending operations instead of rebasing them
@@ -161,7 +177,7 @@ impl AppState {
             toast: None,
             dialog: None,
             properties: None,
-            tool: None,
+            windows: Vec::new(),
             wizard: None,
             reset_on_refresh: false,
         };
@@ -182,6 +198,7 @@ impl AppState {
     pub fn modal(&self) -> bool {
         self.dialog.is_some()
             || self.wizard.is_some()
+            || self.windows.iter().any(|w| w.modal())
             || matches!(self.job, Some(RunningJob { kind: JobKind::Apply { .. }, .. }))
     }
 
@@ -321,9 +338,12 @@ impl AppState {
         // GetLogicalDrives: instant, fine on the UI thread
         let free_letters = self.platform.free_letters();
         let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel);
-        match crate::wizards::for_action(action, &ctx) {
+        let wizard = crate::wizards::for_action(action, &ctx).or_else(|| crate::wizards::clone_for_action(action, &ctx));
+        match wizard {
             Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters }),
-            None if crate::wizards::ACTIONS.contains(&action) => {
+            None if action == Action::PartitionRecovery => self.open_tool(Tool::PartitionRecovery),
+            None if action == Action::SurfaceTest => self.open_tool(Tool::SurfaceTest),
+            None if crate::wizards::ACTIONS.contains(&action) || crate::wizards::CLONE_ACTIONS.contains(&action) => {
                 self.toast(format!("{}: not available for this selection", action.label()))
             }
             None => {
@@ -331,6 +351,52 @@ impl AppState {
                 self.toast(format!("{}: coming in the next step", action.label()));
             }
         }
+    }
+
+    /// Open tool `t` on the current selection: an operation wizard (images), a job wizard or a
+    /// tool window (one of each kind; an open one stays as it is).
+    pub fn open_tool(&mut self, t: Tool) {
+        let sel = self.selected;
+        let live = self.queue.base();
+        let device = Device::from_selection(sel).filter(|d| d.range(live).is_some());
+        let window: Box<dyn ToolWindow> = match t {
+            Tool::CreateImage | Tool::RestoreImage => {
+                let free_letters = Vec::new();
+                let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel);
+                let w = if t == Tool::CreateImage {
+                    crate::wizards::image_create::new(&ctx)
+                } else {
+                    crate::wizards::image_restore::new(&ctx)
+                };
+                match w {
+                    Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters }),
+                    None => self.toast(format!("{}: there is no disk", t.label())),
+                }
+                return;
+            }
+            Tool::BackupImage => return,
+            Tool::DataRecovery => Box::new(crate::wizards::data_recovery::DataRecoveryWizard::new(device)),
+            Tool::PartitionRecovery => Box::new(crate::wizards::partition_recovery::PartitionRecoveryWizard::new(
+                device.map(|d| d.disk()),
+            )),
+            Tool::RescueCopy => Box::new(crate::wizards::rescue::RescueWizard::new(device)),
+            Tool::DiskBenchmark => Box::new(crate::tools::benchmark::BenchmarkWindow::new(
+                sel.partition_in(live).and_then(|p| p.letter()).map(|c| format!("{c}:\\")),
+            )),
+            Tool::SpaceAnalyzer => Box::new(crate::tools::space_analyzer::SpaceAnalyzerWindow::new(
+                sel.partition_in(live).and_then(|p| p.letter()).map(|c| format!("{c}:\\")),
+            )),
+            Tool::SurfaceTest => Box::new(crate::tools::surface_test::SurfaceTestWindow::new(device)),
+            Tool::Smart => Box::new(crate::tools::smart::SmartWindow::new(device.map(|d| d.disk()))),
+        };
+        if !self.windows.iter().any(|w| w.kind() == window.kind()) {
+            self.windows.push(window);
+        }
+    }
+
+    /// The environment tool windows are drawn with.
+    pub fn tool_env(&self) -> ToolEnv<'_> {
+        ToolEnv { platform: &self.platform, live: self.queue.base(), pending: self.queue.ops() }
     }
 
     fn dispatch(&mut self, action: Action, sel: Selected) {
@@ -398,8 +464,7 @@ impl AppState {
                 }
             }
             Cmd::CloseDialog => self.dialog = None,
-            Cmd::OpenTool(t) => self.tool = Some(t),
-            Cmd::CloseTool => self.tool = None,
+            Cmd::OpenTool(t) => self.open_tool(t),
             Cmd::CloseProperties => self.properties = None,
             Cmd::SetTheme(t) => self.theme = t,
             Cmd::SetDryRun(d) => self.dry_run = d,
@@ -574,9 +639,9 @@ mod tests {
     #[test]
     fn actions_without_a_wizard_yet_are_remembered_with_a_toast() {
         let mut s = mock_state();
-        s.handle(Cmd::Action(Action::CopyDisk, Selected::Disk(1)));
-        assert_eq!(s.pending_action, Some((Action::CopyDisk, Selected::Disk(1))));
-        assert!(s.toast.as_ref().unwrap().text.contains("Copy Disk"));
+        s.handle(Cmd::Action(Action::ChangeType, Selected::Partition(1, 3)));
+        assert_eq!(s.pending_action, Some((Action::ChangeType, Selected::Partition(1, 3))));
+        assert!(s.toast.as_ref().unwrap().text.contains("Change Type"));
         assert!(s.wizard.is_none());
         assert!(s.queue.is_empty());
     }
@@ -599,6 +664,40 @@ mod tests {
             s.handle(Cmd::CloseWizard);
             assert!(!s.modal());
         }
+    }
+
+    #[test]
+    fn clone_wizards_and_tool_windows_open() {
+        let mut s = mock_state();
+        for (a, sel) in [
+            (Action::CopyDisk, Selected::Disk(1)),
+            (Action::CopyPartition, Selected::Partition(1, 3)),
+            (Action::MigrateOs, Selected::Disk(1)),
+        ] {
+            s.handle(Cmd::Action(a, sel));
+            assert!(s.wizard.is_some(), "{a:?}: no wizard");
+            s.handle(Cmd::CloseWizard);
+        }
+        s.handle(Cmd::Action(Action::PartitionRecovery, Selected::Disk(1)));
+        assert_eq!(s.windows.len(), 1);
+        assert!(s.modal(), "job wizards are modal");
+        s.windows.clear();
+        s.handle(Cmd::Action(Action::SurfaceTest, Selected::Partition(1, 3)));
+        for t in [Tool::DiskBenchmark, Tool::SpaceAnalyzer, Tool::Smart, Tool::Smart] {
+            s.handle(Cmd::OpenTool(t));
+        }
+        assert_eq!(s.windows.len(), 4, "one window of each kind");
+        assert!(!s.modal(), "tool windows are not modal");
+        for t in [Tool::DataRecovery, Tool::RescueCopy, Tool::PartitionRecovery] {
+            s.handle(Cmd::OpenTool(t));
+        }
+        assert_eq!(s.windows.len(), 7);
+        s.windows.clear();
+        s.handle(Cmd::OpenTool(Tool::CreateImage));
+        assert!(s.wizard.is_some());
+        s.handle(Cmd::CloseWizard);
+        s.handle(Cmd::OpenTool(Tool::RestoreImage));
+        assert!(s.wizard.is_some());
     }
 
     #[test]
