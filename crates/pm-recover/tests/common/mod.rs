@@ -91,6 +91,21 @@ impl<'a> Fat32Writer<'a> {
         first
     }
 
+    /// Number of the last valid data cluster.
+    pub fn last_cluster(&mut self) -> u32 {
+        ((self.dev.len() - self.data_off) / self.cluster_size()) as u32 + 1
+    }
+
+    /// Write `data` into cluster `c` without touching the FAT.
+    pub fn write_cluster(&mut self, c: u32, data: &[u8]) {
+        self.dev.write_at(self.cluster_off(c), data).unwrap();
+    }
+
+    /// Add a root directory entry pointing at `first` with the given size field and no data.
+    pub fn add_raw_entry(&mut self, name: [u8; 11], first: u32, size: u32) {
+        self.put_entry(name, first, size);
+    }
+
     /// Add a file to the root directory; returns its first cluster.
     pub fn add_file(&mut self, name: [u8; 11], data: &[u8]) -> u32 {
         self.add_file_opts(name, data, true)
@@ -99,12 +114,17 @@ impl<'a> Fat32Writer<'a> {
     /// Like `add_file`, but with `link == false` the cluster chain is left unlinked in the FAT.
     pub fn add_file_opts(&mut self, name: [u8; 11], data: &[u8], link: bool) -> u32 {
         let first = self.put_data(data, link);
+        self.put_entry(name, first, data.len() as u32);
+        first
+    }
+
+    fn put_entry(&mut self, name: [u8; 11], first: u32, size: u32) {
         let mut e = [0u8; 32];
         e[..11].copy_from_slice(&name);
         e[11] = 0x20;
         e[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
         e[26..28].copy_from_slice(&(first as u16).to_le_bytes());
-        e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        e[28..32].copy_from_slice(&size.to_le_bytes());
         let root = self.cluster_off(self.root_cluster);
         let mut slot = 0u64;
         loop {
@@ -117,7 +137,6 @@ impl<'a> Fat32Writer<'a> {
             slot += 1;
         }
         self.dev.write_at(root + slot * 32, &e).unwrap();
-        first
     }
 
     /// Mark the root entry called `name` deleted (first byte 0xE5). With `free_chain` its FAT

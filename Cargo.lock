@@ -422,6 +422,7 @@ name = "pm-ops"
 version = "0.1.0"
 dependencies = [
  "pm-core",
+ "pm-fs",
  "pm-image",
  "pm-parttable",
  "pm-platform",
@@ -460,6 +461,7 @@ version = "0.1.0"
 dependencies = [
  "pm-core",
  "pm-fs",
+ "pm-image",
  "pm-parttable",
  "serde",
  "serde_json",

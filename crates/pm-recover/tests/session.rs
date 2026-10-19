@@ -1,7 +1,7 @@
 use pm_core::{DiskInfo, Error, FsKind};
 use pm_fs::Entry;
 use pm_parttable::{Candidate, CandidateSource};
-use pm_recover::{CarvedFile, Category, DeletedFile, DeviceIdentity, ScanSession, SessionKind};
+use pm_recover::{CarveReport, CarvedFile, Category, DeletedFile, DeviceIdentity, ScanSession, SessionKind};
 
 fn identity() -> DeviceIdentity {
     DeviceIdentity {
@@ -45,14 +45,18 @@ fn sessions() -> Vec<ScanSession> {
         integrity: 80,
         fs_offset: 1 << 20,
     }]);
-    let carved = SessionKind::Carved(vec![CarvedFile {
-        offset: 0x1234_5000,
-        len: 4096,
-        sig: "JPEG".into(),
-        ext: "jpg".into(),
-        category: Category::Image,
-        complete: true,
-    }]);
+    let carved = SessionKind::Carved(CarveReport {
+        files: vec![CarvedFile {
+            offset: 0x1234_5000,
+            len: 4096,
+            sig: "JPEG".into(),
+            ext: "jpg".into(),
+            category: Category::Image,
+            complete: true,
+        }],
+        unreadable: vec![(0x2000, 512)],
+        bytes_scanned: 500_107_862_016 - 512,
+    });
     [parts, deleted, carved].into_iter().map(|k| ScanSession::new(identity(), k)).collect()
 }
 
@@ -73,11 +77,14 @@ fn session_roundtrip_json() {
     }
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     match ScanSession::load(&dir.path().join("s2.json")).unwrap().kind {
-        SessionKind::Carved(v) => {
+        SessionKind::Carved(r) => {
+            let v = &r.files;
             assert_eq!(v.len(), 1);
             assert_eq!(v[0].offset, 0x1234_5000);
             assert_eq!(v[0].category, Category::Image);
             assert!(v[0].complete);
+            assert_eq!(r.unreadable, vec![(0x2000, 512)]);
+            assert_eq!(r.bytes_scanned, 500_107_862_016 - 512);
         }
         other => panic!("{other:?}"),
     }
@@ -121,12 +128,12 @@ fn matches_compares_model_serial_size() {
     assert!(s.matches(&disk("Samsung SSD 980", "S64DNX0R123456", 500_107_862_016, "")));
     let mut wiped = identity();
     wiped.table_id.clear();
-    let s2 = ScanSession::new(wiped, SessionKind::Carved(vec![]));
+    let s2 = ScanSession::new(wiped, SessionKind::Carved(CarveReport::default()));
     assert!(s2.matches(&ok));
     // both present and different: not the same disk state
     assert!(!s.matches(&disk("Samsung SSD 980", "S64DNX0R123456", 500_107_862_016, "FFFF0000")));
     // an identity built from a DiskInfo matches that disk
     let id = DeviceIdentity::from_disk(&ok);
     assert_eq!(id.table_id, "8A1B2C3D");
-    assert!(ScanSession::new(id, SessionKind::Carved(vec![])).matches(&ok));
+    assert!(ScanSession::new(id, SessionKind::Carved(CarveReport::default())).matches(&ok));
 }

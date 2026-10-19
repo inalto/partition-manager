@@ -19,7 +19,9 @@ struct Fixture {
 ///   GONE.TXT   deleted, 43 bytes, chain freed (as a real delete does)
 ///   EMPTY.TXT  deleted, 0 bytes
 ///   BIG.BIN    deleted, 1300 bytes, FAT chain left intact
-///   LOST.BIN   deleted, 1300 bytes, FAT chain freed
+///   LOST.BIN   deleted, 1300 bytes, FAT chain freed (restorable as a contiguous run)
+///   EDGE.BIN   deleted, claims 1300 bytes but starts in the last cluster of the volume, so
+///              its contiguous run leaves the volume: only the first cluster is readable
 fn fixture() -> Fixture {
     let mut dev = MemDevice::new(40 * MIB);
     format_part(&mut dev, 0, 40 * MIB, "RECOVER");
@@ -36,6 +38,10 @@ fn fixture() -> Fixture {
         w.delete(dos_name("EMPTY", "TXT"), true);
         w.delete(dos_name("BIG", "BIN"), false);
         w.delete(dos_name("LOST", "BIN"), true);
+        let last = w.last_cluster();
+        w.write_cluster(last, &lost[..512]);
+        w.add_raw_entry(dos_name("EDGE", "BIN"), last, 1300);
+        w.delete(dos_name("EDGE", "BIN"), false);
     }
     Fixture { fs: open(Box::new(dev)).unwrap(), big, lost }
 }
@@ -48,7 +54,7 @@ fn find<'a>(v: &'a [DeletedFile], name: &str) -> &'a DeletedFile {
 fn deleted_fat_file_restored_contents_match() {
     let mut fx = fixture();
     let list = deleted_files(&mut *fx.fs, &NullProgress, &CancelToken::new()).unwrap();
-    assert_eq!(list.len(), 4, "{list:?}");
+    assert_eq!(list.len(), 5, "{list:?}");
     assert!(list.iter().all(|f| f.entry.deleted && f.fs_offset == 0));
     assert!(list.iter().all(|f| f.entry.name != "?eep.txt"));
 
@@ -83,8 +89,10 @@ fn integrity_estimates_follow_readability() {
     assert_eq!(find(&list, "?mpty.txt").integrity, 100);
     assert_eq!(find(&list, "?one.txt").integrity, 80);
     assert_eq!(find(&list, "?ig.bin").integrity, 80);
-    // the start is readable but the freed chain ends after the first cluster
-    assert_eq!(find(&list, "?ost.bin").integrity, 40);
+    // a freed chain is read as a contiguous run
+    assert_eq!(find(&list, "?ost.bin").integrity, 80);
+    // the start is readable but the file's clusters run off the end of the volume
+    assert_eq!(find(&list, "?dge.bin").integrity, 40);
     assert!(list.iter().all(|f| f.integrity <= 100));
 }
 
@@ -93,10 +101,13 @@ fn restore_failure_leaves_no_partial_file() {
     let mut fx = fixture();
     let list = deleted_files(&mut *fx.fs, &NullProgress, &CancelToken::new()).unwrap();
     let dest = tempfile::tempdir().unwrap();
-    let lost = find(&list, "?ost.bin");
-    assert!(restore_file(&mut *fx.fs, lost, dest.path()).is_err());
+    let edge = find(&list, "?dge.bin");
+    assert!(restore_file(&mut *fx.fs, edge, dest.path()).is_err());
     assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
-    let _ = &fx.lost;
+    // while a chain freed by the delete restores completely
+    let lost = find(&list, "?ost.bin");
+    let p = restore_file(&mut *fx.fs, lost, dest.path()).unwrap();
+    assert_eq!(std::fs::read(p).unwrap(), fx.lost);
 }
 
 #[test]

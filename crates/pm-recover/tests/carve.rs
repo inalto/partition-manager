@@ -2,15 +2,45 @@ mod common;
 
 use common::text_bytes;
 use pm_core::{BlockDevice, CancelToken, Error, FnProgress, MemDevice, NullProgress, ProgressReport, ReadOnly};
+use pm_image::rescue::FaultyDevice;
 use pm_recover::{carve, extract_carved, signatures, CarvedFile, Category, LengthRule, Signature};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 const SECTOR: u64 = 512;
 
-fn jpeg(body: usize) -> Vec<u8> {
-    let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0];
+/// SOS segment, entropy-coded data (with a stuffed FF 00 and an RST marker) and EOI.
+fn jpeg_tail(body: usize) -> Vec<u8> {
+    let mut v = vec![0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00];
     v.extend(text_bytes(body, 1));
+    v.extend([0xFF, 0x00]);
+    v.extend(text_bytes(10, 3));
+    v.extend([0xFF, 0xD0]);
+    v.extend(text_bytes(10, 4));
     v.extend([0xFF, 0xD9]);
+    v
+}
+
+/// A structurally valid JPEG: SOI, JFIF APP0, SOS + data, EOI.
+fn jpeg(body: usize) -> Vec<u8> {
+    let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    v.extend(b"JFIF\0\x01\x01\x01\x00\x48\x00\x48\x00\x00");
+    v.extend(jpeg_tail(body));
+    v
+}
+
+/// A JPEG whose EXIF APP1 segment embeds a complete thumbnail JPEG (with its own FF D9) that
+/// starts 512 bytes into the file, i.e. at a sector boundary when the file does.
+fn jpeg_with_thumbnail() -> Vec<u8> {
+    let thumb = jpeg(300);
+    let payload = (512 - 6) + thumb.len() + 40;
+    let mut v = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    v.extend(((payload + 2) as u16).to_be_bytes());
+    v.extend(b"Exif\0\0");
+    v.resize(512, b'x');
+    v.extend(&thumb);
+    v.extend([b'y'; 40]);
+    v.extend(jpeg_tail(500));
     v
 }
 
@@ -109,7 +139,7 @@ fn put(dev: &mut MemDevice, off: u64, data: &[u8]) {
 }
 
 fn run(dev: &mut dyn BlockDevice, sector: u32) -> Vec<CarvedFile> {
-    carve(dev, signatures(), sector, &NullProgress, &CancelToken::new()).unwrap()
+    carve(dev, signatures(), sector, &NullProgress, &CancelToken::new()).unwrap().files
 }
 
 fn by_sig<'a>(v: &'a [CarvedFile], sig: &str) -> Vec<&'a CarvedFile> {
@@ -175,16 +205,16 @@ fn carve_truncates_at_max_len() {
     // no footer at all
     let mut dev = noise_dev(1 << 20);
     put(&mut dev, 100 * SECTOR, b"HDR1");
-    let r = carve(&mut dev, &sigs, 512, &NullProgress, &CancelToken::new()).unwrap();
+    let r = carve(&mut dev, &sigs, 512, &NullProgress, &CancelToken::new()).unwrap().files;
     assert_eq!(r.len(), 1);
     assert_eq!((r[0].offset, r[0].len, r[0].complete), (100 * SECTOR, 4096, false));
     // a footer beyond max_len does not count
     put(&mut dev, 100 * SECTOR + 4500, b"ENDX");
-    let r = carve(&mut dev, &sigs, 512, &NullProgress, &CancelToken::new()).unwrap();
+    let r = carve(&mut dev, &sigs, 512, &NullProgress, &CancelToken::new()).unwrap().files;
     assert_eq!((r[0].len, r[0].complete), (4096, false));
     // a footer inside max_len does
     put(&mut dev, 100 * SECTOR + 1000, b"ENDX");
-    let r = carve(&mut dev, &sigs, 512, &NullProgress, &CancelToken::new()).unwrap();
+    let r = carve(&mut dev, &sigs, 512, &NullProgress, &CancelToken::new()).unwrap().files;
     assert_eq!((r[0].len, r[0].complete), (1004, true));
 }
 
@@ -307,16 +337,13 @@ fn different_types_may_overlap_but_nested_same_type_is_suppressed() {
     assert_eq!((pdf.offset, pdf.len), (20 * SECTOR, outer.len() as u64));
     assert_eq!((png.offset, png.len), (21 * SECTOR, inner.len() as u64));
 
-    // a JPEG header inside a complete JPEG is not reported again
-    let mut outer = jpeg(100);
-    outer.truncate(outer.len() - 2); // drop the footer: the outer one ends at the inner footer
-    outer.resize(512, b'y');
-    outer.extend(jpeg(200));
+    // the thumbnail inside the EXIF segment neither ends the JPEG early nor is reported again
+    let outer = jpeg_with_thumbnail();
     let mut dev = noise_dev(1 << 20);
     put(&mut dev, 5 * SECTOR, &outer);
     let r = run(&mut dev, 512);
     assert_eq!(r.len(), 1, "{r:?}");
-    assert_eq!((r[0].offset, r[0].len), (5 * SECTOR, outer.len() as u64));
+    assert_eq!((r[0].offset, r[0].len, r[0].complete), (5 * SECTOR, outer.len() as u64, true));
 }
 
 #[test]
@@ -340,7 +367,9 @@ fn carve_never_writes_reports_progress_and_honours_cancel() {
     let reports = Mutex::new(Vec::<ProgressReport>::new());
     let sink = FnProgress(|p: &ProgressReport| reports.lock().unwrap().push(p.clone()));
     let r = carve(&mut ro, signatures(), 512, &sink, &CancelToken::new()).unwrap();
-    assert_eq!(r.len(), 1);
+    assert_eq!(r.files.len(), 1);
+    assert!(r.unreadable.is_empty());
+    assert_eq!(r.bytes_scanned, 10 << 20);
     let last = reports.lock().unwrap().last().cloned().expect("a final report");
     assert_eq!(last.done, 10 << 20);
     assert_eq!(last.total, 10 << 20);
@@ -399,4 +428,211 @@ fn signature_table_is_well_formed() {
     // the table survives a JSON round trip of its serializable parts
     let json = serde_json::to_string(&sigs[0]).unwrap();
     assert!(json.contains(sigs[0].name));
+}
+
+// ---- fix round 1: structure-aware ends --------------------------------------------------
+
+fn gif_with_lzw_trailer_lookalike() -> Vec<u8> {
+    let mut v = b"GIF89a".to_vec();
+    v.extend([1, 0, 1, 0, 0x80, 0, 0]); // 1x1, global color table of 2 entries
+    v.extend([0, 0, 0, 255, 255, 255]);
+    v.extend([0x21, 0xF9, 0x04, 0, 0, 0, 0, 0]); // graphic control extension
+    v.extend([0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]); // image descriptor
+    v.push(2); // LZW minimum code size
+    v.extend([5, 0x01, 0x00, 0x3B, 0x02, 0x03]); // sub-block whose data contains 00 3B
+    v.extend([3, 0x04, 0x05, 0x06]);
+    v.push(0); // block terminator
+    v.push(0x3B); // trailer
+    v
+}
+
+#[test]
+fn jpeg_ends_at_the_real_eoi_not_at_an_embedded_thumbnail() {
+    let outer = jpeg_with_thumbnail();
+    let first_eoi = outer.windows(2).position(|w| w == [0xFF, 0xD9]).unwrap();
+    assert!(first_eoi + 2 < outer.len() - 100, "fixture: the thumbnail EOI comes first");
+    let mut dev = noise_dev(1 << 20);
+    put(&mut dev, 40 * SECTOR, &outer);
+    let r = run(&mut dev, 512);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].offset, r[0].len, r[0].complete), (40 * SECTOR, outer.len() as u64, true));
+}
+
+#[test]
+fn jpeg_with_broken_structure_falls_back_to_the_first_footer_as_incomplete() {
+    // APP0 claims a length that lands in the middle of plain text
+    let mut j = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x20];
+    j.extend(text_bytes(300, 1));
+    j.extend([0xFF, 0xD9]);
+    let mut dev = noise_dev(1 << 20);
+    put(&mut dev, 3 * SECTOR, &j);
+    let r = run(&mut dev, 512);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].len, r[0].complete), (j.len() as u64, false));
+}
+
+#[test]
+fn pdf_ends_at_the_last_eof_before_the_next_pdf() {
+    let mut updated = b"%PDF-1.4\n".to_vec();
+    updated.extend(text_bytes(900, 1));
+    updated.extend(b"\n%%EOF\n"); // first revision / linearization hint
+    updated.extend(text_bytes(700, 2));
+    updated.extend(b"\n%%EOF"); // incremental update
+    let second = pdf(1000);
+    let mut dev = noise_dev(1 << 20);
+    let o1 = 10 * SECTOR;
+    let o2 = 30 * SECTOR;
+    put(&mut dev, o1, &updated);
+    put(&mut dev, o2, &second);
+    let r = run(&mut dev, 512);
+    let pdfs = by_sig(&r, "PDF");
+    assert_eq!(pdfs.len(), 2, "{r:?}");
+    assert_eq!((pdfs[0].offset, pdfs[0].len, pdfs[0].complete), (o1, updated.len() as u64, true));
+    assert_eq!((pdfs[1].offset, pdfs[1].len, pdfs[1].complete), (o2, second.len() as u64, true));
+
+    // no %%EOF at all: runs to the next PDF header, incomplete
+    let mut dev = noise_dev(1 << 20);
+    put(&mut dev, o1, b"%PDF-1.4\n");
+    put(&mut dev, o2, b"%PDF-1.7\n");
+    let r = run(&mut dev, 512);
+    let pdfs = by_sig(&r, "PDF");
+    assert_eq!((pdfs[0].len, pdfs[0].complete), (o2 - o1, false));
+}
+
+#[test]
+fn gif_ends_at_the_trailer_even_when_lzw_data_contains_the_footer_bytes() {
+    let g = gif_with_lzw_trailer_lookalike();
+    let early = g.windows(2).position(|w| w == [0x00, 0x3B]).unwrap();
+    assert!(early + 2 < g.len(), "fixture: 00 3B occurs before the trailer");
+    let mut dev = noise_dev(1 << 20);
+    put(&mut dev, 9 * SECTOR, &g);
+    let r = run(&mut dev, 512);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].offset, r[0].len, r[0].complete), (9 * SECTOR, g.len() as u64, true));
+
+    // a broken block structure falls back to the first 00 3B and is incomplete
+    let mut bad = g.clone();
+    bad[13 + 6] = 0x99; // not a GIF block introducer
+    let mut dev = noise_dev(1 << 20);
+    put(&mut dev, 9 * SECTOR, &bad);
+    let r = run(&mut dev, 512);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].len, r[0].complete), (early as u64 + 2, false));
+}
+
+// ---- fix round 1: footers across the 1 MiB search block ---------------------------------
+
+const BLOCK: usize = 1 << 20;
+
+#[test]
+fn png_footer_straddling_the_search_block_boundary_is_found() {
+    // The footer search starts right after the 8-byte header, so the footer begins at
+    // `body + 8` bytes into the file; put it on both sides of the first and second boundary.
+    for body in [BLOCK - 20, BLOCK - 11, BLOCK - 9, BLOCK - 8, BLOCK - 7, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK - 12, 2 * BLOCK - 7] {
+        let p = png(body);
+        let mut dev = noise_dev(3 << 20);
+        put(&mut dev, 3 * SECTOR, &p);
+        let r = run(&mut dev, 512);
+        assert_eq!(r.len(), 1, "body {body}: {r:?}");
+        assert_eq!((r[0].offset, r[0].len, r[0].complete), (3 * SECTOR, p.len() as u64, true), "body {body}");
+    }
+}
+
+#[test]
+fn zip_eocd_straddling_the_search_block_boundary_is_found() {
+    // EOCD offset from the end of the 4-byte local header = 30 + 2 * name + data + 46 - 4 - ...
+    let name = "f.bin";
+    let fixed = 30 + name.len() + 46 + name.len() - 4;
+    for delta in [-6i64, -5, -3, -1, 0, 1, 3] {
+        let data = (BLOCK as i64 - fixed as i64 + delta) as usize;
+        let z = zip(&[(name, &text_bytes(data, 7))], b"comment");
+        let mut dev = noise_dev(3 << 20);
+        put(&mut dev, 5 * SECTOR, &z);
+        let r = run(&mut dev, 512);
+        let zips = by_sig(&r, "ZIP");
+        assert_eq!(zips.len(), 1, "delta {delta}: {r:?}");
+        assert_eq!((zips[0].len, zips[0].complete), (z.len() as u64, true), "delta {delta}");
+    }
+}
+
+#[test]
+fn zip_larger_than_several_search_blocks_has_the_exact_length() {
+    let z = zip(
+        &[("a.bin", &text_bytes(BLOCK + 12_345, 1)), ("b.bin", &text_bytes(BLOCK + 99, 2))],
+        &[b'c'; 100],
+    );
+    assert!(z.len() > 2 * BLOCK);
+    let mut dev = noise_dev(4 << 20);
+    put(&mut dev, 17 * SECTOR, &z);
+    let r = run(&mut dev, 512);
+    let zips = by_sig(&r, "ZIP");
+    assert_eq!(zips.len(), 1, "{r:?}");
+    assert_eq!((zips[0].offset, zips[0].len, zips[0].complete), (17 * SECTOR, z.len() as u64, true));
+}
+
+#[test]
+fn jpeg_entropy_data_longer_than_a_block_is_walked() {
+    // the stuffed FF 00 and the RST marker land on both sides of the first block boundary
+    for extra in [-14i64, -13, -12, -2, -1, 0, 1, 2, 11, 12, 13] {
+        let j = jpeg((BLOCK as i64 + extra) as usize);
+        let mut dev = noise_dev(3 << 20);
+        put(&mut dev, 2 * SECTOR, &j);
+        let r = run(&mut dev, 512);
+        assert_eq!(r.len(), 1, "extra {extra}: {r:?}");
+        assert_eq!((r[0].len, r[0].complete), (j.len() as u64, true), "extra {extra}");
+    }
+}
+
+// ---- fix round 1: read errors -----------------------------------------------------------
+
+fn faulty(len: usize, bad: &[u64]) -> FaultyDevice {
+    FaultyDevice::new(noise_dev(len), bad.to_vec(), HashMap::new())
+}
+
+#[test]
+fn carve_survives_a_bad_sector_and_reports_it() {
+    let j = jpeg(3000);
+    let p = png(5000);
+    let bad = 5 * (1u64 << 20) + 7 * SECTOR; // between the two files, in the second chunk
+    let (oj, op) = (100 * SECTOR, 14_000 * SECTOR);
+    let mut mem = noise_dev(10 << 20);
+    put(&mut mem, oj, &j);
+    put(&mut mem, op, &p);
+    let mut dev = FaultyDevice::new(mem, vec![bad], HashMap::new());
+    assert!(op > bad, "fixture: the PNG lies after the bad sector");
+
+    let r = carve(&mut dev, signatures(), 512, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(r.files.len(), 2, "{r:#?}");
+    assert_eq!((r.files[0].offset, r.files[0].len, r.files[0].complete), (oj, j.len() as u64, true));
+    assert_eq!((r.files[1].offset, r.files[1].len, r.files[1].complete), (op, p.len() as u64, true));
+    assert_eq!(r.unreadable, vec![(bad, SECTOR)]);
+    assert_eq!(r.bytes_scanned, (10 << 20) - SECTOR);
+    assert_eq!(dev.write_count(), 0);
+}
+
+#[test]
+fn adjacent_bad_sectors_are_merged_and_cover_chunk_overlaps() {
+    // bad sectors just before a chunk boundary are read twice (as chunk tail and next head)
+    let boundary = 4u64 << 20;
+    let bad = [boundary - SECTOR, boundary - 2 * SECTOR, boundary + 5 * SECTOR];
+    let mut dev = faulty(9 << 20, &bad);
+    let r = carve(&mut dev, signatures(), 512, &NullProgress, &CancelToken::new()).unwrap();
+    assert!(r.files.is_empty());
+    assert_eq!(r.unreadable, vec![(boundary - 2 * SECTOR, 2 * SECTOR), (boundary + 5 * SECTOR, SECTOR)]);
+    assert_eq!(r.bytes_scanned, (9 << 20) - 3 * SECTOR);
+}
+
+#[test]
+fn a_bad_sector_inside_a_file_makes_it_incomplete_instead_of_aborting() {
+    let p = png(200_000);
+    let off = 50 * SECTOR;
+    let mut mem = noise_dev(2 << 20);
+    put(&mut mem, off, &p);
+    let bad = off + 100 * SECTOR; // inside the PNG body, hit by the footer search
+    let mut dev = FaultyDevice::new(mem, vec![bad], HashMap::new());
+    let r = carve(&mut dev, signatures(), 512, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(r.files.len(), 1, "{r:#?}");
+    assert_eq!(r.files[0].offset, off);
+    assert!(!r.files[0].complete);
+    assert!(r.unreadable.iter().any(|&(o, l)| o <= bad && bad < o + l), "{:?}", r.unreadable);
 }

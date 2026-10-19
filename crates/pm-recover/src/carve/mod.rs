@@ -3,5 +3,5 @@
 mod scanner;
 mod signatures;
 
-pub use scanner::{carve, extract_carved, CarvedFile};
+pub use scanner::{carve, extract_carved, CarveReport, CarvedFile};
 pub use signatures::{signatures, Category, LengthRule, Signature};

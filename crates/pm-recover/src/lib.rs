@@ -10,7 +10,7 @@ pub mod partitions;
 pub mod session;
 
 pub use carve::{
-    carve, extract_carved, signatures, CarvedFile, Category, LengthRule, Signature,
+    carve, extract_carved, signatures, CarveReport, CarvedFile, Category, LengthRule, Signature,
 };
 pub use files::{deleted_files, deleted_files_at, restore_file, DeletedFile};
 pub use partitions::{apply_candidates, find_partitions};

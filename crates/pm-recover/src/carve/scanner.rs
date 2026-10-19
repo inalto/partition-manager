@@ -15,6 +15,10 @@ const BLOCK: usize = 1 << 20;
 const OVERLAP_SLACK: usize = 16;
 /// Upper bound on the atoms walked for one MP4 file.
 const MAX_MP4_BOXES: u32 = 1_000_000;
+/// Size of the sub-reads used to work around a failing chunk read.
+const SUB_READ: usize = 64 << 10;
+/// Upper bound on the segments/blocks walked for one JPEG or GIF.
+const MAX_STRUCTURE_STEPS: u32 = 4_000_000;
 /// The largest plausible `ftyp` atom.
 const MAX_FTYP: u64 = 4096;
 
@@ -30,6 +34,18 @@ pub struct CarvedFile {
     /// The end was found (footer, container length or atom chain) rather than assumed from
     /// `max_len` or the device end.
     pub complete: bool,
+}
+
+/// Outcome of a carving scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarveReport {
+    /// Carved files sorted by offset.
+    pub files: Vec<CarvedFile>,
+    /// Byte ranges `(offset, len)` that could not be read, sorted and merged. They were
+    /// scanned as zeros, so files overlapping them may be missing or incomplete.
+    pub unreadable: Vec<(u64, u64)>,
+    /// Bytes of the device that were read and examined.
+    pub bytes_scanned: u64,
 }
 
 /// Header lookup: signatures grouped by header offset, indexed by the first header byte.
@@ -101,15 +117,19 @@ impl<'a> Matcher<'a> {
 ///
 /// Hits of different types may overlap and are all reported. Once a type has produced a
 /// *complete* file, further headers of that same type inside it are ignored (a zip nested in a
-/// zip, a thumbnail in a JPEG); incomplete hits never suppress anything. The result is sorted
-/// by offset. Progress is reported as phase "Carving" over the device length.
+/// zip, a thumbnail in a JPEG); incomplete hits never suppress anything.
+///
+/// A read error does not abort the scan: the failing chunk is re-read in 64 KiB pieces and then
+/// sector by sector, unreadable sectors are scanned as zeros and listed in
+/// [`CarveReport::unreadable`]. A read error while measuring a file makes that file incomplete.
+/// Progress is reported as phase "Carving" over the device length.
 pub fn carve(
     dev: &mut dyn BlockDevice,
     sigs: &[Signature],
     sector: u32,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
-) -> Result<Vec<CarvedFile>> {
+) -> Result<CarveReport> {
     if sector == 0 {
         return Err(Error::Invalid("carve sector size must be greater than zero".into()));
     }
@@ -118,21 +138,23 @@ pub fn carve(
     let step = sector as u64;
     let mut tracker = ProgressTracker::new(progress, "Carving", dev_len);
     let matcher = Matcher::new(sigs);
-    let mut found: Vec<CarvedFile> = Vec::new();
+    let mut report = CarveReport::default();
     if matcher.groups.is_empty() || dev_len == 0 {
         tracker.finish();
-        return Ok(found);
+        return Ok(report);
     }
     let overlap = matcher.max_extent + OVERLAP_SLACK;
     let mut buf = vec![0u8; CHUNK as usize + overlap];
     let mut skip_until = vec![0u64; sigs.len()];
+    let mut chunk_bad: Vec<(u64, u64)> = Vec::new();
+    let mut measure_bad: Vec<(u64, u64)> = Vec::new();
 
     let mut pos = 0u64;
     while pos < dev_len {
         cancel.check()?;
         let scan_len = CHUNK.min(dev_len - pos);
         let read_len = (CHUNK + overlap as u64).min(dev_len - pos) as usize;
-        dev.read_at(pos, &mut buf[..read_len])?;
+        read_resilient(dev, pos, &mut buf[..read_len], cancel, &mut chunk_bad)?;
         let data = &buf[..read_len];
 
         let mut hits: Vec<usize> = Vec::new();
@@ -147,11 +169,19 @@ pub fn carve(
                         continue;
                     }
                     let sig = &sigs[si];
-                    if let Some((len, complete)) = determine_len(dev, sig, start, dev_len, cancel)? {
+                    let measured = match determine_len(dev, sig, start, dev_len, cancel) {
+                        Ok(m) => m,
+                        Err(Error::Io { offset, len, .. }) => {
+                            measure_bad.push((offset, len as u64));
+                            Some((sig.max_len.min(dev_len - start), false))
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if let Some((len, complete)) = measured {
                         if complete {
                             skip_until[si] = start + len;
                         }
-                        found.push(CarvedFile {
+                        report.files.push(CarvedFile {
                             offset: start,
                             len,
                             sig: sig.name.to_string(),
@@ -168,8 +198,57 @@ pub fn carve(
         pos += scan_len;
     }
     tracker.finish();
-    found.sort_by(|a, b| a.offset.cmp(&b.offset).then_with(|| a.sig.cmp(&b.sig)));
-    Ok(found)
+    report.files.sort_by(|a, b| a.offset.cmp(&b.offset).then_with(|| a.sig.cmp(&b.sig)));
+    let chunk_bad = coalesce(chunk_bad);
+    report.bytes_scanned = dev_len.saturating_sub(chunk_bad.iter().map(|r| r.1).sum());
+    let mut all = chunk_bad;
+    all.extend(measure_bad);
+    report.unreadable = coalesce(all);
+    Ok(report)
+}
+
+/// Read `buf` at `off`; if that fails retry in 64 KiB pieces, then sector by sector. Sectors
+/// that still fail are zero-filled and appended to `bad`.
+fn read_resilient(
+    dev: &mut dyn BlockDevice,
+    off: u64,
+    buf: &mut [u8],
+    cancel: &CancelToken,
+    bad: &mut Vec<(u64, u64)>,
+) -> Result<()> {
+    if dev.read_at(off, buf).is_ok() {
+        return Ok(());
+    }
+    let sector = (dev.sector_size() as usize).max(1);
+    for (i, piece) in buf.chunks_mut(SUB_READ).enumerate() {
+        cancel.check()?;
+        let piece_off = off + (i * SUB_READ) as u64;
+        if dev.read_at(piece_off, piece).is_ok() {
+            continue;
+        }
+        for (j, s) in piece.chunks_mut(sector).enumerate() {
+            let o = piece_off + (j * sector) as u64;
+            if dev.read_at(o, s).is_err() {
+                s.fill(0);
+                bad.push((o, s.len() as u64));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sort ranges and merge those that overlap or touch.
+fn coalesce(mut v: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    v.retain(|r| r.1 > 0);
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (o, l) in v {
+        match out.last_mut() {
+            Some(last) if o <= last.0 + last.1 => last.1 = last.1.max(o + l - last.0),
+            _ => out.push((o, l)),
+        }
+    }
+    out
 }
 
 /// Length of the file of type `sig` starting at `start`, as `(len, complete)`; `None` rejects
@@ -185,17 +264,18 @@ fn determine_len(
     let cap = sig.max_len.min(avail);
     match sig.rule {
         LengthRule::MaxOnly => Ok(Some((cap, false))),
-        LengthRule::Footer(footer) => {
-            let from = start + (sig.header_offset + sig.header.len()) as u64;
-            let end = start + cap;
-            if from >= end {
-                return Ok(Some((cap, false)));
-            }
-            match find_forward(dev, from, end, footer, cancel, &mut |_, _| Ok(true))? {
-                Some(p) => Ok(Some((p + footer.len() as u64 - start, true))),
-                None => Ok(Some((cap, false))),
-            }
-        }
+        LengthRule::Footer(footer) => footer_scan(dev, sig, start, cap, footer, true, cancel),
+        LengthRule::JpegMarkers => match jpeg_walk(dev, start, cap, cancel)? {
+            Walk::End(len) => Ok(Some((len, true))),
+            Walk::Truncated => Ok(Some((cap, false))),
+            Walk::Broken => footer_scan(dev, sig, start, cap, sig.footer.unwrap_or(&[]), false, cancel),
+        },
+        LengthRule::GifBlocks => match gif_walk(dev, start, cap, cancel)? {
+            Walk::End(len) => Ok(Some((len, true))),
+            Walk::Truncated => Ok(Some((cap, false))),
+            Walk::Broken => footer_scan(dev, sig, start, cap, sig.footer.unwrap_or(&[]), false, cancel),
+        },
+        LengthRule::PdfLastEof => pdf_len(dev, sig, start, cap, cancel),
         LengthRule::Riff => {
             let mut h = [0u8; 8];
             if cap < 12 {
@@ -216,6 +296,235 @@ fn determine_len(
         LengthRule::Mp4Atoms => mp4_len(dev, sig, start, avail, cap, cancel),
         LengthRule::ZipEocd => zip_len(dev, sig, start, dev_len, cap, cancel),
     }
+}
+
+/// Search for `footer` after the header; `found_complete` is the `complete` flag to report
+/// when it is found (false for fallbacks from a failed structural walk).
+fn footer_scan(
+    dev: &mut dyn BlockDevice,
+    sig: &Signature,
+    start: u64,
+    cap: u64,
+    footer: &[u8],
+    found_complete: bool,
+    cancel: &CancelToken,
+) -> Result<Option<(u64, bool)>> {
+    let from = start + (sig.header_offset + sig.header.len()) as u64;
+    let end = start + cap;
+    if footer.is_empty() || from >= end {
+        return Ok(Some((cap, false)));
+    }
+    match find_forward(dev, from, end, footer, cancel, &mut |_, _| Ok(true))? {
+        Some(p) => Ok(Some((p + footer.len() as u64 - start, found_complete))),
+        None => Ok(Some((cap, false))),
+    }
+}
+
+/// Result of walking a file's internal structure.
+enum Walk {
+    /// The file ends here (length in bytes).
+    End(u64),
+    /// The structure was fine up to the cap or device end.
+    Truncated,
+    /// The structure does not parse.
+    Broken,
+}
+
+fn read_u8(dev: &mut dyn BlockDevice, off: u64) -> Result<u8> {
+    let mut b = [0u8; 1];
+    dev.read_at(off, &mut b)?;
+    Ok(b[0])
+}
+
+/// Walk JPEG marker segments from SOI. Segments (APPn with an embedded thumbnail, DQT, ...) are
+/// skipped by their length, so only a top-level EOI ends the file; after SOS the entropy-coded
+/// data is scanned for the next real marker (stuffed `FF 00`, RSTn and fill bytes are data).
+fn jpeg_walk(dev: &mut dyn BlockDevice, start: u64, cap: u64, cancel: &CancelToken) -> Result<Walk> {
+    let mut pos = 2u64;
+    let mut steps = 0u32;
+    loop {
+        if steps >= MAX_STRUCTURE_STEPS {
+            return Ok(Walk::Broken);
+        }
+        if steps % 256 == 0 {
+            cancel.check()?;
+        }
+        steps += 1;
+        if pos + 2 > cap {
+            return Ok(Walk::Truncated);
+        }
+        let mut m = [0u8; 2];
+        dev.read_at(start + pos, &mut m)?;
+        if m[0] != 0xFF {
+            return Ok(Walk::Broken);
+        }
+        match m[1] {
+            0xFF => pos += 1, // fill byte
+            0xD9 => return Ok(Walk::End(pos + 2)),
+            0x01 | 0xD0..=0xD7 => pos += 2, // standalone markers
+            0x00 | 0xD8 => return Ok(Walk::Broken),
+            marker => {
+                if pos + 4 > cap {
+                    return Ok(Walk::Truncated);
+                }
+                let mut l = [0u8; 2];
+                dev.read_at(start + pos + 2, &mut l)?;
+                let len = u16::from_be_bytes(l) as u64;
+                if len < 2 {
+                    return Ok(Walk::Broken);
+                }
+                pos += 2 + len;
+                if pos > cap {
+                    return Ok(Walk::Truncated);
+                }
+                if marker == 0xDA {
+                    match scan_entropy(dev, start, pos, cap, cancel)? {
+                        Some(q) => pos = q,
+                        None => return Ok(Walk::Truncated),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Position (relative to `start`) of the first marker in entropy-coded data beginning at
+/// `from`, or `None` when the data runs to `cap` without one.
+fn scan_entropy(
+    dev: &mut dyn BlockDevice,
+    start: u64,
+    from: u64,
+    cap: u64,
+    cancel: &CancelToken,
+) -> Result<Option<u64>> {
+    if from >= cap {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; (BLOCK + 1).min((cap - from) as usize)];
+    let mut p = from;
+    loop {
+        cancel.check()?;
+        let n = (buf.len() as u64).min(cap - p) as usize;
+        dev.read_at(start + p, &mut buf[..n])?;
+        let last = p + n as u64 == cap;
+        // offsets handled by this block; the next one starts BLOCK bytes further
+        let limit = if last { n } else { BLOCK };
+        let mut i = 0;
+        while i < limit {
+            match buf[i..limit].iter().position(|&b| b == 0xFF) {
+                None => break,
+                Some(k) => {
+                    i += k;
+                    if i + 1 >= n {
+                        return Ok(None); // an FF as the very last byte
+                    }
+                    let next = buf[i + 1];
+                    if next == 0x00 || next == 0xFF || (0xD0..=0xD7).contains(&next) {
+                        i += 1;
+                        continue;
+                    }
+                    return Ok(Some(p + i as u64));
+                }
+            }
+        }
+        if last {
+            return Ok(None);
+        }
+        p += BLOCK as u64;
+    }
+}
+
+/// Skip the sub-blocks starting at `*pos`; false when they run past `cap`.
+fn gif_skip_sub_blocks(
+    dev: &mut dyn BlockDevice,
+    start: u64,
+    pos: &mut u64,
+    cap: u64,
+    steps: &mut u32,
+    cancel: &CancelToken,
+) -> Result<bool> {
+    loop {
+        if *steps % 4096 == 0 {
+            cancel.check()?;
+        }
+        *steps += 1;
+        if *pos >= cap {
+            return Ok(false);
+        }
+        let size = read_u8(dev, start + *pos)? as u64;
+        *pos += 1 + size;
+        if size == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Walk GIF blocks: header, logical screen (+ global color table), then image descriptors,
+/// extensions and finally the trailer `3B`.
+fn gif_walk(dev: &mut dyn BlockDevice, start: u64, cap: u64, cancel: &CancelToken) -> Result<Walk> {
+    if cap < 13 {
+        return Ok(Walk::Truncated);
+    }
+    let mut h = [0u8; 13];
+    dev.read_at(start, &mut h)?;
+    let mut pos = 13u64;
+    if h[10] & 0x80 != 0 {
+        pos += 3u64 << ((h[10] & 7) + 1);
+    }
+    let mut steps = 0u32;
+    loop {
+        if steps >= MAX_STRUCTURE_STEPS {
+            return Ok(Walk::Broken);
+        }
+        if pos >= cap {
+            return Ok(Walk::Truncated);
+        }
+        match read_u8(dev, start + pos)? {
+            0x3B => return Ok(Walk::End(pos + 1)),
+            0x2C => {
+                if pos + 11 > cap {
+                    return Ok(Walk::Truncated);
+                }
+                let packed = read_u8(dev, start + pos + 9)?;
+                pos += 10;
+                if packed & 0x80 != 0 {
+                    pos += 3u64 << ((packed & 7) + 1);
+                }
+                pos += 1; // LZW minimum code size
+            }
+            0x21 => pos += 2, // introducer + label
+            _ => return Ok(Walk::Broken),
+        }
+        if !gif_skip_sub_blocks(dev, start, &mut pos, cap, &mut steps, cancel)? {
+            return Ok(Walk::Truncated);
+        }
+    }
+}
+
+/// A PDF ends at its last `%%EOF` before the next `%PDF-` header (or the cap).
+fn pdf_len(
+    dev: &mut dyn BlockDevice,
+    sig: &Signature,
+    start: u64,
+    cap: u64,
+    cancel: &CancelToken,
+) -> Result<Option<(u64, bool)>> {
+    let from = start + sig.header.len() as u64;
+    let end = start + cap;
+    if from >= end {
+        return Ok(Some((cap, false)));
+    }
+    let limit = find_forward(dev, from, end, sig.header, cancel, &mut |_, _| Ok(true))?.unwrap_or(end);
+    let eof = sig.footer.unwrap_or(b"%%EOF");
+    let mut last: Option<u64> = None;
+    find_forward(dev, from, limit, eof, cancel, &mut |_, p| {
+        last = Some(p);
+        Ok(false)
+    })?;
+    Ok(Some(match last {
+        Some(p) => (p + eof.len() as u64 - start, true),
+        None => (limit - start, false),
+    }))
 }
 
 /// Walk the top-level atom chain of an ISO base media file.

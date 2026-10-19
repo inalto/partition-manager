@@ -27,6 +27,16 @@ pub enum LengthRule {
     Riff,
     /// ISO base media (MP4, MOV, M4A): walk the top-level atom chain.
     Mp4Atoms,
+    /// JPEG: walk the marker segments from SOI (so thumbnails embedded in APPn segments are
+    /// skipped), then the entropy-coded data up to the real EOI. A structurally broken file
+    /// falls back to the first footer and is reported incomplete.
+    JpegMarkers,
+    /// PDF: the last `%%EOF` before the next `%PDF-` header (incremental updates and
+    /// linearized files contain several).
+    PdfLastEof,
+    /// GIF: walk the block structure to the trailer. A broken structure falls back to the
+    /// first footer and is reported incomplete.
+    GifBlocks,
     /// ZIP and its derivatives: find the end-of-central-directory record that belongs to this
     /// archive; the file ends after its comment.
     ZipEocd,
@@ -103,6 +113,28 @@ const fn with_footer(
     }
 }
 
+const fn ruled(
+    name: &'static str,
+    ext: &'static str,
+    header: &'static [u8],
+    footer: &'static [u8],
+    rule: LengthRule,
+    max_len: u64,
+    category: Category,
+) -> Signature {
+    Signature {
+        name,
+        ext,
+        header,
+        header_offset: 0,
+        footer: Some(footer),
+        max_len,
+        category,
+        secondary: None,
+        rule,
+    }
+}
+
 const fn riff(
     name: &'static str,
     ext: &'static str,
@@ -126,7 +158,15 @@ const fn riff(
 const EOCD: &[u8] = b"PK\x05\x06";
 
 static SIGNATURES: &[Signature] = &[
-    with_footer("JPEG", "jpg", &[0xFF, 0xD8, 0xFF], &[0xFF, 0xD9], 64 * MIB, Category::Image),
+    ruled(
+        "JPEG",
+        "jpg",
+        &[0xFF, 0xD8, 0xFF],
+        &[0xFF, 0xD9],
+        LengthRule::JpegMarkers,
+        64 * MIB,
+        Category::Image,
+    ),
     with_footer(
         "PNG",
         "png",
@@ -135,14 +175,14 @@ static SIGNATURES: &[Signature] = &[
         64 * MIB,
         Category::Image,
     ),
-    with_footer("GIF87a", "gif", b"GIF87a", &[0x00, 0x3B], 32 * MIB, Category::Image),
-    with_footer("GIF89a", "gif", b"GIF89a", &[0x00, 0x3B], 32 * MIB, Category::Image),
+    ruled("GIF87a", "gif", b"GIF87a", &[0x00, 0x3B], LengthRule::GifBlocks, 32 * MIB, Category::Image),
+    ruled("GIF89a", "gif", b"GIF89a", &[0x00, 0x3B], LengthRule::GifBlocks, 32 * MIB, Category::Image),
     plain("BMP", "bmp", b"BM", 64 * MIB, Category::Image),
     plain("TIFF (LE)", "tif", &[0x49, 0x49, 0x2A, 0x00], 256 * MIB, Category::Image),
     plain("TIFF (BE)", "tif", &[0x4D, 0x4D, 0x00, 0x2A], 256 * MIB, Category::Image),
     riff("WebP", "webp", b"WEBP", 256 * MIB, Category::Image),
     plain("PSD", "psd", b"8BPS", 256 * MIB, Category::Image),
-    with_footer("PDF", "pdf", b"%PDF-", b"%%EOF", 256 * MIB, Category::Document),
+    ruled("PDF", "pdf", b"%PDF-", b"%%EOF", LengthRule::PdfLastEof, 256 * MIB, Category::Document),
     Signature {
         name: "ZIP",
         ext: "zip",

@@ -1,6 +1,6 @@
 //! Saveable scan results, so a long scan can be reviewed or resumed later.
 
-use crate::{CarvedFile, DeletedFile};
+use crate::{CarveReport, DeletedFile};
 use pm_core::{DiskInfo, Error, Result};
 use pm_parttable::Candidate;
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ impl DeviceIdentity {
 pub enum SessionKind {
     Partitions(Vec<Candidate>),
     Deleted(Vec<DeletedFile>),
-    Carved(Vec<CarvedFile>),
+    Carved(CarveReport),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
