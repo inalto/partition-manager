@@ -1,4 +1,13 @@
 //! FAT12/16/32 read-only filesystem.
+//!
+//! Deleted files: a real FAT delete frees the file's cluster chain (every entry becomes 0),
+//! so for entries with `deleted == true` [`FatFs`] applies the usual undelete heuristic when
+//! reading. The chain is followed while it is intact; at the first cluster whose FAT entry
+//! is 0 (free) the file is assumed to continue in the *next contiguous clusters* for the
+//! rest of its `ceil(size / cluster_size)` clusters. If the first cluster itself is free the
+//! whole file is therefore the contiguous run starting there. This is a best effort:
+//! fragmented deleted files, or clusters reused by newer files, yield wrong data. Live
+//! entries are never read this way.
 
 pub mod bpb;
 pub mod dir;
@@ -17,8 +26,11 @@ const MAX_DIR_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Copy)]
 struct Cursor {
     first: u32,
+    deleted: bool,
     idx: u64,
     cluster: u32,
+    /// Deleted files only: the intact chain ended and clusters are now assumed contiguous.
+    contiguous: bool,
 }
 
 /// A mounted (read-only) FAT volume.
@@ -182,26 +194,41 @@ impl FatFs {
         }
     }
 
-    /// The `target`-th (0-based) cluster of the chain starting at `first`.
-    fn cluster_at(&mut self, first: u32, target: u64) -> Result<u32> {
+    /// The cluster after `c` while reading file data. For deleted files a free FAT entry
+    /// switches to the contiguous-run assumption (and stays there).
+    fn step(&mut self, c: u32, deleted: bool, contiguous: bool) -> Result<(u32, bool)> {
+        if deleted && (contiguous || self.fat_entry(c)? == 0) {
+            let n = c + 1;
+            if !self.valid_cluster(n) {
+                return Err(Error::Parse("deleted file runs past the end of the volume".into()));
+            }
+            return Ok((n, true));
+        }
+        match self.next_cluster(c)? {
+            Some(n) => Ok((n, contiguous)),
+            None => Err(Error::Parse("FAT chain shorter than the file".into())),
+        }
+    }
+
+    /// The `target`-th (0-based) cluster of the file starting at `first`.
+    fn cluster_at(&mut self, first: u32, target: u64, deleted: bool) -> Result<u32> {
         if !self.valid_cluster(first) {
             return Err(Error::Parse(format!("invalid start cluster {first}")));
         }
-        let (mut idx, mut c) = match self.cursor {
-            Some(cur) if cur.first == first && cur.idx <= target => (cur.idx, cur.cluster),
-            _ => (0, first),
+        let (mut idx, mut c, mut contiguous) = match self.cursor {
+            Some(cur) if cur.first == first && cur.deleted == deleted && cur.idx <= target => {
+                (cur.idx, cur.cluster, cur.contiguous)
+            }
+            _ => (0, first, false),
         };
         while idx < target {
-            match self.next_cluster(c)? {
-                Some(n) => c = n,
-                None => return Err(Error::Parse("FAT chain shorter than the file".into())),
-            }
+            (c, contiguous) = self.step(c, deleted, contiguous)?;
             idx += 1;
             if idx >= self.bpb.cluster_count as u64 {
                 return Err(Error::Parse("FAT chain loop".into()));
             }
         }
-        self.cursor = Some(Cursor { first, idx, cluster: c });
+        self.cursor = Some(Cursor { first, deleted, idx, cluster: c, contiguous });
         Ok(c)
     }
 
@@ -264,6 +291,9 @@ impl FileSystem for FatFs {
         Ok(dir::scan(&bytes, &d.path, self.is_fat32()).live)
     }
 
+    /// Follows the file's cluster chain. For `deleted` entries (whose chain a real FAT delete
+    /// has freed) the chain is followed while intact and then continued as a contiguous run
+    /// of clusters; see the module documentation.
     fn read_file(&mut self, e: &Entry, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if e.is_dir {
             return Err(Error::Invalid(format!("{} is a directory", e.path)));
@@ -277,7 +307,7 @@ impl FileSystem for FatFs {
         let mut done = 0usize;
         while done < want {
             let pos = offset + done as u64;
-            let c = self.cluster_at(first, pos / cs)?;
+            let c = self.cluster_at(first, pos / cs, e.deleted)?;
             let in_cluster = pos % cs;
             let n = ((cs - in_cluster) as usize).min(want - done);
             let at = self.base + self.bpb.cluster_offset(c) + in_cluster;
