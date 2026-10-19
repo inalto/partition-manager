@@ -813,3 +813,61 @@ fn qcow2_autoclear_features_cleared_on_write() {
     dev.read_at(512, &mut got).unwrap();
     assert_eq!(got, pattern(512, 7));
 }
+
+// ---------------------------------------------------------------- fix round 2
+
+fn assert_same_file_refused(src: &Path, dst: &Path, fmt: ImageFormat, what: &str) {
+    match convert(src, dst, fmt, &NullProgress, &CancelToken::new()) {
+        Err(Error::Invalid(msg)) => {
+            assert_eq!(msg, "destination is the same file as the source", "{what}")
+        }
+        other => panic!("{what}: expected Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn convert_refuses_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    // raw -> raw onto itself, spelled directly and through `..`
+    let src = dir.path().join("src.img");
+    {
+        let mut d = create(&src, &opts(ImageFormat::Raw, MIB)).unwrap();
+        d.write_at(0, &pattern(4096, 1)).unwrap();
+        d.flush().unwrap();
+    }
+    let before = std::fs::read(&src).unwrap();
+    assert_same_file_refused(&src, &src, ImageFormat::Raw, "raw onto itself");
+    let dotted = sub.join("..").join("src.img");
+    assert_same_file_refused(&src, &dotted, ImageFormat::Qcow2, "same file via ..");
+    assert_eq!(std::fs::read(&src).unwrap(), before, "raw source untouched");
+
+    // flat VMDK pair: vm.vmdk (descriptor) + vm-flat.vmdk (extent)
+    let desc = dir.path().join("vm.vmdk");
+    let flat = dir.path().join("vm-flat.vmdk");
+    {
+        let mut d = create(&desc, &opts(ImageFormat::VmdkFlat, MIB)).unwrap();
+        d.write_at(512, &pattern(2048, 2)).unwrap();
+        d.flush().unwrap();
+    }
+    let desc_before = std::fs::read(&desc).unwrap();
+    let flat_before = std::fs::read(&flat).unwrap();
+    // the destination's <stem>-flat.vmdk sibling is the source
+    assert_same_file_refused(&flat, &desc, ImageFormat::VmdkFlat, "flat sibling is source");
+    // the source descriptor's extent is the destination
+    assert_same_file_refused(&desc, &flat, ImageFormat::Raw, "source extent is destination");
+    assert_eq!(std::fs::read(&desc).unwrap(), desc_before, "descriptor untouched");
+    assert_eq!(std::fs::read(&flat).unwrap(), flat_before, "flat extent untouched");
+
+    // distinct files still convert, and an existing destination is overwritten
+    let out = sub.join("out.vmdk");
+    std::fs::write(&out, b"old contents").unwrap();
+    convert(&desc, &out, ImageFormat::VmdkFlat, &NullProgress, &CancelToken::new()).unwrap();
+    let mut d = open(&out, true).unwrap();
+    let mut got = vec![0u8; 2048];
+    d.read_at(512, &mut got).unwrap();
+    assert_eq!(got, pattern(2048, 2));
+    assert!(sub.join("out-flat.vmdk").exists());
+}

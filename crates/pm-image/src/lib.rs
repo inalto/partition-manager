@@ -13,7 +13,7 @@ mod vmdk;
 pub use format::ImageFormat;
 pub use rescue::{copy_simple, rescue, BlockStatus, MapFile, MapStats, RescueOpts, RescueStats};
 use pm_core::{BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Options for [`create`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +63,11 @@ pub fn identify(path: &Path) -> Result<ImageFormat> {
 
 /// Copy the image `src` (any format) into a new image `dst` of format `fmt` with the
 /// same capacity, in 1 MiB chunks. All-zero chunks are not written to sparse formats so
-/// they stay unallocated. On cancellation the partial destination is left in place.
+/// they stay unallocated. An existing destination is overwritten (truncated), but a
+/// destination that is the source itself — directly, through another spelling of the
+/// path, or through a flat VMDK extent on either side — is refused with
+/// [`Error::Invalid`] before anything is created. On cancellation the partial
+/// destination is left in place.
 pub fn convert(
     src: &Path,
     dst: &Path,
@@ -72,6 +76,7 @@ pub fn convert(
     cancel: &CancelToken,
 ) -> Result<()> {
     cancel.check()?;
+    refuse_same_file(src, dst, fmt)?;
     let mut input = open(src, true)?;
     let capacity = input.len();
     let mut output = create(
@@ -99,4 +104,57 @@ pub fn convert(
     output.flush()?;
     tracker.finish();
     Ok(())
+}
+
+/// Refuse a conversion whose destination files (including a VmdkFlat destination's
+/// `<stem>-flat.vmdk`) overlap the files the source is read from (including a flat
+/// descriptor's extent): `create` would truncate the source before it is read.
+fn refuse_same_file(src: &Path, dst: &Path, fmt: ImageFormat) -> Result<()> {
+    let mut sources = vec![src.to_path_buf()];
+    if format::sniff(src)? == ImageFormat::VmdkFlat {
+        sources.push(vmdk::flat_extent_path(src)?);
+    }
+    let mut targets = vec![dst.to_path_buf()];
+    if fmt == ImageFormat::VmdkFlat {
+        targets.push(vmdk::flat_sibling(dst)?);
+    }
+    let sources: Vec<PathBuf> = sources.iter().map(|p| file_identity(p)).collect();
+    for t in targets.iter().map(|p| file_identity(p)) {
+        if sources.iter().any(|s| same_path(s, &t)) {
+            return Err(Error::Invalid(
+                "destination is the same file as the source".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Canonical form of a path that may not exist yet: the canonical file if it exists,
+/// else the canonical parent directory joined with the file name.
+fn file_identity(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::canonicalize(parent)
+                .map(|c| c.join(name))
+                .unwrap_or_else(|_| p.to_path_buf())
+        }
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Path equality; case-insensitive on Windows, where file names are.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
 }

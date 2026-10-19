@@ -84,13 +84,18 @@ fn file_name(path: &Path) -> Result<String> {
 
 // ------------------------------------------------------------------ flat
 
-pub(crate) fn create_flat(path: &Path, capacity: u64) -> Result<Box<dyn BlockDevice>> {
+/// The `<stem>-flat.vmdk` extent that [`create_flat`] writes next to descriptor `path`.
+pub(crate) fn flat_sibling(path: &Path) -> Result<PathBuf> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| Error::Invalid(format!("bad image path {}", path.display())))?;
-    let flat_name = format!("{stem}-flat.vmdk");
-    let flat_path = path.with_file_name(&flat_name);
+    Ok(path.with_file_name(format!("{stem}-flat.vmdk")))
+}
+
+pub(crate) fn create_flat(path: &Path, capacity: u64) -> Result<Box<dyn BlockDevice>> {
+    let flat_path = flat_sibling(path)?;
+    let flat_name = file_name(&flat_path)?;
     let dev = FileDevice::create(&flat_path, capacity)?;
     let sectors = capacity / 512;
     let text = descriptor(
@@ -134,6 +139,30 @@ fn parse_extent(line: &str) -> Result<Extent> {
 /// Open a text descriptor (`createType="monolithicFlat"`) and its single FLAT extent,
 /// resolved relative to the descriptor's directory.
 pub(crate) fn open_flat(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>> {
+    let (ext, extent_path) = read_flat_descriptor(path)?;
+    let ro = read_only || ext.access == "RDONLY";
+    let dev = FileDevice::open(&extent_path, ro)?;
+    let range = ext.offset.checked_mul(512).zip(ext.sectors.checked_mul(512));
+    let Some((off, len)) = range.filter(|(o, l)| o.checked_add(*l).is_some()) else {
+        return Err(Error::Parse("VMDK extent offset/size overflow".into()));
+    };
+    if off + len > dev.len() {
+        return Err(Error::Parse(format!(
+            "flat extent {} is shorter than the descriptor says",
+            extent_path.display()
+        )));
+    }
+    Ok(Box::new(SliceDevice::new(dev, off, len)?))
+}
+
+/// Path of the single FLAT extent a text descriptor refers to.
+pub(crate) fn flat_extent_path(path: &Path) -> Result<PathBuf> {
+    Ok(read_flat_descriptor(path)?.1)
+}
+
+/// Parse a `monolithicFlat` descriptor: its single FLAT extent and the extent's path,
+/// resolved relative to the descriptor's directory.
+fn read_flat_descriptor(path: &Path) -> Result<(Extent, PathBuf)> {
     let size = std::fs::metadata(path).map_err(|e| Error::io(0, 0, e))?.len();
     if size > MAX_DESCRIPTOR_FILE {
         return Err(Error::Parse(format!("VMDK descriptor file too large ({size} bytes)")));
@@ -148,10 +177,10 @@ pub(crate) fn open_flat(path: &Path, read_only: bool) -> Result<Box<dyn BlockDev
         .filter(|l| ["RW ", "RDONLY ", "NOACCESS "].iter().any(|p| l.starts_with(p)))
         .map(parse_extent)
         .collect::<Result<_>>()?;
-    let [ext] = extents.as_slice() else {
+    let count = extents.len();
+    let Ok([ext]) = <[Extent; 1]>::try_from(extents) else {
         return Err(Error::Unsupported(format!(
-            "VMDK descriptors with {} extents",
-            extents.len()
+            "VMDK descriptors with {count} extents"
         )));
     };
     if ext.kind != "FLAT" {
@@ -168,19 +197,7 @@ pub(crate) fn open_flat(path: &Path, read_only: bool) -> Result<Box<dyn BlockDev
             path.parent().unwrap_or(Path::new(".")).join(p)
         }
     };
-    let ro = read_only || ext.access == "RDONLY";
-    let dev = FileDevice::open(&extent_path, ro)?;
-    let range = ext.offset.checked_mul(512).zip(ext.sectors.checked_mul(512));
-    let Some((off, len)) = range.filter(|(o, l)| o.checked_add(*l).is_some()) else {
-        return Err(Error::Parse("VMDK extent offset/size overflow".into()));
-    };
-    if off + len > dev.len() {
-        return Err(Error::Parse(format!(
-            "flat extent {} is shorter than the descriptor says",
-            extent_path.display()
-        )));
-    }
-    Ok(Box::new(SliceDevice::new(dev, off, len)?))
+    Ok((ext, extent_path))
 }
 
 // ------------------------------------------------------------------ sparse
