@@ -499,3 +499,27 @@ fn ext_corrupt_never_panics() {
         }
     }
 }
+
+#[test]
+fn ext_huge_geometry_is_a_parse_error_not_an_overflow() {
+    use pm_core::{BlockDevice, FileDevice};
+    // a sparse ~600 GiB device; bpg = 1 makes a group per block, ipg and inode size maximal
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge.img");
+    let len: u64 = 600 << 30;
+    let mut dev = FileDevice::create(&path, len).unwrap();
+    let mut sb = vec![0u8; 1024];
+    put16(&mut sb, 56, 0xEF53);
+    put32(&mut sb, 24, 6); // 64 KiB blocks
+    put32(&mut sb, 4, (len / 65536) as u32);
+    put32(&mut sb, 20, 0);
+    put32(&mut sb, 32, 1);
+    put32(&mut sb, 40, 8 * 65536);
+    put32(&mut sb, 76, 1);
+    put16(&mut sb, 88, 32768);
+    dev.write_at(1024, &sb).unwrap();
+    assert!(matches!(Ext::open(Box::new(dev)), Err(Error::Parse(_))));
+    // the same through the crate's dispatching entry point
+    let dev = FileDevice::open(&path, true).unwrap();
+    assert!(pm_fs::open(Box::new(dev)).is_err());
+}

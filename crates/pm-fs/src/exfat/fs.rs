@@ -6,7 +6,7 @@ use crate::bitmap::UsedMap;
 use crate::traits::{Entry, FileSystem};
 use crate::util::read_padded;
 use pm_core::{BlockDevice, CancelToken, Error, FsKind, ProgressReport, ProgressSink, Result};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The spec limits a directory to 256 MiB.
 const MAX_DIR_BYTES: u64 = 256 << 20;
@@ -57,6 +57,9 @@ pub struct ExFat {
     /// `(first cluster, index, cluster)`: where the last FAT-chain lookup ended, so sequential
     /// reads of a fragmented file do not rewalk the chain from its start.
     cursor: Option<(u32, u64, u32)>,
+    /// ValidDataLength of the files handed out by `list` / `deleted_entries`, keyed by first
+    /// cluster, for those where it is below the data length. `Entry` has no field for it.
+    valid_len: HashMap<u32, u64>,
 }
 
 impl ExFat {
@@ -64,7 +67,7 @@ impl ExFat {
         let mut s0 = [0u8; 512];
         read_padded(&mut *dev, 0, &mut s0)?;
         let boot = ExFatBoot::parse(&s0, dev.len())?;
-        let mut fs = ExFat { dev, boot, label: String::new(), cursor: None };
+        let mut fs = ExFat { dev, boot, label: String::new(), cursor: None, valid_len: HashMap::new() };
         let root = Loc { first: fs.boot.root_cluster, nofat: false, clusters: 0 };
         if let Ok(bytes) = fs.read_dir_bytes(root) {
             if let Ok(p) = dir::parse(&bytes, false, false) {
@@ -178,8 +181,21 @@ impl ExFat {
         Ok(out)
     }
 
-    fn entry_of(&self, parent: &str, s: &FileSet, deleted: bool) -> Entry {
+    fn entry_of(&mut self, parent: &str, s: &FileSet, deleted: bool) -> Entry {
         let loc = Loc::of_set(s, self.cs());
+        if !s.is_dir() && s.first_cluster >= 2 {
+            let short = s.valid_len < s.data_len;
+            if !deleted {
+                if short {
+                    self.valid_len.insert(s.first_cluster, s.valid_len);
+                } else {
+                    self.valid_len.remove(&s.first_cluster);
+                }
+            } else if short {
+                // a deleted file never overrides a live file that reuses its first cluster
+                self.valid_len.entry(s.first_cluster).or_insert(s.valid_len);
+            }
+        }
         Entry {
             name: s.name.clone(),
             path: join(parent, &s.name),
@@ -306,7 +322,11 @@ impl FileSystem for ExFat {
         }
         let bytes = self.read_dir_bytes(Loc::from_id(d.id))?;
         let parsed = dir::parse(&bytes, true, false)?;
-        Ok(parsed.sets.iter().map(|s| self.entry_of(&d.path, s, false)).collect())
+        let mut out = Vec::with_capacity(parsed.sets.len());
+        for s in &parsed.sets {
+            out.push(self.entry_of(&d.path, s, false));
+        }
+        Ok(out)
     }
 
     fn read_file(&mut self, e: &Entry, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -318,17 +338,30 @@ impl FileSystem for ExFat {
         }
         let want = (buf.len() as u64).min(e.size - offset) as usize;
         let loc = self.effective(Loc::from_id(e.id), e);
+        if loc.nofat {
+            // the whole contiguous run must lie in the cluster heap
+            let end = (loc.first as u64).checked_add(loc.clusters);
+            if loc.first < 2 || end.is_none_or(|x| x > self.boot.cluster_count as u64 + 2) {
+                return Err(Error::Parse(format!(
+                    "contiguous stream of {} clusters at cluster {} leaves the heap",
+                    loc.clusters, loc.first
+                )));
+            }
+        }
+        // bytes at or beyond ValidDataLength read as zeros
+        let valid = self.valid_len.get(&loc.first).copied().unwrap_or(u64::MAX).min(e.size);
+        let disk = valid.saturating_sub(offset).min(want as u64) as usize;
         let cs = self.cs();
         let mut done = 0usize;
-        while done < want {
+        while done < disk {
             let pos = offset + done as u64;
             let idx = pos / cs;
             let within = pos % cs;
             let c = self.cluster_at(loc, idx)?;
-            let mut n = ((want - done) as u64).min(cs - within);
+            let mut n = ((disk - done) as u64).min(cs - within);
             if loc.nofat {
                 // a contiguous stream: read across cluster boundaries in one go
-                n = ((want - done) as u64).min((loc.clusters - idx) * cs - within);
+                n = ((disk - done) as u64).min((loc.clusters - idx) * cs - within);
             }
             let at = self.boot.cluster_offset(c)? + within;
             if at.checked_add(n).is_none_or(|end| end > self.dev.len()) {
@@ -337,6 +370,7 @@ impl FileSystem for ExFat {
             self.dev.read_at(at, &mut buf[done..done + n as usize])?;
             done += n as usize;
         }
+        buf[disk..want].fill(0);
         Ok(want)
     }
 

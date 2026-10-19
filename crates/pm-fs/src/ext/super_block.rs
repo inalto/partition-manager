@@ -128,7 +128,10 @@ impl SuperBlock {
         }
         // every group's inode table is part of the filesystem; this also bounds a scan of all of
         // them by the device length
-        let tables = groups * ipg as u64 * inode_size as u64;
+        let tables = groups
+            .checked_mul(ipg as u64)
+            .and_then(|t| t.checked_mul(inode_size as u64))
+            .ok_or_else(|| bad("inode table size overflows"))?;
         if tables > total {
             return Err(bad("inode tables are larger than the filesystem"));
         }

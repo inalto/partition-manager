@@ -16,6 +16,8 @@ pub struct FileSet {
     /// Stream flag `NoFatChain`: the clusters are contiguous.
     pub nofat: bool,
     pub data_len: u64,
+    /// ValidDataLength: bytes at or beyond it read as zeros (never above `data_len`).
+    pub valid_len: u64,
     pub name: String,
 }
 
@@ -142,6 +144,7 @@ fn build(bytes: &[u8], i: usize, stream: usize, names: &[usize], in_use: bool) -
         first_cluster: le32(s, 20),
         nofat: s[1] & 0x02 != 0,
         data_len: le64(s, 24),
+        valid_len: le64(s, 8).min(le64(s, 24)),
         name: utf16(&units),
     })
 }

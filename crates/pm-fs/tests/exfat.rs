@@ -409,3 +409,75 @@ fn exfat_used_map_bitmap_spans_clusters() {
         assert!(m.is_used(0) && m.is_used(heap as u64 - 1));
     }
 }
+
+/// Offsets of the stream-extension entries in the root directory of the default image.
+fn stream_off(b: &Built, entry_index: usize) -> usize {
+    coff(b, 4) as usize + 32 * entry_index
+}
+
+#[test]
+fn exfat_contiguous_run_must_stay_in_the_heap() {
+    // heap at sector 260 leaves 2 KiB of volume slack after the last cluster
+    for (first, why) in [(None, "run past the heap end"), (Some(1u32), "cluster below 2")] {
+        let mut built = build(&ExOpts { heap_sectors: 260 });
+        let s = stream_off(&built, 4); // hello.txt stream (label, bitmap, up-case, primary, stream)
+        assert_eq!(built.image[s], 0xC0);
+        put32(&mut built.image, s + 20, first.unwrap_or(built.cluster_count + 1)); // last cluster
+        let mut fs = open_image(built.image);
+        let root = fs.root();
+        let list = fs.list(&root).unwrap();
+        let hello = find(&list, "hello.txt");
+        assert_eq!(hello.size, 6000);
+        let mut buf = vec![0u8; 6000];
+        assert!(matches!(fs.read_file(hello, 0, &mut buf), Err(Error::Parse(_))), "{why}");
+        assert!(matches!(fs.read_file(hello, 5000, &mut buf), Err(Error::Parse(_))), "{why}");
+    }
+}
+
+#[test]
+fn exfat_valid_data_length_zero_fills_the_tail() {
+    let mut built = build(&ExOpts::default());
+    // hello.txt (contiguous) valid up to 5000, stale 0xAA beyond
+    let s = stream_off(&built, 4);
+    put64(&mut built.image, s + 8, 5000);
+    let c5 = coff(&built, 5) as usize;
+    built.image[c5 + 5000..c5 + 6000].fill(0xAA);
+    // frag.bin (FAT chain) valid up to 4100, stale beyond in the 2nd and 3rd clusters
+    let f = stream_off(&built, 7);
+    assert_eq!(built.image[f], 0xC0);
+    put64(&mut built.image, f + 8, 4100);
+    let c10 = coff(&built, 10) as usize;
+    built.image[c10 + 4..c10 + CS].fill(0xAA);
+    // deleted gone.txt valid up to 40
+    let g = stream_off(&built, 21);
+    assert_eq!(built.image[g], 0x40);
+    put64(&mut built.image, g + 8, 40);
+    let c18 = coff(&built, 18) as usize;
+    built.image[c18 + 40..c18 + 80].fill(0xAA);
+
+    let (hello_data, frag_data, gone_data) = (built.hello.clone(), built.frag.clone(), built.gone.clone());
+    let mut fs = open_image(built.image);
+    let root = fs.root();
+    let list = fs.list(&root).unwrap();
+
+    let mut want = hello_data;
+    want[5000..].fill(0);
+    assert_eq!(read_all(&mut fs, find(&list, "hello.txt")), want);
+    let mut buf = vec![0u8; 20];
+    assert_eq!(fs.read_file(find(&list, "hello.txt"), 4990, &mut buf).unwrap(), 20);
+    assert_eq!(&buf[..10], &want[4990..5000]);
+    assert!(buf[10..].iter().all(|&b| b == 0));
+    // a read wholly past the valid length is all zeros
+    assert_eq!(fs.read_file(find(&list, "hello.txt"), 5500, &mut buf).unwrap(), 20);
+    assert!(buf.iter().all(|&b| b == 0));
+
+    let mut want = frag_data;
+    want[4100..].fill(0);
+    assert_eq!(read_all(&mut fs, find(&list, "frag.bin")), want);
+
+    let del = fs.deleted_entries(&NullProgress, &CancelToken::new()).unwrap();
+    let gone = del.iter().find(|e| e.name == "gone.txt").unwrap();
+    let mut want = gone_data;
+    want[40..].fill(0);
+    assert_eq!(read_all(&mut fs, gone), want);
+}
