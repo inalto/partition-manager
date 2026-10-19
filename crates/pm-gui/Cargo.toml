@@ -22,9 +22,6 @@ eframe.workspace = true
 egui_extras.workspace = true
 log.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Console"] }
-
 [build-dependencies]
 embed-resource.workspace = true
 

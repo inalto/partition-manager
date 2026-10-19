@@ -3,6 +3,7 @@
 // Release builds are GUI-subsystem executables (no console window); debug builds keep the
 // console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![forbid(unsafe_code)]
 
 use pm_gui::args::{self, USAGE};
 use std::process::ExitCode;
@@ -10,11 +11,7 @@ use std::process::ExitCode;
 /// GUI-subsystem executables have no console: borrow the parent's, if any, so `--help` and
 /// argument errors are visible when started from a terminal.
 fn attach_console() {
-    #[cfg(windows)]
-    // SAFETY: plain Win32 call without pointers; failure (no parent console) is harmless.
-    unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
-    }
+    pm_platform::console::attach_parent_console();
 }
 
 fn main() -> ExitCode {

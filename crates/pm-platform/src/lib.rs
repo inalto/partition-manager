@@ -4,8 +4,10 @@
 //! real implementation (Windows) or [`NullPlatform`] elsewhere; [`MockPlatform`] backs the tests.
 
 pub mod aligned;
+pub mod console;
 pub mod file_platform;
 pub mod mock;
+pub mod shell;
 pub mod traits;
 #[cfg(windows)]
 pub mod windows;

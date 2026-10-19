@@ -4,6 +4,8 @@
 //! in their own modules and are unit-tested; [`app::AppState`] holds the state and applies
 //! [`app::Cmd`]s, while `views` and `dialogs` only draw and emit commands.
 
+#![forbid(unsafe_code)]
+
 pub mod actions;
 pub mod app;
 pub mod args;

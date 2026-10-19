@@ -48,13 +48,8 @@ pub enum Dialog {
     Error(String),
     /// Apply confirmation; `allow_system` relaxes the executor's system-disk guard for the
     /// non-destructive family (resize, letter, label, mount).
-    Confirm {
-        allow_system: bool,
-        /// Per queued operation: destructive in the model it will run on.
-        destructive: Vec<bool>,
-        /// Per queued operation: touches the running system disk.
-        system: Vec<bool>,
-    },
+    /// The destructive / system-disk flags are recomputed from the live queue every frame.
+    Confirm { allow_system: bool },
     WipeMethod { disk: u32, method: WipeMethod },
     MountLetter { volume: VolumeId, letters: Vec<char>, choice: Option<char> },
     Unmount { volume: VolumeId, mount_points: Vec<String>, choice: usize },
@@ -131,6 +126,9 @@ pub struct AppState {
     /// Disk whose properties window is open.
     pub properties: Option<u32>,
     pub tool: Option<Tool>,
+    /// The next successful refresh drops the pending operations instead of rebasing them
+    /// (set after a failed Apply, when some of them may already have been written).
+    pub reset_on_refresh: bool,
 }
 
 impl AppState {
@@ -153,6 +151,7 @@ impl AppState {
             dialog: None,
             properties: None,
             tool: None,
+            reset_on_refresh: false,
         };
         s.start_refresh();
         s
@@ -223,7 +222,13 @@ impl AppState {
             (JobKind::Refresh, Ok(JobOutput::Model(m))) => {
                 self.loaded = true;
                 self.banner = None;
-                let dropped = rebase(&mut self.queue, m);
+                let dropped = if std::mem::take(&mut self.reset_on_refresh) {
+                    let n = self.queue.len();
+                    self.queue.reset(m);
+                    n
+                } else {
+                    rebase(&mut self.queue, m)
+                };
                 if dropped > 0 {
                     self.toast(format!("{dropped} pending operation(s) no longer apply and were removed"));
                 }
@@ -253,7 +258,16 @@ impl AppState {
                 self.selected = self.selected.revalidate(self.queue.preview());
                 self.dialog = Some(Dialog::Report { report, dry_run, note });
             }
-            (JobKind::Apply { .. }, Err(e)) => self.error(format!("Apply failed: {e}")),
+            (JobKind::Apply { dry_run }, Err(e)) => {
+                self.error(format!("Apply failed: {e}"));
+                if !dry_run {
+                    // Some operations may have written before the failure (or the worker
+                    // panicked): re-read the disks and drop the queue rather than rebase it,
+                    // so nothing already applied is queued again.
+                    self.reset_on_refresh = true;
+                    self.start_refresh();
+                }
+            }
             (_, Ok(other)) => log::warn!("unexpected job output {other:?}"),
         }
     }
@@ -319,18 +333,15 @@ impl AppState {
             }
             Cmd::Apply => {
                 if !self.queue.is_empty() && !self.busy() {
-                    let ops = self.queue.ops();
-                    let sys = self.system_disk_ops();
-                    self.dialog = Some(Dialog::Confirm {
-                        allow_system: false,
-                        destructive: destructive_flags(self.queue.base(), ops),
-                        system: (0..ops.len()).map(|i| sys.contains(&i)).collect(),
-                    });
+                    self.dialog = Some(Dialog::Confirm { allow_system: false });
                 }
             }
             Cmd::ConfirmApply { allow_system } => {
-                self.dialog = None;
-                self.start_apply(allow_system);
+                // only from the confirmation the user is looking at
+                if matches!(self.dialog, Some(Dialog::Confirm { .. })) {
+                    self.dialog = None;
+                    self.start_apply(allow_system);
+                }
             }
             Cmd::Undo => {
                 if !self.busy() {
@@ -344,7 +355,12 @@ impl AppState {
                     self.selected = self.selected.revalidate(self.queue.preview());
                 }
             }
-            Cmd::Refresh => self.start_refresh(),
+            // a refresh rebases the queue: never under an open dialog (e.g. the confirmation)
+            Cmd::Refresh => {
+                if self.dialog.is_none() {
+                    self.start_refresh();
+                }
+            }
             Cmd::CancelJob => {
                 if let Some(j) = &self.job {
                     j.handle.cancel();
@@ -368,11 +384,7 @@ impl AppState {
 
 /// Open the system file browser on `path` (detached; never waits for it).
 fn explore(state: &mut AppState, path: &str) {
-    #[cfg(windows)]
-    let r = std::process::Command::new("explorer.exe").arg(path).spawn().map(|_| ());
-    #[cfg(not(windows))]
-    let r = std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ());
-    if let Err(e) = r {
+    if let Err(e) = pm_platform::shell::open_in_file_manager(std::path::Path::new(path)) {
         state.toast(format!("Cannot open {path}: {e}"));
     }
 }
@@ -572,6 +584,51 @@ mod tests {
             Operation::DeletePartition { disk: 1, number: 3 },
         ];
         assert_eq!(destructive_flags(&base, &ops), [false, false, true, true]);
+    }
+
+    #[test]
+    fn confirm_apply_without_the_dialog_does_nothing() {
+        let mut s = mock_state();
+        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        s.handle(Cmd::ConfirmApply { allow_system: true });
+        assert!(s.job.is_none(), "no Apply without the confirmation");
+        assert_eq!(s.queue.len(), 1);
+        // with another dialog open it is refused as well
+        s.dialog = Some(Dialog::Error("x".into()));
+        s.handle(Cmd::ConfirmApply { allow_system: false });
+        assert!(s.job.is_none());
+        assert!(matches!(s.dialog, Some(Dialog::Error(_))));
+        assert_eq!(s.queue.len(), 1);
+    }
+
+    #[test]
+    fn refresh_is_refused_while_a_dialog_is_open() {
+        let mut s = mock_state();
+        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        s.handle(Cmd::Apply);
+        assert!(matches!(s.dialog, Some(Dialog::Confirm { .. })));
+        s.handle(Cmd::Refresh);
+        assert!(s.job.is_none(), "no refresh (and no rebase) under the confirmation");
+        s.handle(Cmd::CloseDialog);
+        s.handle(Cmd::Refresh);
+        assert!(s.busy());
+        wait_idle(&mut s);
+        assert_eq!(s.queue.len(), 1, "rebased, still valid");
+    }
+
+    #[test]
+    fn failed_apply_refreshes_and_drops_the_queue() {
+        let mut s = mock_state();
+        s.handle(Cmd::Action(Action::DeletePartition, Selected::Partition(0, 6)));
+        assert_eq!(s.queue.len(), 1);
+        // a worker that dies mid-Apply ("job stopped unexpectedly")
+        let handle = spawn_job("Applying changes", |_p, _c| panic!("worker died"));
+        s.job = Some(RunningJob { kind: JobKind::Apply { dry_run: false }, handle });
+        wait_idle(&mut s); // the Apply error, then the refresh it starts
+        assert!(matches!(&s.dialog, Some(Dialog::Error(m)) if m.contains("Apply failed")));
+        assert!(s.queue.is_empty(), "queue reset on the re-read disks, not rebased");
+        assert!(!s.reset_on_refresh);
+        assert_eq!(s.preview().disks.len(), 2);
     }
 
     #[test]

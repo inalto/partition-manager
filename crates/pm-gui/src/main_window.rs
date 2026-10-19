@@ -69,10 +69,13 @@ impl PartitionApp {
                 ui.add_enabled_ui(enabled, |ui| disk_map::show(ui, s, &mut cmds));
             });
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(b) = &s.banner {
-                banner(ui, b, &mut cmds);
-            }
-            ui.add_enabled_ui(enabled, |ui| disk_table::show(ui, s, &mut cmds));
+            ui.add_enabled_ui(enabled, |ui| {
+                // inside the enabled scope: Retry must not start a refresh under a modal
+                if let Some(b) = &s.banner {
+                    banner(ui, b, &mut cmds);
+                }
+                disk_table::show(ui, s, &mut cmds)
+            });
         });
 
         if s.modal() {

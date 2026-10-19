@@ -2,7 +2,7 @@
 //! the running system disk is involved, Cancel / Apply.
 
 use super::modal_window;
-use crate::app::{AppState, Cmd};
+use crate::app::{destructive_flags, AppState, Cmd};
 use crate::theme::DANGER;
 use crate::views::icons;
 use eframe::egui::{self, Color32, RichText};
@@ -11,12 +11,14 @@ pub fn show(
     ctx: &egui::Context,
     s: &AppState,
     allow_system: &mut bool,
-    destructive: &[bool],
-    system: &[bool],
     out: &mut Vec<Cmd>,
 ) -> bool {
     let mut keep = true;
     let ops = s.queue.ops();
+    // recomputed every frame from the live queue: in-memory simulation of a short list
+    let destructive = destructive_flags(s.queue.base(), ops);
+    let sys = s.system_disk_ops();
+    let system: Vec<bool> = (0..ops.len()).map(|i| sys.contains(&i)).collect();
     let title = if s.dry_run { "Apply (dry run)" } else { "Apply pending operations" };
     modal_window(title).show(ctx, |ui| {
         ui.set_max_width(560.0);

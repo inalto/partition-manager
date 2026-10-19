@@ -27,9 +27,7 @@ pub(crate) fn modal_window(title: impl Into<egui::WidgetText>) -> egui::Window<'
 pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<Cmd>) -> bool {
     match dlg {
         Dialog::Error(msg) => message(ctx, "Cannot do that", msg, out),
-        Dialog::Confirm { allow_system, destructive, system } => {
-            confirm::show(ctx, s, allow_system, destructive, system, out)
-        }
+        Dialog::Confirm { allow_system } => confirm::show(ctx, s, allow_system, out),
         Dialog::WipeMethod { disk, method } => wipe_method(ctx, *disk, method, out),
         Dialog::MountLetter { volume, letters, choice } => {
             let mut keep = true;
