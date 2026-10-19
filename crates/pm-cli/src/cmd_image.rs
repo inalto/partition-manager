@@ -2,14 +2,15 @@
 //! back to a device, and convert between image formats.
 
 use crate::cli::{CliError, CopyMode};
-use crate::cmd_clone::{copy_device, existing_canonical, summary};
-use crate::device_arg::{open_spec, Identity, Opened};
+use crate::cmd_clone::{copy_device, copy_planned, existing_canonical, open_checked, plan_used_map, summary, SharedSource};
+use crate::device_arg::{open_spec, vmdk_extent_files};
+use crate::partial::Partial;
 use crate::progress::StderrProgress;
-use pm_core::{align_up, CancelToken, Error};
+use pm_core::{align_up, BlockDevice, CancelToken, Error};
 use pm_image::{CreateOpts, ImageFormat};
 use pm_platform::{OpenMode, Platform};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn write_err(e: std::io::Error) -> CliError {
@@ -26,15 +27,20 @@ fn pick_format(explicit: Option<ImageFormat>, file: &Path) -> Result<ImageFormat
     })
 }
 
-/// Creating `file` truncates it, so refuse before that when it is the file `src` is read from.
-fn refuse_source_overwrite(src: &Identity, file: &Path) -> Result<(), CliError> {
-    match (existing_canonical(file), src) {
-        (Some(c), Identity::File(s)) if &c == s => Err(CliError::Usage(format!(
-            "'{}' is the source itself; refusing to overwrite it",
-            file.display()
-        ))),
-        _ => Ok(()),
+/// Refuse when any file the output would create or replace is one of the files `read_from`
+/// is being read from (the output is written before the source is fully read).
+fn refuse_source_overwrite(read_from: &[PathBuf], written: &[PathBuf]) -> Result<(), CliError> {
+    for w in written {
+        if let Some(c) = existing_canonical(w) {
+            if read_from.contains(&c) {
+                return Err(CliError::Usage(format!(
+                    "'{}' is (part of) the source itself; refusing to overwrite it",
+                    w.display()
+                )));
+            }
+        }
     }
+    Ok(())
 }
 
 pub fn run_image(
@@ -52,22 +58,37 @@ pub fn run_image(
     if len == 0 {
         return Err(CliError::Usage("the source is empty; nothing to image".into()));
     }
-    refuse_source_overwrite(&source.identity, file)?;
+    let partial = Partial::new(file, fmt);
+    refuse_source_overwrite(&source.source_files(), &partial.files_written())?;
+
+    // Everything that can be refused is refused before any output file is touched.
+    let mut shared = SharedSource::new(source.dev);
+    let used = plan_used_map(&shared, mode)?;
 
     let start = Instant::now();
-    let dev = pm_image::create(
-        file,
-        &CreateOpts {
-            format: fmt,
-            capacity: align_up(len, 512),
-            sparse: true,
-        },
-    )?;
-    let identity = Identity::File(std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()));
-    let range = (0, dev.len());
-    let target = Opened { dev, identity, range };
-    let (copied, smart) = copy_device(source, target, 0, mode, cancel)?;
-    writeln!(out, "{}", summary("Imaged", copied, start.elapsed(), smart))
+    let written = (|| -> Result<u64, CliError> {
+        let mut dev = pm_image::create(
+            partial.path(),
+            &CreateOpts {
+                format: fmt,
+                capacity: align_up(len, 512),
+                sparse: true,
+            },
+        )?;
+        copy_planned(&mut shared, used.as_ref(), &mut *dev, 0, cancel)
+        // `dev` is closed here, before the rename
+    })();
+    let copied = match written {
+        Ok(n) => {
+            partial.commit()?;
+            n
+        }
+        Err(e) => {
+            partial.discard();
+            return Err(e);
+        }
+    };
+    writeln!(out, "{}", summary("Imaged", copied, start.elapsed(), used.is_some()))
         .and_then(|_| writeln!(out, "Wrote {} ({})", file.display(), fmt.display()))
         .map_err(write_err)
 }
@@ -80,8 +101,7 @@ pub fn run_restore(
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let source = open_spec(platform, file, OpenMode::ReadOnly)?;
-    let target = open_spec(platform, dst, OpenMode::ReadWrite)?;
+    let (source, target) = open_checked(platform, file, dst, dst_offset)?;
     let start = Instant::now();
     let (copied, smart) = copy_device(source, target, dst_offset, CopyMode::Sector, cancel)?;
     writeln!(out, "{}", summary("Restored", copied, start.elapsed(), smart)).map_err(write_err)
@@ -98,11 +118,20 @@ pub fn run_convert(
     if !input.is_file() {
         return Err(CliError::Usage(format!("image file '{}' does not exist", input.display())));
     }
-    refuse_source_overwrite(&Identity::File(std::fs::canonicalize(input).map_err(|e| {
-        CliError::Runtime(Error::io(0, 0, e))
-    })?), output)?;
+    let canonical = std::fs::canonicalize(input).map_err(write_err)?;
+    let mut read_from = vmdk_extent_files(input);
+    read_from.push(canonical);
+    let partial = Partial::new(output, fmt);
+    refuse_source_overwrite(&read_from, &partial.files_written())?;
+
     let start = Instant::now();
-    pm_image::convert(input, output, fmt, &StderrProgress::new(), cancel)?;
+    match pm_image::convert(input, partial.path(), fmt, &StderrProgress::new(), cancel) {
+        Ok(()) => partial.commit()?,
+        Err(e) => {
+            partial.discard();
+            return Err(e.into());
+        }
+    }
     writeln!(
         out,
         "Converted {} to {} ({}) in {:.1}s",

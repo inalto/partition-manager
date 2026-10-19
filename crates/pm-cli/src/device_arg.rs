@@ -36,18 +36,105 @@ pub struct Opened {
     pub identity: Identity,
     /// The byte range of `identity` that `dev` covers (all of it unless a partition).
     pub range: (u64, u64),
+    /// `(disk index, start, end)`: where `dev` lives on a physical disk, when known. Set for
+    /// disks and their partitions, and for volumes the platform places on a disk, so a volume
+    /// and the disk (or partition) it sits on can be recognised as the same storage.
+    pub disk_extent: Option<(u32, u64, u64)>,
+    /// Canonical paths of further files the data is stored in (the flat extent of a VMDK
+    /// descriptor).
+    pub files: Vec<PathBuf>,
+}
+
+fn ranges_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 < b.1 && b.0 < a.1
 }
 
 impl Opened {
-    /// Whether writing `len` bytes at `offset` of `self` would touch `other`'s byte range.
-    pub fn overlaps(&self, offset: u64, len: u64, other: &Opened) -> bool {
-        if self.identity != other.identity {
-            return false;
+    /// Every file this device reads from: the file itself plus its dependent extents.
+    pub fn source_files(&self) -> Vec<PathBuf> {
+        let mut v = self.files.clone();
+        if let Identity::File(p) = &self.identity {
+            v.push(p.clone());
         }
-        let start = self.range.0.saturating_add(offset);
-        let end = start.saturating_add(len);
-        start < other.range.1 && other.range.0 < end
+        v
     }
+
+    /// The physical disk this device is on, if known.
+    pub fn disk_index(&self) -> Option<u32> {
+        self.disk_extent.map(|e| e.0)
+    }
+
+    /// Whether writing `len` bytes at `offset` of `self` would touch the storage `other`
+    /// covers: the same disk / volume / file range (the bytes written), overlapping extents of
+    /// one physical disk (a volume against its disk or a partition), or a file against
+    /// another file's extent.
+    pub fn overlaps(&self, offset: u64, len: u64, other: &Opened) -> bool {
+        let start = self.range.0.saturating_add(offset);
+        let window = (start, start.saturating_add(len));
+        if self.identity == other.identity {
+            return ranges_overlap(window, other.range);
+        }
+        // Different handles on one physical disk (a volume and its disk, a volume and a
+        // partition): compare whole extents, not just the bytes about to be written, so a copy
+        // never lands in a device that contains (or is contained by) the other one.
+        if let (Some(a), Some(b)) = (self.disk_extent, other.disk_extent) {
+            if a.0 == b.0 && ranges_overlap((a.1, a.2), (b.1, b.2)) {
+                return true;
+            }
+        }
+        match (&self.identity, &other.identity) {
+            (Identity::File(a), Identity::File(b)) => self.files.contains(b) || other.files.contains(a),
+            _ => false,
+        }
+    }
+}
+
+/// Canonical paths of the extent files a VMDK text descriptor at `path` refers to (empty for
+/// every other file).
+pub fn vmdk_extent_files(path: &Path) -> Vec<PathBuf> {
+    use std::io::Read;
+    const SIGNATURE: &str = "# Disk DescriptorFile";
+    let mut head = Vec::new();
+    if std::fs::File::open(path).and_then(|f| f.take(1 << 20).read_to_end(&mut head)).is_err() {
+        return Vec::new();
+    }
+    let Ok(text) = String::from_utf8(head) else {
+        return Vec::new();
+    };
+    if !text.starts_with(SIGNATURE) {
+        return Vec::new();
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    text.lines()
+        .map(str::trim)
+        .filter(|l| ["RW ", "RDONLY ", "NOACCESS "].iter().any(|p| l.starts_with(p)))
+        .filter_map(|l| {
+            let (a, b) = (l.find('"')?, l.rfind('"')?);
+            (b > a).then(|| &l[a + 1..b])
+        })
+        .filter_map(|name| {
+            let p = PathBuf::from(name);
+            let p = if p.is_absolute() { p } else { dir.join(p) };
+            std::fs::canonicalize(p).ok()
+        })
+        .collect()
+}
+
+/// Where the volume `id` lives on a physical disk, according to the platform.
+fn volume_extent(p: &dyn Platform, id: &VolumeId) -> Option<(u32, u64, u64)> {
+    if let Ok(vols) = p.enumerate_volumes() {
+        if let Some(v) = vols.iter().find(|v| &v.id == id) {
+            if let (Some(d), true) = (v.disk, v.len > 0) {
+                return Some((d, v.start, v.start.saturating_add(v.len)));
+            }
+        }
+    }
+    p.enumerate_disks().ok()?.into_iter().find_map(|d| {
+        d.partitions
+            .iter()
+            .find(|part| part.volume.as_ref() == Some(id))
+            .map(|part| (d.index, part.start, part.end()))
+    })
 }
 
 /// `D:` / `D:\` -> `Some('D')`.
@@ -167,10 +254,12 @@ pub fn open_device(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -> Result<Bo
 /// the byte range it covers (see [`Opened`]). Partitions are bounds-checked slices of their
 /// parent, located through `pm_parttable::read_table`.
 pub fn open_device_with_slice(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -> Result<Opened> {
-    let whole = |dev: Box<dyn BlockDevice>, identity: Identity| Opened {
+    let whole = |dev: Box<dyn BlockDevice>, identity: Identity, disk_extent: Option<(u32, u64, u64)>| Opened {
         range: (0, dev.len()),
         dev,
         identity,
+        disk_extent,
+        files: Vec::new(),
     };
     match a {
         DeviceArg::Disk(i) => {
@@ -182,7 +271,8 @@ pub fn open_device_with_slice(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -
                     e
                 }
             })?;
-            Ok(whole(dev, Identity::Disk(*i)))
+            let len = dev.len();
+            Ok(whole(dev, Identity::Disk(*i), Some((*i, 0, len))))
         }
         DeviceArg::Volume(v) => {
             let id = resolve_volume(p, v)?;
@@ -194,13 +284,16 @@ pub fn open_device_with_slice(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -
                     e
                 }
             })?;
-            Ok(whole(dev, Identity::Volume(id.0)))
+            let extent = volume_extent(p, &id);
+            Ok(whole(dev, Identity::Volume(id.0), extent))
         }
         // Any image format pm-image understands (raw, VHD, VMDK, qcow2), detected by content.
         DeviceArg::File(path) => {
             let dev = pm_image::open(path, mode == OpenMode::ReadOnly)?;
             let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            Ok(whole(dev, Identity::File(canonical)))
+            let mut opened = whole(dev, Identity::File(canonical), None);
+            opened.files = vmdk_extent_files(path);
+            Ok(opened)
         }
         DeviceArg::Partition(parent, number) => {
             let mut parent = open_device_with_slice(p, parent, mode)?;
@@ -219,6 +312,8 @@ pub fn open_device_with_slice(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -
                 dev: Box::new(slice),
                 identity: parent.identity,
                 range: (parent.range.0 + start, parent.range.0 + start + len),
+                disk_extent: parent.disk_extent.map(|(d, s, _)| (d, s + start, s + start + len)),
+                files: parent.files,
             })
         }
     }
@@ -305,7 +400,13 @@ mod tests {
 
     #[test]
     fn overlap_rules() {
-        let mk = |id: Identity, range| Opened { dev: Box::new(MemDevice::new(0)), identity: id, range };
+        let mk = |id: Identity, range| Opened {
+            dev: Box::new(MemDevice::new(0)),
+            identity: id,
+            range,
+            disk_extent: None,
+            files: Vec::new(),
+        };
         let f = |s: &str| Identity::File(PathBuf::from(s));
         let whole = mk(f("a"), (0, 100));
         let other = mk(f("b"), (0, 100));

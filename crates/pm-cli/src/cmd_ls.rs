@@ -3,6 +3,7 @@
 
 use crate::cli::CliError;
 use crate::device_arg::open_spec;
+use crate::partial::path_err;
 use pm_core::{format_size, CancelToken, Error};
 use pm_fs::{Entry, FileSystem};
 use pm_platform::{OpenMode, Platform};
@@ -15,14 +16,6 @@ const MAX_DEPTH: usize = 64;
 
 fn out_err(e: std::io::Error) -> CliError {
     CliError::Runtime(Error::io(0, 0, e))
-}
-
-/// A local file system failure, keeping the path in the message.
-fn path_err(path: &Path, e: std::io::Error) -> CliError {
-    CliError::Runtime(Error::Platform {
-        code: e.raw_os_error().unwrap_or(0) as u32,
-        msg: format!("{}: {e}", path.display()),
-    })
 }
 
 fn open_fs(platform: &dyn Platform, device: &str) -> Result<Box<dyn FileSystem>, CliError> {

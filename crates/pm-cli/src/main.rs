@@ -13,6 +13,7 @@ mod cmd_probe;
 mod cmd_rescue;
 mod cmd_table;
 mod device_arg;
+mod partial;
 mod progress;
 
 use clap::Parser;

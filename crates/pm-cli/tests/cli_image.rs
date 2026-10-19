@@ -262,7 +262,7 @@ fn cli_rescue_on_file_writes_mapfile() {
     make_pattern_raw(&src, 4 * MIB);
     FileDevice::create(&dst, 4 * MIB).unwrap();
 
-    let out = pm(&["rescue", s(&src), s(&dst), s(&map), "-b", "64K", "-r", "1"]);
+    let out = pm(&["rescue", s(&src), s(&dst), s(&map), "-b", "512", "-c", "128", "-r", "1"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(stdout(&out).contains("Rescued"), "{}", stdout(&out));
     assert_eq!(read_all(&dst), read_all(&src));
@@ -274,7 +274,7 @@ fn cli_rescue_on_file_writes_mapfile() {
     assert!(m.blocks.iter().all(|b| b.2 == pm_image::BlockStatus::Finished), "{:?}", m.blocks);
 
     // resuming from the finished mapfile succeeds and changes nothing
-    let out = pm(&["rescue", s(&src), s(&dst), s(&map), "-R", "-n", "-N"]);
+    let out = pm(&["rescue", s(&src), s(&dst), s(&map), "-R", "-n", "-N", "-K", "64K"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(read_all(&dst), read_all(&src));
 }
@@ -314,10 +314,15 @@ fn cli_rescue_refuses_unsafe_arguments() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(read_all(&big).iter().all(|&b| b == 0));
     // sizes are validated
-    let out = pm(&["rescue", s(&src), s(&big), s(&map), "-b", "xyz"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    let out = pm(&["rescue", s(&src), s(&big), s(&map), "-b", "0"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    for bad in [["-b", "xyz"], ["-b", "0"], ["-b", "100"], ["-c", "0"], ["-c", "1M"], ["-c", "4294967295"]] {
+        let out = pm(&["rescue", s(&src), s(&big), s(&map), bad[0], bad[1]]);
+        assert_eq!(out.status.code(), Some(1), "{bad:?}: {}", stderr(&out));
+    }
+    // the long forms exist and --no-trim / --no-scrape are the ddrescue letters' long names
+    let help = stdout(&pm(&["rescue", "--help"]));
+    for needle in ["-b, --sector-size", "-c, --cluster-size", "-K, --skip-size", "-r, --retries", "-R, --reverse", "-n, --no-scrape", "-N, --no-trim"] {
+        assert!(help.contains(needle), "missing {needle}: {help}");
+    }
     // a mapfile of another size cannot be resumed
     std::fs::write(&map, "# Mapfile.
 0x0  ?  1
@@ -607,4 +612,92 @@ fn cli_image_smart_fat32_to_qcow2_is_sparse_and_browsable() {
     let out = pm(&["restore", s(&img), s(&back)]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(read_all(&back), read_all(&src));
+}
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn cli_image_failure_keeps_existing_output_and_leaves_no_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("plain.raw");
+    let out_img = dir.path().join("keep.qcow2");
+    make_pattern_raw(&src, 4 * MIB);
+    std::fs::write(&out_img, b"precious existing image").unwrap();
+
+    // --smart on something that is not a filesystem fails before the output is touched
+    let out = pm(&["image", s(&src), s(&out_img), "--smart"]);
+    assert!(!out.status.success());
+    assert_eq!(read_all(&out_img), b"precious existing image");
+    assert_eq!(file_names(dir.path()), ["keep.qcow2", "plain.raw"]);
+
+    // a successful run replaces it and leaves no .partial behind
+    let out = pm(&["image", s(&src), s(&out_img), "--sector"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(identify(&out_img).unwrap(), ImageFormat::Qcow2);
+    assert_eq!(file_names(dir.path()), ["keep.qcow2", "plain.raw"]);
+
+    // a failure after the copy (the final name is a directory) removes the partial file
+    let blocked = dir.path().join("blocked.qcow2");
+    std::fs::create_dir(&blocked).unwrap();
+    let out = pm(&["image", s(&src), s(&blocked), "--sector"]);
+    assert!(!out.status.success());
+    assert!(blocked.is_dir());
+    assert!(!dir.path().join("blocked.qcow2.partial").exists());
+
+    // convert behaves the same way
+    let conv = dir.path().join("conv.vmdk");
+    let out = pm(&["convert", s(&out_img), s(&conv)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!dir.path().join("conv.vmdk.partial").exists());
+    let out = pm(&["convert", s(&out_img), s(&blocked)]);
+    assert!(!out.status.success());
+    assert!(!dir.path().join("blocked.qcow2.partial").exists());
+}
+
+#[test]
+fn cli_flat_vmdk_roundtrip_and_extent_protection() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.raw");
+    let vmdk = dir.path().join("disk.vmdk");
+    let extent = dir.path().join("disk-flat.vmdk");
+    make_pattern_raw(&src, 4 * MIB);
+
+    let out = pm(&["image", s(&src), s(&vmdk), "--format", "vmdk-flat", "--sector"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(identify(&vmdk).unwrap(), ImageFormat::VmdkFlat);
+    // exactly the descriptor and its extent, no partial files, and the descriptor opens
+    assert_eq!(file_names(dir.path()), ["disk-flat.vmdk", "disk.vmdk", "src.raw"]);
+    let back = dir.path().join("back.raw");
+    FileDevice::create(&back, 4 * MIB).unwrap();
+    let out = pm(&["restore", s(&vmdk), s(&back)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(read_all(&back), read_all(&src));
+
+    // the extent is part of the source: nothing may be written onto it
+    let before = read_all(&extent);
+    let ext_spec = format!("file:{}", s(&extent));
+    for args in [
+        vec!["image", s(&vmdk), s(&extent), "--format", "raw", "--sector"],
+        vec!["convert", s(&vmdk), s(&extent), "--format", "raw"],
+        vec!["clone", s(&vmdk), &ext_spec, "--sector"],
+        vec!["restore", s(&vmdk), &ext_spec],
+        vec!["clone", &ext_spec, s(&vmdk), "--sector"],
+        vec!["image", s(&vmdk), s(&vmdk), "--format", "raw", "--sector"],
+    ] {
+        let out = pm(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(read_all(&extent), before);
+    assert_eq!(identify(&vmdk).unwrap(), ImageFormat::VmdkFlat);
+    // converting the descriptor to a flat image that would overwrite its own extent
+    let out = pm(&["convert", s(&vmdk), s(&vmdk), "--format", "vmdk-flat"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(read_all(&extent), before);
 }

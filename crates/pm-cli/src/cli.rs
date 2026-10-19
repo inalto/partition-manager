@@ -52,6 +52,11 @@ pub enum Command {
     /// Print environment diagnostics (elevation, toolchain, disks seen)
     Doctor,
     /// Copy one device onto another (disk, partition, volume or image file)
+    ///
+    /// Refuses to write onto the source, onto a partition or volume overlapping it, onto the
+    /// running system disk, or onto a VMDK descriptor's extent file. Limitation: other ways
+    /// of reaching the same storage (hard links, junctions, a file stored on the disk being
+    /// copied, a differencing image's parent) are not detected.
     Clone {
         /// Source device: `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
         src: String,
@@ -64,6 +69,11 @@ pub enum Command {
         dst_offset: u64,
     },
     /// Save a device to an image file (raw, VHD, VMDK or qcow2)
+    ///
+    /// The image is written to FILE.partial and renamed when complete; a failed run leaves an
+    /// existing FILE untouched. Refuses to overwrite the source or a VMDK extent it is read
+    /// from. Limitation: other ways of reaching the same storage (hard links, junctions, a
+    /// differencing image's parent) are not detected.
     Image {
         /// Source device: `disk:N[:P]`, a drive letter, or an image file
         src: String,
@@ -76,6 +86,11 @@ pub enum Command {
         mode: CopyModeArgs,
     },
     /// Write an image (or any device) onto a device
+    ///
+    /// Refuses to write onto the source, onto a partition or volume overlapping it, onto the
+    /// running system disk, or onto a VMDK descriptor's extent file. Limitation: other ways
+    /// of reaching the same storage (hard links, junctions, a file stored on the disk being
+    /// copied, a differencing image's parent) are not detected.
     Restore {
         /// Image file (`file:PATH[:P]` or PATH) or other source device
         file: String,
@@ -86,6 +101,9 @@ pub enum Command {
         dst_offset: u64,
     },
     /// Convert an image file to another format
+    ///
+    /// The output is written to OUTPUT.partial and renamed when complete. Refuses to overwrite
+    /// the input or its VMDK extent file.
     Convert {
         /// Existing image file (any supported format)
         input: PathBuf,
@@ -96,6 +114,9 @@ pub enum Command {
         format: Option<ImageFormat>,
     },
     /// Copy a failing device with ddrescue's algorithm, keeping a resumable mapfile
+    ///
+    /// Short options follow GNU ddrescue: -b sector size, -c sectors per read, -K skip size,
+    /// -r retry passes, -R reverse, -n no scrape, -N no trim.
     Rescue(RescueArgs),
     /// Identify the filesystem on a device
     Probe {
@@ -158,7 +179,7 @@ impl CopyModeArgs {
     }
 }
 
-/// Arguments of `pm rescue`; the flag letters follow the task brief.
+/// Arguments of `pm rescue`; the short flags are GNU ddrescue's.
 #[derive(Args, Debug)]
 pub struct RescueArgs {
     /// Source device: `disk:N[:P]`, a drive letter, or an image file
@@ -167,9 +188,12 @@ pub struct RescueArgs {
     pub dst: String,
     /// Mapfile (ddrescue format): resumes from it when it exists, kept up to date while copying
     pub mapfile: PathBuf,
-    /// Read size of the copy phase
+    /// Sector size in bytes: the unit of trimming, scraping and retrying (default: the source's)
     #[arg(short = 'b', long, value_parser = size_arg)]
-    pub block_size: Option<u64>,
+    pub sector_size: Option<u64>,
+    /// Sectors per read in the copy phase (default: 128 KiB worth)
+    #[arg(short = 'c', long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub cluster_size: Option<u32>,
     /// Initial skip after a read error (doubles on further errors)
     #[arg(short = 'K', long, value_parser = size_arg)]
     pub skip_size: Option<u64>,
@@ -179,18 +203,21 @@ pub struct RescueArgs {
     /// Copy from the end of the source towards the start
     #[arg(short = 'R', long)]
     pub reverse: bool,
-    /// Skip the trimming phase
-    #[arg(short = 'n', long)]
-    pub no_trim: bool,
     /// Skip the scraping phase
-    #[arg(short = 'N', long)]
+    #[arg(short = 'n', long)]
     pub no_scrape: bool,
+    /// Skip the trimming phase
+    #[arg(short = 'N', long)]
+    pub no_trim: bool,
     /// Write starting at this byte offset of the destination
     #[arg(long, default_value = "0", value_parser = size_arg)]
     pub dst_offset: u64,
     /// Skip areas the filesystem marks unused (they are zero-filled in the destination)
     #[arg(long)]
     pub used_map: bool,
+    /// Redraw the status block in place with ANSI escapes even when the terminal is not detected
+    #[arg(long)]
+    pub ansi: bool,
 }
 
 /// A byte count such as `4096`, `64K`, `1.5G`.

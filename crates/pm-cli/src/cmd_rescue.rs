@@ -2,11 +2,11 @@
 //! mapfile and a live status block on stderr.
 
 use crate::cli::{CliError, RescueArgs};
-use crate::cmd_clone::{check_copy, existing_canonical, fs_used_map, SharedSource};
-use crate::device_arg::{open_spec, Identity};
+use crate::cmd_clone::{existing_canonical, fs_used_map, open_checked, SharedSource};
+use crate::device_arg::Identity;
 use pm_core::{format_size, BlockDevice, CancelToken, Error, ProgressReport, ProgressSink};
 use pm_image::{rescue, RescueOpts};
-use pm_platform::{OpenMode, Platform};
+use pm_platform::Platform;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -103,14 +103,13 @@ struct RescueStatus {
 }
 
 impl RescueStatus {
-    fn new(pos: Arc<AtomicU64>) -> Self {
-        let mode = if !std::io::stderr().is_terminal() {
-            StatusMode::Plain
-        } else if enable_ansi() {
-            StatusMode::Block
-        } else {
-            StatusMode::Line
-        };
+    fn new(pos: Arc<AtomicU64>, ansi: bool) -> Self {
+        let mode = choose_mode(
+            ansi,
+            std::io::stderr().is_terminal(),
+            std::env::var_os("WT_SESSION").is_some(),
+            std::env::var("TERM").ok().as_deref(),
+        );
         RescueStatus { mode, pos, state: Mutex::new(DrawState::default()) }
     }
 
@@ -176,44 +175,45 @@ impl ProgressSink for RescueStatus {
     }
 }
 
-/// Turn on ANSI escape processing for stderr; false when the console does not support it.
-#[cfg(windows)]
-fn enable_ansi() -> bool {
-    use std::os::windows::io::AsRawHandle;
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
-        fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
-    }
-    let handle = std::io::stderr().as_raw_handle();
-    let mut mode = 0u32;
-    // SAFETY: `handle` is the process's stderr handle, valid for the call; `mode` is a live local.
-    unsafe {
-        if GetConsoleMode(handle, &mut mode) == 0 {
-            return false;
-        }
-        mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
-            || SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+/// How to draw the status. The in-place block needs ANSI escapes, which are only used when
+/// asked for (`--ansi`) or when the environment says the terminal handles them (Windows
+/// Terminal sets `WT_SESSION`, Unix terminals set `TERM`); any other terminal gets the plain
+/// `\r`-refreshed line, and redirected stderr one line per phase.
+fn choose_mode(ansi_flag: bool, is_terminal: bool, wt_session: bool, term: Option<&str>) -> StatusMode {
+    if ansi_flag {
+        StatusMode::Block
+    } else if !is_terminal {
+        StatusMode::Plain
+    } else if wt_session || term.is_some_and(|t| !t.is_empty() && t != "dumb") {
+        StatusMode::Block
+    } else {
+        StatusMode::Line
     }
 }
 
-#[cfg(not(windows))]
-fn enable_ansi() -> bool {
-    std::env::var("TERM").map_or(false, |t| t != "dumb")
-}
-
-fn opts_from_args(a: &RescueArgs, sector: u32) -> Result<RescueOpts, CliError> {
-    let mut opts = RescueOpts { sector, ..RescueOpts::default() };
-    if let Some(b) = a.block_size {
-        if b == 0 || b > MAX_BLOCK {
-            return Err(CliError::Usage(format!(
-                "--block-size must be between 1 and {}",
-                format_size(MAX_BLOCK)
-            )));
-        }
-        opts.block_size = b as usize;
+/// Engine options from the flags. `-b` is the sector size in bytes (a multiple of the
+/// device's), `-c` the sectors per copy-phase read; the read size is their product.
+fn opts_from_args(a: &RescueArgs, device_sector: u32) -> Result<RescueOpts, CliError> {
+    let device_sector = device_sector.max(1) as u64;
+    let sector = a.sector_size.unwrap_or(device_sector);
+    if sector == 0 || sector > u32::MAX as u64 || sector % device_sector != 0 {
+        return Err(CliError::Usage(format!(
+            "--sector-size must be a non-zero multiple of the device's sector size ({device_sector})"
+        )));
     }
+    let default_cluster = (RescueOpts::default().block_size as u64 / sector).max(1);
+    let cluster = a.cluster_size.map_or(default_cluster, u64::from);
+    let block = cluster.checked_mul(sector).filter(|&b| b <= MAX_BLOCK).ok_or_else(|| {
+        CliError::Usage(format!(
+            "--cluster-size x --sector-size must be at most {}",
+            format_size(MAX_BLOCK)
+        ))
+    })?;
+    let mut opts = RescueOpts {
+        sector: sector as u32,
+        block_size: block as usize,
+        ..RescueOpts::default()
+    };
     if let Some(k) = a.skip_size {
         opts.skip_size = k;
     }
@@ -231,10 +231,9 @@ pub fn run(
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let source = open_spec(platform, &a.src, OpenMode::ReadOnly)?;
-    let mut target = open_spec(platform, &a.dst, OpenMode::ReadWrite)?;
-    // everything that can be refused is refused before the first write
-    check_copy(&source, &target, a.dst_offset)?;
+    // Source and destination are checked (and the destination opened read-only) before the
+    // destination is opened for writing; the remaining checks below also precede any write.
+    let (source, mut target) = open_checked(platform, &a.src, &a.dst, a.dst_offset)?;
     if let Some(dir) = a.mapfile.parent().filter(|d| !d.as_os_str().is_empty()) {
         if !dir.is_dir() {
             return Err(CliError::Usage(format!(
@@ -266,7 +265,7 @@ pub fn run(
 
     let pos = Arc::new(AtomicU64::new(0));
     let mut src = PosSource { inner: shared, pos: pos.clone() };
-    let status = RescueStatus::new(pos);
+    let status = RescueStatus::new(pos, a.ansi);
     let start = Instant::now();
     let result = rescue(&mut src, &mut *target.dev, a.dst_offset, &opts, &status, cancel);
     status.close();
@@ -364,28 +363,67 @@ mod tests {
     }
 
     #[test]
-    fn options_follow_the_flags() {
-        let args = RescueArgs {
+    fn mode_selection() {
+        use StatusMode::*;
+        assert_eq!(choose_mode(true, false, false, None), Block);
+        assert_eq!(choose_mode(false, false, true, Some("xterm")), Plain);
+        assert_eq!(choose_mode(false, true, true, None), Block);
+        assert_eq!(choose_mode(false, true, false, Some("xterm-256color")), Block);
+        assert_eq!(choose_mode(false, true, false, Some("dumb")), Line);
+        assert_eq!(choose_mode(false, true, false, Some("")), Line);
+        assert_eq!(choose_mode(false, true, false, None), Line);
+    }
+
+    fn args() -> RescueArgs {
+        RescueArgs {
             src: "a".into(),
             dst: "b".into(),
             mapfile: "m".into(),
-            block_size: Some(64 << 10),
+            sector_size: None,
+            cluster_size: None,
+            skip_size: None,
+            retries: 0,
+            reverse: false,
+            no_scrape: false,
+            no_trim: false,
+            dst_offset: 0,
+            used_map: false,
+            ansi: false,
+        }
+    }
+
+    #[test]
+    fn options_follow_the_flags() {
+        let a = RescueArgs {
+            sector_size: Some(4096),
+            cluster_size: Some(16),
             skip_size: Some(1 << 20),
             retries: 2,
             reverse: true,
             no_trim: true,
-            no_scrape: false,
-            dst_offset: 0,
-            used_map: false,
+            ..args()
         };
-        let o = opts_from_args(&args, 4096).unwrap();
-        assert_eq!((o.block_size, o.skip_size, o.max_retries, o.sector), (64 << 10, 1 << 20, 2, 4096));
+        let o = opts_from_args(&a, 512).unwrap();
+        assert_eq!((o.sector, o.block_size, o.skip_size, o.max_retries), (4096, 16 * 4096, 1 << 20, 2));
         assert!(o.reverse && o.no_trim && !o.no_scrape && !o.abort_on_error);
         assert_eq!(o.mapfile.as_deref(), Some(Path::new("m")));
-        let defaults = RescueArgs { block_size: None, skip_size: None, ..args };
-        let o = opts_from_args(&defaults, 512).unwrap();
-        assert_eq!((o.block_size, o.skip_size), (RescueOpts::default().block_size, RescueOpts::default().skip_size));
-        let huge = RescueArgs { block_size: Some(MAX_BLOCK + 1), ..defaults };
+
+        // defaults: the device's sector size and the engine's default read size
+        let o = opts_from_args(&args(), 512).unwrap();
+        assert_eq!((o.sector, o.block_size), (512, RescueOpts::default().block_size));
+        assert_eq!(o.skip_size, RescueOpts::default().skip_size);
+        let o = opts_from_args(&args(), 4096).unwrap();
+        assert_eq!((o.sector, o.block_size), (4096, RescueOpts::default().block_size));
+
+        // -n is no-scrape, -N is no-trim (checked through the parser in the integration tests)
+        let o = opts_from_args(&RescueArgs { no_scrape: true, ..args() }, 512).unwrap();
+        assert!(o.no_scrape && !o.no_trim);
+
+        // invalid combinations
+        assert!(opts_from_args(&RescueArgs { sector_size: Some(0), ..args() }, 512).is_err());
+        assert!(opts_from_args(&RescueArgs { sector_size: Some(100), ..args() }, 512).is_err());
+        assert!(opts_from_args(&RescueArgs { sector_size: Some(512), ..args() }, 4096).is_err());
+        let huge = RescueArgs { cluster_size: Some(u32::MAX), ..args() };
         assert!(opts_from_args(&huge, 512).is_err());
     }
 }
