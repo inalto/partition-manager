@@ -156,6 +156,12 @@ fn fat_add_file(dev: &mut MemDevice, part: u64, name83: &[u8; 11], data: &[u8]) 
     dev.write_at(cluster_off(root) + slot as u64 * 32, &de).unwrap();
 }
 
+/// `m`, after checking it has no run of spaces (a lost `\` line continuation in a message).
+fn spaced(m: &str) -> &str {
+    assert!(!m.contains("  "), "broken message spacing: {m:?}");
+    m
+}
+
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
 }
@@ -861,7 +867,8 @@ fn execute_clone_to_smaller_disk_shrinks_ntfs_source_first() {
     let model = Model::from_platform(&p).unwrap();
     let warn = fit_clone().shrinks_source(&model);
     assert_eq!(warn.len(), 1, "{warn:?}");
-    assert!(warn[0].contains("partition 1"), "{warn:?}");
+    assert!(spaced(&warn[0]).contains("partition 1"), "{warn:?}");
+    assert!(warn[0].contains("will be shrunk from"), "{warn:?}");
 
     let r = run(&p, &[fit_clone()]);
     assert_eq!(r.failed, None, "{:?}", r.log);
@@ -892,7 +899,8 @@ fn execute_clone_refusal_writes_nothing() {
     let r = run(&p, &[fit_clone()]);
     let (i, msg) = r.failed.clone().expect("refused");
     assert_eq!(i, 0);
-    assert!(msg.contains("must be shrunk first"), "{msg}");
+    assert!(spaced(&msg).contains("must be shrunk first"), "{msg}");
+    assert!(msg.contains("only NTFS volumes can be shrunk online"), "{msg}");
     assert!(p.write_sessions_log().is_empty());
     assert_eq!(p.disk_bytes(1), before, "the target is untouched");
     assert!(p.calls().is_empty(), "{:?}", p.calls());
@@ -920,9 +928,13 @@ fn precheck_rejects_what_the_executor_refuses() {
     let resize = Operation::ResizeMove { disk: 1, number: 1, new_start: legacy, new_len: 12 * MIB };
     let align = Operation::AlignPartitions { disk: 1 };
     for op in [&label, &resize, &align] {
-        assert!(pm_ops::precheck(&model, op).is_err(), "{op:?}");
+        let e = pm_ops::precheck(&model, op).expect_err("refused");
+        spaced(&e.to_string());
         assert!(q.push(op.clone()).is_err(), "{op:?}");
     }
+    let e = pm_ops::precheck(&model, &align).unwrap_err().to_string();
+    assert!(e.contains("aligning it would shrink it by"), "{e}");
+    assert!(e.contains("only NTFS volumes can be shrunk online"), "{e}");
     assert!(q.is_empty());
     // what the executor can do still passes
     assert!(pm_ops::precheck(&model, &Operation::DeletePartition { disk: 1, number: 1 }).is_ok());
@@ -991,4 +1003,40 @@ fn execute_move_and_grow_extends_the_relocated_volume() {
     let r = run(&p, &[Operation::ResizeMove { disk: 1, number: 1, new_start: 10 * MIB, new_len: 12 * MIB }]);
     assert_eq!(r.failed, None, "{:?}", r.log);
     assert!(p.calls().contains(&format!("extend v1-moved {}", 12 * MIB)), "{:?}", p.calls());
+}
+
+// ---------------------------------------------------------------- fix round 2
+
+#[test]
+fn refs_can_grow_but_cannot_be_shrunk_online() {
+    let p = MockPlatform::new();
+    p.add_disk(1, gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 20 * MIB, gpt_types::BASIC_DATA, 0)])), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("r1", Some(FsKind::ReFs), &[], 20 * MIB, 15 * MIB), 1, MIB, 20 * MIB);
+    let model = Model::from_platform(&p).unwrap();
+
+    let shrink = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 10 * MIB };
+    let e = pm_ops::precheck(&model, &shrink).unwrap_err().to_string();
+    assert!(spaced(&e).contains("only NTFS volumes can be shrunk online"), "{e}");
+    let r = run(&p, &[shrink]);
+    assert!(r.failed.is_some());
+    assert!(p.calls().is_empty() && p.write_sessions_log().is_empty(), "{:?}", p.calls());
+
+    let grow = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 30 * MIB };
+    assert!(pm_ops::precheck(&model, &grow).is_ok());
+    let r = run(&p, &[grow]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert!(p.calls().contains(&format!("extend r1 {}", 30 * MIB)), "{:?}", p.calls());
+
+    // a ReFS source larger than its clone target is refused, never shrunk
+    let (p, _) = shrink_fixture(FsKind::ReFs, "src-refs");
+    let model = Model::from_platform(&p).unwrap();
+    assert!(fit_clone().shrinks_source(&model).is_empty());
+    let before = p.disk_bytes(1);
+    let r = run(&p, &[fit_clone()]);
+    let (_, msg) = r.failed.expect("refused");
+    assert!(spaced(&msg).contains("(ReFS)") && msg.contains("only NTFS volumes can be shrunk online"), "{msg}");
+    assert!(p.calls().is_empty(), "{:?}", p.calls());
+    assert!(p.write_sessions_log().is_empty());
+    assert_eq!(p.disk_bytes(1), before);
 }

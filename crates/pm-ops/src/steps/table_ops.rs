@@ -142,14 +142,17 @@ pub(crate) fn convert(ctx: &mut Ctx, disk: u32, to: TableKind) -> Result<()> {
     ctx.rescan(disk)
 }
 
-/// What happens to a filesystem whose partition shrinks from `old` to `new` bytes.
+/// What happens to a filesystem whose partition shrinks from `old` to `new` bytes: `Ok(true)`
+/// when NTFS must be shrunk through the platform first, `Ok(false)` when nothing has to follow,
+/// `Unsupported` otherwise (only NTFS can be shrunk online; ReFS cannot).
 fn check_shrink(fs: Option<FsKind>, disk: u32, number: u32, old: u64, new: u64) -> Result<bool> {
     match fs {
         _ if new >= old => Ok(false),
         None => Ok(false),
-        Some(FsKind::Ntfs | FsKind::ReFs) => Ok(true),
+        Some(FsKind::Ntfs) => Ok(true),
         Some(other) => Err(Error::Unsupported(format!(
-            "partition {number} on Disk {disk}: resize of {} is not supported (aligning it would              shrink it by {} bytes)",
+            "partition {number} on Disk {disk}: resize of {} is not supported (aligning it would \
+             shrink it by {} bytes; only NTFS volumes can be shrunk online)",
             other.display_name(),
             old - new
         ))),
@@ -161,7 +164,7 @@ pub(crate) struct AlignChange {
     pub number: u32,
     pub old: (u64, u64),
     pub new: (u64, u64),
-    /// Its NTFS/ReFS filesystem must be shrunk first.
+    /// Its NTFS filesystem must be shrunk first.
     pub shrink_fs: bool,
 }
 
@@ -187,7 +190,7 @@ pub(crate) fn align_changes(d: &DiskInfo) -> Result<Vec<AlignChange>> {
 /// range lies inside its old one.
 ///
 /// Every decision is taken first (nothing is written if a partition cannot be aligned), then
-/// NTFS/ReFS filesystems that shrink are shrunk through the platform, then, inside one
+/// NTFS filesystems that shrink are shrunk through the platform, then, inside one
 /// session, each partition in turn has its data copied to its new start and **the table is
 /// committed right after that partition** — so the table on disk always matches the data, even
 /// when a later move fails or the run is cancelled. Cancellation is honoured between

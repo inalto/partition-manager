@@ -64,17 +64,15 @@ pub struct ExecReport {
 ///
 /// Refused:
 /// * `SetLabel` (no platform support yet);
-/// * a length change of a partition whose filesystem is neither NTFS nor ReFS (and not
-///   unrecognised);
-/// * an alignment that would shrink such a partition;
+/// * a length change of a partition with a recognised filesystem other than NTFS, except
+///   growing ReFS (ReFS cannot be shrunk online);
+/// * an alignment that would shrink a partition with a recognised filesystem other than NTFS;
 /// * a clone / migration that puts a source partition into a smaller target unless the source
-///   is an NTFS/ReFS volume that can be shrunk online. (Conservative: a filesystem smaller
+///   is an NTFS volume that can be shrunk online. (Conservative: a filesystem smaller
 ///   than its partition would fit, but the model does not know filesystem sizes.)
 pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
     match op {
-        Operation::SetLabel { .. } => Err(Error::Unsupported(
-            "set label requires platform support (planned)".into(),
-        )),
+        Operation::SetLabel { .. } => Err(set_label_unsupported()),
         Operation::ResizeMove { disk, number, new_len, .. } => {
             if let Some(p) = model.partition(*disk, *number) {
                 steps::resize::check_resize(p, *disk, *number, *new_len)?;
@@ -98,8 +96,13 @@ pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
     }
 }
 
+/// `Platform` has no API to change a volume label yet.
+fn set_label_unsupported() -> Error {
+    Error::Unsupported("set label requires platform support (planned)".into())
+}
+
 impl Operation {
-    /// Source volumes this clone / migration will shrink (NTFS/ReFS sources whose planned
+    /// Source volumes this clone / migration will shrink (NTFS sources whose planned
     /// target on `model` is smaller), one human-readable line each, for the confirmation
     /// dialog. Empty for every other operation.
     pub fn shrinks_source(&self, model: &Model) -> Vec<String> {
@@ -110,7 +113,8 @@ impl Operation {
                 let fs = p.fs.map_or("unknown filesystem", |f| f.display_name());
                 let at = p.mount_points.first().map(|m| format!(", {m}")).unwrap_or_default();
                 format!(
-                    "partition {} ({fs}{at}) on Disk {d}: the source volume will be shrunk from                      {} to {}",
+                    "partition {} ({fs}{at}) on Disk {d}: the source volume will be shrunk from \
+                     {} to {}",
                     p.number,
                     pm_core::format_size(p.len),
                     pm_core::format_size(len)
@@ -256,7 +260,8 @@ fn run_op(ctx: &mut Ctx, op: &Operation) -> Result<()> {
             resize::resize_move(ctx, *disk, *number, *new_start, *new_len)
         }
         SetActive { disk, number } => table_ops::set_active(ctx, *disk, *number),
-        SetLabel { .. } => precheck(ctx.live, op),
+        // refused by `precheck` before any step runs; kept for exhaustiveness
+        SetLabel { .. } => Err(set_label_unsupported()),
         SetLetter { disk, number, letter } => format::set_letter(ctx, *disk, *number, *letter),
         SetType { disk, number, ptype } => table_ops::set_type(ctx, *disk, *number, *ptype),
         Mount { volume, at } => format::mount(ctx, volume, at),

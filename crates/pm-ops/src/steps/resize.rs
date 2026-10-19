@@ -1,9 +1,9 @@
 //! Resize and move a partition.
 //!
-//! * A length change needs the filesystem to follow: NTFS and ReFS go through the platform
-//!   (shrink: filesystem first, then the table; grow: table first, then the filesystem).
-//!   A partition without a recognised filesystem changes only in the table. Any other
-//!   filesystem is refused (`Error::Unsupported`).
+//! * A length change needs the filesystem to follow through the platform (shrink: filesystem
+//!   first, then the table; grow: table first, then the filesystem). NTFS can shrink and grow;
+//!   ReFS can only grow (Windows cannot shrink ReFS online). A partition without a recognised
+//!   filesystem changes only in the table. Anything else is refused (`Error::Unsupported`).
 //! * A move copies the data to the new start inside the write session (overlap-safe), then
 //!   writes the table; any filesystem can be moved as long as its length is kept.
 
@@ -11,16 +11,21 @@ use super::{entry_mut, locate_volume, move_data, volume_of, with_session, Ctx};
 use pm_core::{Error, FsKind, PartitionInfo, Result};
 
 /// Whether changing the length of `p` (partition `number` of `disk`) to `new_len` is possible:
-/// `Ok(true)` when the filesystem must follow through the platform (NTFS/ReFS), `Ok(false)`
-/// for a table-only change (same length, or no recognised filesystem), `Unsupported`
-/// otherwise. Shared by the executor and [`crate::precheck`].
+/// `Ok(true)` when the filesystem must follow through the platform (NTFS either way, ReFS
+/// growing only), `Ok(false)` for a table-only change (same length, or no recognised
+/// filesystem), `Unsupported` otherwise. Shared by the executor and [`crate::precheck`].
 pub(crate) fn check_resize(p: &PartitionInfo, disk: u32, number: u32, new_len: u64) -> Result<bool> {
     if new_len == p.len {
         return Ok(false);
     }
     match p.fs {
         None => Ok(false),
-        Some(FsKind::Ntfs | FsKind::ReFs) => Ok(true),
+        Some(FsKind::Ntfs) => Ok(true),
+        Some(FsKind::ReFs) if new_len > p.len => Ok(true),
+        Some(FsKind::ReFs) => Err(Error::Unsupported(format!(
+            "shrinking ReFS is not supported (partition {number} on Disk {disk}); only NTFS \
+             volumes can be shrunk online"
+        ))),
         Some(fs) => Err(Error::Unsupported(format!(
             "resize of {} is not supported (partition {number} on Disk {disk})",
             fs.display_name()

@@ -9,9 +9,10 @@ use pm_core::{format_size, Error, FsKind, PartitionInfo, Result, SliceDevice, Vo
 use pm_fs::UsedMap;
 use pm_platform::OpenMode;
 
-/// True if the filesystem of `p` can be shrunk online through the platform.
+/// True if the filesystem of `p` can be shrunk online through the platform: a mounted NTFS
+/// volume (Windows' FSCTL_SHRINK_VOLUME does not support ReFS).
 pub(crate) fn shrinkable(p: &PartitionInfo) -> bool {
-    matches!(p.fs, Some(FsKind::Ntfs | FsKind::ReFs)) && p.volume.is_some()
+    p.fs == Some(FsKind::Ntfs) && p.volume.is_some()
 }
 
 fn fs_name(p: &PartitionInfo) -> &'static str {
@@ -21,8 +22,8 @@ fn fs_name(p: &PartitionInfo) -> &'static str {
 /// The refusal for a source that is larger than its target and cannot be shrunk online.
 pub(crate) fn must_shrink_first(src_disk: u32, p: &PartitionInfo) -> Error {
     Error::Unsupported(format!(
-        "partition {} ({}) on Disk {src_disk} must be shrunk first; only NTFS/ReFS volumes can \
-         be shrunk online",
+        "partition {} ({}) on Disk {src_disk} must be shrunk first; only NTFS volumes can be \
+         shrunk online",
         p.number,
         fs_name(p)
     ))
@@ -104,7 +105,7 @@ pub(crate) struct CopyPlan<'a> {
 /// refusal writes nothing:
 ///
 /// 1. decide (read-only): a source larger than its target must have a filesystem that already
-///    fits the target, or be an NTFS/ReFS volume that can be shrunk online; anything else is
+///    fits the target, or be an NTFS volume that can be shrunk online; anything else is
 ///    refused ([`must_shrink_first`]);
 /// 2. shrink those source volumes through the platform (allowed on the system disk: that is
 ///    what migrating to a smaller SSD needs), logging `shrinking source volume …`;
