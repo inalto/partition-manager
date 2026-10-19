@@ -71,11 +71,12 @@ pub fn parse_size(s: &str) -> Result<u64> {
 }
 
 /// Round `v` up to the next multiple of `a` (`a == 0` returns `v` unchanged).
+/// Saturates to `u64::MAX` if the aligned value would overflow.
 pub fn align_up(v: u64, a: u64) -> u64 {
     if a == 0 {
         return v;
     }
-    v.div_ceil(a) * a
+    v.div_ceil(a).checked_mul(a).unwrap_or(u64::MAX)
 }
 
 /// Round `v` down to a multiple of `a` (`a == 0` returns `v` unchanged).
@@ -123,6 +124,13 @@ mod tests {
         assert!(parse_size("12X").is_err());
         assert!(parse_size("-5M").is_err());
         assert!(parse_size("99999999999P").is_err());
+    }
+
+    #[test]
+    fn align_up_saturates_on_overflow() {
+        assert_eq!(align_up(u64::MAX, 512), u64::MAX);
+        assert_eq!(align_up(u64::MAX - 100, 512), u64::MAX);
+        assert_eq!(align_up(u64::MAX - 511, 512), u64::MAX - 511);
     }
 
     #[test]

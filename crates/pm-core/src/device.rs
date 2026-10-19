@@ -358,6 +358,14 @@ pub fn copy_range(
     if buf_size == 0 {
         return Err(Error::Invalid("copy buffer size must be non-zero".into()));
     }
+    let in_range = |off: u64, dev_len: u64| off.checked_add(len).map_or(false, |end| end <= dev_len);
+    if !in_range(src_off, src.len()) || !in_range(dst_off, dst.len()) {
+        return Err(Error::Invalid(format!(
+            "copy range out of bounds: src {src_off}+{len} (of {}), dst {dst_off}+{len} (of {})",
+            src.len(),
+            dst.len()
+        )));
+    }
     let mut buf = vec![0u8; (buf_size as u64).min(len) as usize];
     let mut copied = 0u64;
     while copied < len {
@@ -469,6 +477,33 @@ mod tests {
         copy_range(&mut src, &mut dst, 0, 0, 0, 16).unwrap();
         assert!(copy_range(&mut src, &mut dst, 9000, 0, 2000, 512).is_err());
         assert!(copy_range(&mut src, &mut dst, 0, 0, 10, 0).is_err());
+    }
+
+    #[test]
+    fn copy_range_validates_bounds_before_writing() {
+        let mut src = MemDevice::from_vec(vec![0xAA; 1000]);
+        let mut dst = MemDevice::new(1000);
+        // destination too small: nothing may be written
+        assert!(matches!(
+            copy_range(&mut src, &mut dst, 0, 600, 500, 100),
+            Err(Error::Invalid(_))
+        ));
+        assert!(dst.as_slice().iter().all(|&b| b == 0));
+        // source range exceeds source
+        assert!(matches!(
+            copy_range(&mut src, &mut dst, 600, 0, 500, 100),
+            Err(Error::Invalid(_))
+        ));
+        // offset + len overflows u64
+        assert!(matches!(
+            copy_range(&mut src, &mut dst, u64::MAX, 0, 2, 100),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            copy_range(&mut src, &mut dst, 0, u64::MAX, 2, 100),
+            Err(Error::Invalid(_))
+        ));
+        assert!(dst.as_slice().iter().all(|&b| b == 0));
     }
 
     #[test]
