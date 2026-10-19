@@ -12,7 +12,7 @@ use super::layout::{
     parse_alignment_descriptor, parse_device_descriptor, parse_drive_layout, parse_trim_descriptor,
     ParsedLayout,
 };
-use crate::merge_volumes;
+use crate::{detect_filesystems, merge_volumes};
 use crate::traits::OpenMode;
 use pm_core::{BlockDevice, DiskInfo, Error, TableKind, VolumeInfo};
 use pm_parttable::{is_protective_mbr, read_table};
@@ -68,6 +68,13 @@ pub fn enumerate_disks(volumes: &[VolumeInfo], system_disk: Option<u32>) -> Vec<
             Ok(mut d) => {
                 d.flags.system = system_disk == Some(index);
                 merge_volumes(&mut d, volumes);
+                // partitions without a mounted volume: identify the filesystem from its
+                // signature (needs read access; a query-only handle skips this silently)
+                if readable {
+                    if let Some(mut dev) = open_disk_device(&d.path) {
+                        detect_filesystems(&mut d, &mut dev);
+                    }
+                }
                 out.push(d);
             }
             Err(code) => log::warn!("skipping {path}: query failed ({})", super::friendly_error(code)),

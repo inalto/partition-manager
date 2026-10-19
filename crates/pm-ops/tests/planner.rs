@@ -932,9 +932,12 @@ fn resize_refuses_shrink_with_unknown_used() {
     // Growing is fine.
     let grow = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 12 * GIB };
     Planner::simulate(&m, &grow).unwrap();
-    // A raw partition (no filesystem) may shrink.
+    // A partition whose filesystem is unknown may not shrink either (only the table would
+    // follow); it may grow.
     m.disks[1].partitions[0].fs = None;
-    Planner::simulate(&m, &shrink).unwrap();
+    let msg = invalid_msg(Planner::simulate(&m, &shrink));
+    assert!(msg.contains("filesystem unknown; refresh or check the volume"), "{msg}");
+    Planner::simulate(&m, &grow).unwrap();
 }
 
 #[test]

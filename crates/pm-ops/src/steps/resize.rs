@@ -3,22 +3,50 @@
 //! * A length change needs the filesystem to follow through the platform (shrink: filesystem
 //!   first, then the table; grow: table first, then the filesystem). NTFS can shrink and grow;
 //!   ReFS can only grow (Windows cannot shrink ReFS online). A partition without a recognised
-//!   filesystem changes only in the table. Anything else is refused (`Error::Unsupported`).
+//!   filesystem may grow in the table only; it may not be shrunk (its filesystem may simply be
+//!   unknown to the disk list), and should a shrink get this far the executor reads the
+//!   partition head inside the write session and refuses when it finds a filesystem signature.
+//!   Anything else is refused (`Error::Unsupported`).
 //! * A move copies the data to the new start inside the write session (overlap-safe), then
 //!   writes the table; any filesystem can be moved as long as its length is kept.
 
-use super::{entry_mut, locate_volume, move_data, volume_of, with_session, Ctx};
+use super::{ensure_no_filesystem, entry_mut, locate_volume, move_data, volume_of, with_session, Ctx};
 use pm_core::{Error, FsKind, PartitionInfo, Result};
+
+/// True for an MBR extended-partition container (a table structure without data of its own).
+pub(crate) fn is_container_part(p: &PartitionInfo) -> bool {
+    !p.logical && p.ptype.is_some_and(|t| t.is_extended_mbr())
+}
+
+/// The refusal of a shrink of a partition whose filesystem the model does not know.
+pub(crate) fn unknown_fs_shrink(disk: u32, number: u32) -> Error {
+    Error::Invalid(format!(
+        "Cannot shrink partition {number} on Disk {disk}: filesystem unknown; refresh or check \
+         the volume"
+    ))
+}
 
 /// Whether changing the length of `p` (partition `number` of `disk`) to `new_len` is possible:
 /// `Ok(true)` when the filesystem must follow through the platform (NTFS either way, ReFS
-/// growing only), `Ok(false)` for a table-only change (same length, or no recognised
-/// filesystem), `Unsupported` otherwise. Shared by the executor and [`crate::precheck`].
-pub(crate) fn check_resize(p: &PartitionInfo, disk: u32, number: u32, new_len: u64) -> Result<bool> {
+/// growing only), `Ok(false)` for a table-only change (same length, growing a partition
+/// without a recognised filesystem, or an extended container), `Unsupported` otherwise. A
+/// shrink of a partition whose filesystem is unknown is refused, unless `verified_later`: the
+/// executor's step, which checks the device itself inside the write session. Shared by the
+/// executor and [`crate::precheck`].
+pub(crate) fn check_resize(
+    p: &PartitionInfo,
+    disk: u32,
+    number: u32,
+    new_len: u64,
+    verified_later: bool,
+) -> Result<bool> {
     if new_len == p.len {
         return Ok(false);
     }
     match p.fs {
+        None if new_len < p.len && !is_container_part(p) && !verified_later => {
+            Err(unknown_fs_shrink(disk, number))
+        }
         None => Ok(false),
         Some(FsKind::Ntfs) => Ok(true),
         Some(FsKind::ReFs) if new_len > p.len => Ok(true),
@@ -43,7 +71,9 @@ pub(crate) fn resize_move(
     let p = ctx.live_partition(disk, number)?;
     let (old_start, old_len) = (p.start, p.len);
     let moving = new_start != old_start;
-    let via_platform = check_resize(p, disk, number, new_len)?;
+    let via_platform = check_resize(p, disk, number, new_len, true)?;
+    // a shrink that only the table follows: verified against the device inside the session
+    let table_only_shrink = !via_platform && new_len < old_len && !is_container_part(p);
     if via_platform && new_len < old_len {
         let vol = volume_of(ctx, disk, p)?;
         ctx.step("shrink the filesystem");
@@ -57,6 +87,9 @@ pub(crate) fn resize_move(
             return Err(Error::Invalid(format!(
                 "partition {number} on Disk {disk} changed on the device"
             )));
+        }
+        if table_only_shrink {
+            ensure_no_filesystem(s.device(), old_start, disk, number)?;
         }
         if moving {
             let sink = ctx.step("move the data");

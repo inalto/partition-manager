@@ -26,9 +26,15 @@ use uuid::Uuid;
 
 /// Chunk size of wipes and in-place moves.
 pub(crate) const CHUNK: u64 = 4 << 20;
-/// How long to wait for the OS to expose the volume of a new or changed partition.
-const VOLUME_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for the OS to expose the volume of a new or changed partition, and for the
+/// volumes of a disk to come back after a write session.
+const VOLUME_WAIT: Duration = Duration::from_secs(30);
 const VOLUME_POLL: Duration = Duration::from_millis(250);
+/// The volume set of a disk counts as settled once it has not changed for this long (after it
+/// changed at least once).
+const VOLUME_SETTLE: Duration = Duration::from_secs(1);
+/// BitLocker's signature at byte 3 of an encrypted volume (no filesystem reader knows it).
+const BITLOCKER_SIGNATURE: &[u8] = b"-FVE-FS-";
 
 /// Everything a step needs while one operation runs.
 pub(crate) struct Ctx<'a> {
@@ -250,7 +256,7 @@ pub(crate) fn entry_mut(t: &mut Table, disk: u32, n: u32) -> Result<&mut Entry> 
         .ok_or_else(|| Error::Invalid(format!("Disk {disk} has no partition {n} on the device")))
 }
 
-/// Wait (up to 5 s) for the OS to expose a volume at byte `start` of `disk`.
+/// Wait (up to 30 s) for the OS to expose a volume at byte `start` of `disk`.
 pub(crate) fn locate_volume(
     p: &dyn Platform,
     disk: u32,
@@ -273,6 +279,90 @@ pub(crate) fn locate_volume(
             )));
         }
         std::thread::sleep(VOLUME_POLL);
+    }
+}
+
+/// After a write session on `disk`: wait (up to 30 s, polling every 250 ms, cancellable) until
+/// the OS reports at least `expected` volumes on `disk` again — Windows re-arrives them
+/// asynchronously after the disk comes back online — or until their set has stopped changing
+/// for 1 s after changing at least once. Returns whether the expected count was reached; a
+/// timeout is not an error (the next operation re-reads the disks and re-validates).
+pub(crate) fn wait_for_volumes(
+    p: &dyn Platform,
+    disk: u32,
+    expected: usize,
+    cancel: &CancelToken,
+) -> Result<bool> {
+    wait_for_volumes_with(p, disk, expected, cancel, VOLUME_WAIT)
+}
+
+fn wait_for_volumes_with(
+    p: &dyn Platform,
+    disk: u32,
+    expected: usize,
+    cancel: &CancelToken,
+    limit: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + limit;
+    let mut last: Option<Vec<(String, u64)>> = None;
+    let mut changed_at: Option<Instant> = None;
+    loop {
+        let mut now_set: Vec<(String, u64)> = p
+            .enumerate_volumes()?
+            .into_iter()
+            .filter(|v| v.disk == Some(disk))
+            .map(|v| (v.id.0, v.start))
+            .collect();
+        now_set.sort();
+        if now_set.len() >= expected {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        match &last {
+            Some(prev) if *prev != now_set => changed_at = Some(now),
+            _ => {}
+        }
+        if changed_at.is_some_and(|t| now.duration_since(t) >= VOLUME_SETTLE) {
+            return Ok(false);
+        }
+        last = Some(now_set);
+        cancel.check()?;
+        if now >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(VOLUME_POLL);
+    }
+}
+
+/// Refuse a table-only shrink of partition `number` (at byte `start` of the session's device)
+/// when its head is unreadable or carries a filesystem signature ([`pm_fs::detect`], or
+/// BitLocker): the disk list did not know its filesystem, so cutting the table would truncate
+/// it. Runs inside the write session, before anything is written.
+pub(crate) fn ensure_no_filesystem(
+    dev: &mut dyn BlockDevice,
+    start: u64,
+    disk: u32,
+    number: u32,
+) -> Result<()> {
+    let mut head = vec![0u8; (dev.sector_size() as usize).max(512)];
+    dev.read_at(start, &mut head).map_err(|e| {
+        Error::Invalid(format!(
+            "partition {number} on Disk {disk}: cannot read its start to check for a filesystem \
+             ({}); refusing to shrink it",
+            err_text(e)
+        ))
+    })?;
+    let found = if head.get(3..3 + BITLOCKER_SIGNATURE.len()) == Some(BITLOCKER_SIGNATURE) {
+        Some("BitLocker")
+    } else {
+        pm_fs::detect(dev, start).map(|p| p.kind.display_name())
+    };
+    match found {
+        Some(name) => Err(Error::Invalid(format!(
+            "partition {number} on Disk {disk} holds a {name} filesystem the disk list did not \
+             show; refusing to shrink it in the partition table only (refresh or check the volume)"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -347,4 +437,134 @@ pub(crate) fn move_data(
 /// The message reported for a failed operation (without the `invalid:` prefix).
 pub(crate) fn message(e: Error) -> String {
     err_text(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pm_core::{gpt_types, MemDevice, NullProgress, PartitionType, VolumeInfo, MIB};
+    use pm_platform::MockPlatform;
+
+    const DISK: u64 = 48 * MIB;
+
+    fn gpt_disk(parts: &[(u32, u64, u64)]) -> MemDevice {
+        let mut dev = MemDevice::new(DISK);
+        let mut t = Table::empty(TableKind::Gpt, DISK, 512);
+        for &(number, start, len) in parts {
+            t.entries.push(Entry {
+                number,
+                start,
+                len,
+                ptype: PartitionType::Gpt(gpt_types::BASIC_DATA),
+                guid: Some(Uuid::new_v4()),
+                name: String::new(),
+                attrs: 0,
+                logical: false,
+            });
+        }
+        pm_parttable::write_table(&mut dev, &t).unwrap();
+        dev
+    }
+
+    fn boot_sector(dev: &mut MemDevice, at: u64, oem: &[u8]) {
+        let mut bs = vec![0u8; 512];
+        bs[3..3 + oem.len()].copy_from_slice(oem);
+        bs[510] = 0x55;
+        bs[511] = 0xAA;
+        dev.write_at(at, &bs).unwrap();
+    }
+
+    fn entries(p: &MockPlatform) -> Vec<(u32, u64, u64)> {
+        let mut dev = MemDevice::from_vec(p.disk_bytes(1));
+        let t = pm_parttable::read_table(&mut dev).unwrap();
+        t.entries.iter().map(|e| (e.number, e.start, e.len)).collect()
+    }
+
+    /// Run one step the way the executor does, but without its precheck (which refuses a
+    /// shrink of an unknown filesystem before any step runs).
+    fn run_step(p: &MockPlatform, op: &Operation, f: impl FnOnce(&mut Ctx) -> Result<()>) -> Result<()> {
+        let live = Model::from_platform(p).unwrap();
+        let after = live.clone();
+        let (mut log, mut stats) = (Vec::new(), Vec::new());
+        let cancel = CancelToken::new();
+        let mut ctx =
+            Ctx::new(p, &NullProgress, &cancel, (0, 1), op, &mut log, &mut stats, (&live, &after));
+        f(&mut ctx)
+    }
+
+    #[test]
+    fn table_only_shrink_checks_the_partition_head_in_session() {
+        let p = MockPlatform::new();
+        let mut dev = gpt_disk(&[(1, MIB, 20 * MIB), (2, 30 * MIB, 8 * MIB)]);
+        // partition 1: an NTFS boot sector the disk list did not report (no volume)
+        boot_sector(&mut dev, MIB, b"NTFS    ");
+        // partition 2: raw data without any signature
+        dev.write_at(30 * MIB, &[0x5A; 4096]).unwrap();
+        p.add_disk(1, dev, Default::default());
+        let model = Model::from_platform(&p).unwrap();
+        assert_eq!(model.partition(1, 1).unwrap().fs, None);
+
+        let shrink1 = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 10 * MIB };
+        let before = p.disk_bytes(1);
+        let err = run_step(&p, &shrink1, |ctx| resize::resize_move(ctx, 1, 1, MIB, 10 * MIB))
+            .unwrap_err();
+        let msg = message(err);
+        assert!(msg.contains("NTFS") && msg.contains("partition 1"), "{msg}");
+        assert_eq!(p.disk_bytes(1), before, "nothing written");
+        assert_eq!(p.write_sessions_log(), p.finished_sessions_log());
+
+        // a truly raw partition is trimmed in the table
+        let shrink2 = Operation::ResizeMove { disk: 1, number: 2, new_start: 30 * MIB, new_len: 4 * MIB };
+        run_step(&p, &shrink2, |ctx| resize::resize_move(ctx, 1, 2, 30 * MIB, 4 * MIB)).unwrap();
+        assert_eq!(entries(&p), vec![(1, MIB, 20 * MIB), (2, 30 * MIB, 4 * MIB)]);
+        assert_eq!(p.write_sessions_log(), p.finished_sessions_log());
+    }
+
+    #[test]
+    fn table_only_align_trim_checks_every_partition_head_first() {
+        let p = MockPlatform::new();
+        let legacy = 63 * 512;
+        let mut dev = MemDevice::new(DISK);
+        let mut t = Table::empty(TableKind::Gpt, DISK, 512);
+        t.gpt_first_usable = 34 * 512;
+        for (number, start) in [(1, legacy), (2, 10 * MIB + legacy)] {
+            t.entries.push(Entry {
+                number,
+                start,
+                len: 8 * MIB,
+                ptype: PartitionType::Gpt(gpt_types::BASIC_DATA),
+                guid: Some(Uuid::new_v4()),
+                name: String::new(),
+                attrs: 0,
+                logical: false,
+            });
+        }
+        pm_parttable::write_table(&mut dev, &t).unwrap();
+        // partition 2 is a locked BitLocker volume: no reader knows it
+        boot_sector(&mut dev, 10 * MIB + legacy, b"-FVE-FS-");
+        p.add_disk(1, dev, Default::default());
+        let op = Operation::AlignPartitions { disk: 1 };
+        let before = p.disk_bytes(1);
+        let msg = message(run_step(&p, &op, |ctx| table_ops::align(ctx, 1)).unwrap_err());
+        assert!(msg.contains("BitLocker") && msg.contains("partition 2"), "{msg}");
+        assert_eq!(p.disk_bytes(1), before, "partition 1 was not moved either");
+        assert_eq!(p.write_sessions_log(), p.finished_sessions_log());
+    }
+
+    #[test]
+    fn waiting_for_volumes_returns_once_they_are_back() {
+        let p = MockPlatform::new();
+        p.add_disk(1, gpt_disk(&[(1, MIB, 8 * MIB)]), Default::default());
+        let v = VolumeInfo { id: VolumeId("v1".into()), ..Default::default() };
+        p.add_volume(v, 1, MIB, 8 * MIB);
+        let cancel = CancelToken::new();
+        assert!(wait_for_volumes(&p, 1, 1, &cancel).unwrap());
+        // a volume that never comes back: bounded wait, not an error
+        let t = Instant::now();
+        assert!(!wait_for_volumes_with(&p, 1, 2, &cancel, Duration::from_millis(600)).unwrap());
+        assert!(t.elapsed() < Duration::from_secs(5));
+        // cancellable
+        cancel.cancel();
+        assert!(wait_for_volumes(&p, 1, 2, &cancel).is_err());
+    }
 }

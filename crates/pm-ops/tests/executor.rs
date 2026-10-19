@@ -665,6 +665,8 @@ fn execute_align_moves_data_before_table() {
     let p = MockPlatform::new();
     p.add_disk(1, dev, meta(1));
     p.set_system_disk(ELSEWHERE);
+    // an NTFS volume (a partition of unknown filesystem may not be trimmed)
+    p.add_volume(volume("a1", Some(FsKind::Ntfs), &[], len, len - MIB), 1, old, len);
     let r = run(&p, &[Operation::AlignPartitions { disk: 1 }]);
     assert_eq!(r.failed, None, "{:?}", r.log);
     let e = &table_of(&p, 1).entries[0];
@@ -803,6 +805,8 @@ fn execute_align_cancel_keeps_table_consistent() {
     let p = MockPlatform::new();
     p.add_disk(1, dev, meta(1));
     p.set_system_disk(ELSEWHERE);
+    p.add_volume(volume("a1", Some(FsKind::Ntfs), &[], len, len - MIB), 1, p1, len);
+    p.add_volume(volume("a2", Some(FsKind::Ntfs), &[], len, len - MIB), 1, p2, len);
 
     // cancel once the data of the first partition has been moved
     let cancel = CancelToken::new();
@@ -1039,4 +1043,39 @@ fn refs_can_grow_but_cannot_be_shrunk_online() {
     assert!(p.calls().is_empty(), "{:?}", p.calls());
     assert!(p.write_sessions_log().is_empty());
     assert_eq!(p.disk_bytes(1), before);
+}
+
+// ---------------------------------------------------------------- final review fixes
+
+#[test]
+fn shrink_of_a_partition_with_unknown_filesystem_is_refused() {
+    // partition 1 carries an NTFS boot sector, but no volume reported it (fs unknown)
+    let mut dev = gpt_dev(DISK_LEN, 0, Some(vec![entry(1, MIB, 20 * MIB, gpt_types::BASIC_DATA, 0)]));
+    let mut bs = vec![0u8; 512];
+    bs[3..11].copy_from_slice(b"NTFS    ");
+    bs[510] = 0x55;
+    bs[511] = 0xAA;
+    dev.write_at(MIB, &bs).unwrap();
+    let p = MockPlatform::new();
+    p.add_disk(1, dev, meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let model = Model::from_platform(&p).unwrap();
+    assert_eq!(model.partition(1, 1).unwrap().fs, None);
+
+    let shrink = Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 10 * MIB };
+    let msg = pm_ops::precheck(&model, &shrink).unwrap_err().to_string();
+    assert!(spaced(&msg).contains("filesystem unknown; refresh or check the volume"), "{msg}");
+    assert!(OpQueue::new(model.clone()).push(shrink.clone()).is_err());
+
+    let before = p.disk_bytes(1);
+    let r = run(&p, &[shrink]);
+    let (_, msg) = r.failed.expect("refused");
+    assert!(msg.contains("filesystem unknown"), "{msg}");
+    assert!(p.write_sessions_log().is_empty(), "no session was opened");
+    assert_eq!(p.disk_bytes(1), before);
+
+    // growing it only changes the table
+    let r = run(&p, &[Operation::ResizeMove { disk: 1, number: 1, new_start: MIB, new_len: 24 * MIB }]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_eq!(table_of(&p, 1).entries[0].len, 24 * MIB);
 }

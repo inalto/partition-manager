@@ -119,16 +119,8 @@ impl Platform for FilePlatform {
             out.push(match read_table(&mut dev) {
                 Ok(t) => {
                     let mut info = t.to_disk_info(base);
-                    // kind and label only: the fill level stays unknown (`used == None`), so the
-                    // planner's "unknown fill level" rule keeps shrinks of a filesystem away
-                    for p in &mut info.partitions {
-                        if let Some(probe) = pm_fs::detect(&mut dev, p.start) {
-                            if probe.kind != FsKind::Unknown {
-                                p.fs = Some(probe.kind);
-                                p.label = probe.label;
-                            }
-                        }
-                    }
+                    // kind and label only: the fill level stays unknown (`used == None`)
+                    crate::detect_filesystems(&mut info, &mut dev);
                     info
                 }
                 Err(e @ (Error::Io { .. } | Error::Cancelled)) => return Err(e),

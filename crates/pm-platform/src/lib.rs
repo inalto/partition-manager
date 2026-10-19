@@ -49,6 +49,28 @@ pub fn merge_volumes(disk: &mut DiskInfo, volumes: &[VolumeInfo]) {
     }
 }
 
+/// Fill `fs` and `label` of every partition of `disk` whose filesystem is still unknown (no
+/// mounted volume reported one) from the on-disk signature at its start ([`pm_fs::detect`]).
+/// `used` is left alone: the fill level stays unknown, so the planner's "unknown fill level"
+/// rule keeps shrinks of such a filesystem away. MBR extended containers are skipped. A read
+/// that fails (e.g. a query-only handle) leaves the partition unchanged.
+pub fn detect_filesystems(disk: &mut DiskInfo, dev: &mut dyn BlockDevice) {
+    let mbr = disk.table == pm_core::TableKind::Mbr;
+    for p in disk.partitions.iter_mut().filter(|p| p.fs.is_none()) {
+        if mbr && !p.logical && p.ptype.is_some_and(|t| t.is_extended_mbr()) {
+            continue;
+        }
+        if let Some(probe) = pm_fs::detect(dev, p.start) {
+            if probe.kind != FsKind::Unknown {
+                p.fs = Some(probe.kind);
+                if p.label.is_empty() {
+                    p.label = probe.label;
+                }
+            }
+        }
+    }
+}
+
 /// Platform for unsupported operating systems: every operation fails with `Error::Unsupported`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NullPlatform;
@@ -138,6 +160,39 @@ mod tests {
         assert!(!p.is_elevated());
         assert!(p.free_letters().is_empty());
         assert_eq!(p.system_disk(), None);
+    }
+
+    #[test]
+    fn detect_filesystems_fills_unmounted_partitions_only() {
+        use pm_core::{MemDevice, PartitionInfo, PartitionType, TableKind, MIB};
+        let mut dev = MemDevice::new(8 * MIB);
+        // an NTFS boot sector at 1 MiB, nothing at 3 MiB, an "NTFS" EBR-container head at 5 MiB
+        for off in [MIB, 5 * MIB] {
+            dev.write_at(off + 3, b"NTFS    ").unwrap();
+        }
+        let part = |number, start, ptype, logical| PartitionInfo {
+            number,
+            start,
+            len: MIB,
+            ptype: Some(PartitionType::Mbr(ptype)),
+            logical,
+            ..Default::default()
+        };
+        let mut d = DiskInfo {
+            table: TableKind::Mbr,
+            partitions: vec![part(1, MIB, 0x07, false), part(2, 3 * MIB, 0x07, false), part(3, 5 * MIB, 0x0F, false)],
+            ..Default::default()
+        };
+        let mut mounted = d.clone();
+        detect_filesystems(&mut d, &mut dev);
+        assert_eq!(d.partitions[0].fs, Some(FsKind::Ntfs));
+        assert_eq!(d.partitions[0].used, None, "the fill level stays unknown");
+        assert_eq!(d.partitions[1].fs, None, "no signature: raw");
+        assert_eq!(d.partitions[2].fs, None, "extended containers are not probed");
+        // a filesystem a mounted volume reported is kept
+        mounted.partitions[0].fs = Some(FsKind::ReFs);
+        detect_filesystems(&mut mounted, &mut dev);
+        assert_eq!(mounted.partitions[0].fs, Some(FsKind::ReFs));
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //! with the planner's numbers and commits it.
 
 use crate::operation::table_name;
-use super::{entry_mut, entry_of, format, move_data, with_session, Ctx};
+use super::resize::{is_container_part, unknown_fs_shrink};
+use super::{ensure_no_filesystem, entry_mut, entry_of, format, move_data, with_session, Ctx};
 use pm_core::units::MIB;
-use pm_core::{DiskInfo, Error, FsKind, PartitionType, Result, TableKind};
+use pm_core::{DiskInfo, Error, FsKind, PartitionInfo, PartitionType, Result, TableKind};
 use pm_parttable::{align_table, gpt_to_mbr, mbr_to_gpt, Table};
 
 /// Sectors at the start of a disk that hold the MBR, the GPT header and its entry array.
@@ -142,13 +143,18 @@ pub(crate) fn convert(ctx: &mut Ctx, disk: u32, to: TableKind) -> Result<()> {
     ctx.rescan(disk)
 }
 
-/// What happens to a filesystem whose partition shrinks from `old` to `new` bytes: `Ok(true)`
-/// when NTFS must be shrunk through the platform first, `Ok(false)` when nothing has to follow,
-/// `Unsupported` otherwise (only NTFS can be shrunk online; ReFS cannot).
-fn check_shrink(fs: Option<FsKind>, disk: u32, number: u32, old: u64, new: u64) -> Result<bool> {
-    match fs {
+/// What happens to the filesystem of `p` (on `disk`) when its partition shrinks to `new`
+/// bytes: `Ok(true)` when NTFS must be shrunk through the platform first, `Ok(false)` when
+/// nothing has to follow (an extended container, or — with `verified_later`, for the
+/// executor, which checks the device inside the session — an unknown filesystem),
+/// `Unsupported` otherwise (only NTFS can be shrunk online; ReFS cannot). An unknown
+/// filesystem is refused without `verified_later`.
+fn check_shrink(p: &PartitionInfo, disk: u32, new: u64, verified_later: bool) -> Result<bool> {
+    let (number, old) = (p.number, p.len);
+    match p.fs {
         _ if new >= old => Ok(false),
-        None => Ok(false),
+        None if is_container_part(p) || verified_later => Ok(false),
+        None => Err(unknown_fs_shrink(disk, number)),
         Some(FsKind::Ntfs) => Ok(true),
         Some(other) => Err(Error::Unsupported(format!(
             "partition {number} on Disk {disk}: resize of {} is not supported (aligning it would \
@@ -166,11 +172,15 @@ pub(crate) struct AlignChange {
     pub new: (u64, u64),
     /// Its NTFS filesystem must be shrunk first.
     pub shrink_fs: bool,
+    /// Only the table follows the shrink (no recognised filesystem): the executor verifies
+    /// inside the session that the partition head carries no filesystem signature.
+    pub verify_raw: bool,
 }
 
 /// What aligning `d` to 1 MiB changes, refusing (without side effects) partitions whose
-/// filesystem cannot follow a shrink. Shared by the executor and [`crate::precheck`].
-pub(crate) fn align_changes(d: &DiskInfo) -> Result<Vec<AlignChange>> {
+/// filesystem cannot follow a shrink. Shared by the executor (`verified_later`) and
+/// [`crate::precheck`].
+pub(crate) fn align_changes(d: &DiskInfo, verified_later: bool) -> Result<Vec<AlignChange>> {
     let target = align_table(&crate::model::table_from_disk(d), MIB);
     let mut out = Vec::new();
     for e in &target.entries {
@@ -180,8 +190,15 @@ pub(crate) fn align_changes(d: &DiskInfo) -> Result<Vec<AlignChange>> {
         if (p.start, p.len) == (e.start, e.len) {
             continue;
         }
-        let shrink_fs = check_shrink(p.fs, d.index, p.number, p.len, e.len)?;
-        out.push(AlignChange { number: p.number, old: (p.start, p.len), new: (e.start, e.len), shrink_fs });
+        let shrink_fs = check_shrink(p, d.index, e.len, verified_later)?;
+        let verify_raw = !shrink_fs && e.len < p.len && p.fs.is_none() && !is_container_part(p);
+        out.push(AlignChange {
+            number: p.number,
+            old: (p.start, p.len),
+            new: (e.start, e.len),
+            shrink_fs,
+            verify_raw,
+        });
     }
     Ok(out)
 }
@@ -197,7 +214,7 @@ pub(crate) fn align_changes(d: &DiskInfo) -> Result<Vec<AlignChange>> {
 /// partitions only: a single move is not cancellable once started.
 pub(crate) fn align(ctx: &mut Ctx, disk: u32) -> Result<()> {
     let d = ctx.live_disk(disk)?;
-    let changes = align_changes(d)?;
+    let changes = align_changes(d, true)?;
     if changes.is_empty() {
         ctx.note("nothing to align");
         return Ok(());
@@ -219,6 +236,10 @@ pub(crate) fn align(ctx: &mut Ctx, disk: u32) -> Result<()> {
                     c.number
                 )));
             }
+        }
+        // every table-only trim is verified before the first byte moves
+        for c in changes.iter().filter(|c| c.verify_raw) {
+            ensure_no_filesystem(s.device(), c.old.0, disk, c.number)?;
         }
         for c in &changes {
             let ((old_start, old_len), (new_start, new_len)) = (c.old, c.new);

@@ -75,13 +75,13 @@ pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
         Operation::SetLabel { .. } => Err(set_label_unsupported()),
         Operation::ResizeMove { disk, number, new_len, .. } => {
             if let Some(p) = model.partition(*disk, *number) {
-                steps::resize::check_resize(p, *disk, *number, *new_len)?;
+                steps::resize::check_resize(p, *disk, *number, *new_len, false)?;
             }
             Ok(())
         }
         Operation::AlignPartitions { disk } => {
             if let Some(d) = model.disk(*disk) {
-                steps::table_ops::align_changes(d)?;
+                steps::table_ops::align_changes(d, false)?;
             }
             Ok(())
         }
@@ -200,17 +200,51 @@ pub fn execute(
                     &mut report.rescue_stats,
                     (&live, &after),
                 );
-                run_op(&mut ctx, op)
+                run_op(&mut ctx, op)?;
+                Ok((written_disk(&live, op), after))
             });
-        if let Err(e) = r {
-            let msg = message(e);
-            report.log.push(format!("[{}/{n}] {}: failed: {msg}", i + 1, op.summary()));
-            report.failed = Some((i, msg));
-            break;
-        }
+        let (written, after) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = message(e);
+                report.log.push(format!("[{}/{n}] {}: failed: {msg}", i + 1, op.summary()));
+                report.failed = Some((i, msg));
+                break;
+            }
+        };
         report.completed += 1;
+        if i + 1 < n {
+            if let Some(d) = written {
+                settle_volumes(platform, d, &after, cancel, &mut report.log);
+            }
+        }
     }
     Ok(report)
+}
+
+/// Before the next operation re-reads the disks: give the OS time to bring back the volumes of
+/// `disk` (every partition of `after` on it that has a volume). Not reaching them is only
+/// logged; the next operation re-validates against whatever is there.
+fn settle_volumes(
+    platform: &dyn Platform,
+    disk: u32,
+    after: &Model,
+    cancel: &CancelToken,
+    log: &mut Vec<String>,
+) {
+    let expected = after
+        .disk(disk)
+        .map_or(0, |d| d.partitions.iter().filter(|p| p.volume.is_some()).count());
+    if expected == 0 {
+        return;
+    }
+    match steps::wait_for_volumes(platform, disk, expected, cancel) {
+        Ok(true) => {}
+        Ok(false) => log.push(format!(
+            "note: not every volume of Disk {disk} came back after the write; continuing"
+        )),
+        Err(e) => log.push(format!("note: waiting for the volumes of Disk {disk}: {}", message(e))),
+    }
 }
 
 /// Validate the whole list against the live state (each operation on the model the previous

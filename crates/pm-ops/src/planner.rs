@@ -540,6 +540,11 @@ fn resize_move(m: &mut Model, disk: u32, number: u32, new_start: u64, new_len: u
         }
         _ => {}
     }
+    // An unknown filesystem may only be one the disk list could not read: never shrink it
+    // (only the table would follow, truncating the data).
+    if new_len < p.len && p.fs.is_none() && !is_container(disk_ref(m, disk)?.table, &p) {
+        return Err(crate::steps::resize::unknown_fs_shrink(disk, number));
+    }
     let end = match new_start.checked_add(new_len) {
         Some(end) if end <= size => end,
         _ => {
@@ -735,6 +740,9 @@ fn align(m: &mut Model, disk: u32) -> Result<()> {
                  installation",
                 p.number
             ));
+        }
+        if e.len < p.len && p.fs.is_none() && !is_container(d.table, p) {
+            return Err(crate::steps::resize::unknown_fs_shrink(disk, p.number));
         }
         if p.used.map_or(false, |u| u > e.len) {
             return invalid(format!(
