@@ -339,7 +339,9 @@ impl Planner {
                 let p = part_ref(&m, *disk, *number)?.clone();
                 guard_windows(&m, *disk, &p, "change the type of")?;
                 guard_container(d, &p, "change the type of")?;
-                if !ptype_fits(d.table, *ptype) || (!p.logical && ptype.is_extended_mbr()) {
+                // an extended type would turn the partition (primary or logical) into a
+                // container and hide its data
+                if !ptype_fits(d.table, *ptype) || ptype.is_extended_mbr() {
                     return invalid(format!(
                         "Type {} cannot be used for partition {number} on the {} Disk {disk}",
                         ptype.name(),

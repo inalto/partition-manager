@@ -1295,3 +1295,39 @@ fn model_from_platform_finds_windows_by_its_system32_folder() {
     assert_eq!(m.windows_found, vec![(1, 41 * MIB)]);
     assert_eq!(m.windows_partition_of(1), Some(2));
 }
+
+#[test]
+fn read_only_or_offline_disks_and_extended_types_are_refused() {
+    let p = mbr_logicals();
+    let model = Model::from_platform(&p).unwrap();
+    // an extended type on a logical (or a primary) would hide its data in a container
+    for number in [5, 6] {
+        let op = Operation::SetType { disk: 1, number, ptype: PartitionType::Mbr(0x05) };
+        let msg = pm_ops::Planner::simulate(&model, &op).unwrap_err().to_string();
+        assert!(msg.contains("cannot be used"), "{msg}");
+    }
+    pm_ops::Planner::simulate(
+        &model,
+        &Operation::SetType { disk: 1, number: 5, ptype: PartitionType::Mbr(0x0C) },
+    )
+    .unwrap();
+
+    let wipe = Operation::WipePartition { disk: 1, number: 5, method: WipeMethod::Zero };
+    for (read_only, offline, needle) in [(true, false, "read-only"), (false, true, "offline")] {
+        let mut m = model.clone();
+        let d = m.disk_mut(1).unwrap();
+        d.flags.read_only = read_only;
+        d.flags.offline = offline;
+        let msg = pm_ops::precheck(&m, &wipe).unwrap_err().to_string();
+        assert!(msg.contains(needle) && msg.contains("Disk 1"), "{msg}");
+        assert!(OpQueue::new(m.clone()).push(wipe.clone()).is_err());
+        // reading the disk (an image of it) is still fine
+        let img = Operation::ImageDisk {
+            disk: 1,
+            path: std::env::temp_dir().join("pm-never-written.img"),
+            format: ImageFormat::Raw,
+            mode: CloneMode::Sector,
+        };
+        pm_ops::precheck(&m, &img).unwrap();
+    }
+}

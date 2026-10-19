@@ -129,7 +129,7 @@ pub(crate) fn prepare_copies<'a>(
         let mut shrink = None;
         if target_len < part.len {
             let fs_len = fs_facts(ctx.platform, src_disk, part.start, part.len)
-                .map_or(part.len, |f| f.total);
+                .map_or(part.len, |f| f.footprint());
             if fs_len > target_len {
                 if !shrinkable(part) {
                     return Err(must_shrink_first(src_disk, part));
@@ -174,13 +174,13 @@ pub(crate) fn prepare_copies<'a>(
             .then(|| fs_facts(ctx.platform, d.src_disk, d.part.start, d.part.len))
             .flatten();
         if let Some(f) = &facts {
-            if f.total > len {
+            if f.footprint() > len {
                 return Err(Error::Invalid(format!(
                     "partition {} on Disk {}: its filesystem ({}) is still larger than its {} \
                      target",
                     d.part.number,
                     d.src_disk,
-                    format_size(f.total),
+                    format_size(f.footprint()),
                     format_size(len)
                 )));
             }

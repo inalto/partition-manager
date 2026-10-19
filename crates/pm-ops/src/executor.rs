@@ -75,7 +75,23 @@ pub struct ExecReport {
 /// * a clone / migration that puts a source partition into a smaller target unless the source
 ///   is an NTFS volume that can be shrunk online. (Conservative: a filesystem smaller
 ///   than its partition would fit, but the model does not know filesystem sizes.)
+/// * any write to a disk Windows reports as read-only or offline.
 pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
+    if let Some(d) = written_disk(model, op).and_then(|d| model.disk(d)) {
+        let i = d.index;
+        if d.flags.read_only {
+            return Err(Error::Invalid(format!(
+                "Disk {i} is read-only; clear its read-only attribute first (Disk Management, or \
+                 Set-Disk {i} -IsReadOnly $false)"
+            )));
+        }
+        if d.flags.offline {
+            return Err(Error::Invalid(format!(
+                "Disk {i} is offline; bring it online first (Disk Management, or Set-Disk {i} \
+                 -IsOffline $false)"
+            )));
+        }
+    }
     match op {
         Operation::SetLabel { .. } => Err(set_label_unsupported()),
         Operation::ResizeMove { disk, number, new_len, .. } => {

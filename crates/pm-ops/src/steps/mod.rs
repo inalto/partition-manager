@@ -377,8 +377,17 @@ pub(crate) fn volume_of(ctx: &Ctx, disk: u32, part: &PartitionInfo) -> Result<Vo
 /// Filesystem facts used to copy only what matters.
 pub(crate) struct FsFacts {
     pub used: UsedMap,
-    /// Filesystem size in bytes.
+    /// Filesystem size in bytes, as the filesystem reports it.
     pub total: u64,
+}
+
+impl FsFacts {
+    /// Bytes the filesystem occupies from the partition start: its size, or the extent of its
+    /// used map when that is larger (NTFS: the volume plus the backup boot sector after it,
+    /// which `total` leaves out).
+    pub(crate) fn footprint(&self) -> u64 {
+        self.total.max(self.used.len)
+    }
 }
 
 /// Used map and size of the filesystem at `[start, start + len)` of `disk`; `None` when it
@@ -549,6 +558,15 @@ mod tests {
         assert!(msg.contains("BitLocker") && msg.contains("partition 2"), "{msg}");
         assert_eq!(p.disk_bytes(1), before, "partition 1 was not moved either");
         assert_eq!(p.write_sessions_log(), p.finished_sessions_log());
+    }
+
+    #[test]
+    fn filesystem_footprint_includes_the_ntfs_backup_boot_sector() {
+        let used = UsedMap::new(8 * MIB, 4096);
+        let f = FsFacts { used, total: 8 * MIB - 512 };
+        assert_eq!(f.footprint(), 8 * MIB);
+        let f = FsFacts { used: UsedMap::new(MIB, 4096), total: 2 * MIB };
+        assert_eq!(f.footprint(), 2 * MIB);
     }
 
     #[test]
