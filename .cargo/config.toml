@@ -1,0 +1,8 @@
+# Machine-specific: no MSVC Build Tools are installed, so we build with the GNU
+# toolchain and the portable WinLibs MinGW-w64 installed via
+#   winget install --id BrechtSanders.WinLibs.POSIX.UCRT --scope user
+# If you install Visual Studio Build Tools, delete this file and rust-toolchain.toml.
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/alain/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gcc.exe"
+rustflags = ["-C", "dlltool=C:/Users/alain/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/dlltool.exe"]
+
