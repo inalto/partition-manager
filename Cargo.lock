@@ -455,6 +455,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-recover"
+version = "0.1.0"
+dependencies = [
+ "pm-core",
+ "pm-fs",
+ "pm-parttable",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
