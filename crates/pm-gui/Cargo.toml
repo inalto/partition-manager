@@ -1,0 +1,36 @@
+[package]
+name = "pm-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Partition Manager desktop application (eframe/egui)"
+build = "build.rs"
+
+[lib]
+name = "pm_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "partition-manager"
+path = "src/main.rs"
+
+[dependencies]
+pm-core = { path = "../pm-core" }
+pm-platform = { path = "../pm-platform" }
+pm-ops = { path = "../pm-ops" }
+pm-parttable = { path = "../pm-parttable" }
+pm-fs = { path = "../pm-fs" }
+pm-image = { path = "../pm-image" }
+pm-recover = { path = "../pm-recover" }
+pm-analyze = { path = "../pm-analyze" }
+eframe.workspace = true
+egui_extras.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+tempfile.workspace = true

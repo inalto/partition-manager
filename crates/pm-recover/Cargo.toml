@@ -1,0 +1,18 @@
+[package]
+name = "pm-recover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Partition Manager recovery: lost-partition finder, deleted-file recovery, signature-based file carving and saveable scan sessions"
+
+[dependencies]
+pm-core = { path = "../pm-core" }
+pm-fs = { path = "../pm-fs" }
+pm-parttable = { path = "../pm-parttable" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pm-image = { path = "../pm-image", features = ["testing"] }
+tempfile.workspace = true

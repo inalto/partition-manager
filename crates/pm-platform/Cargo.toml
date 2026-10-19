@@ -1,0 +1,31 @@
+[package]
+name = "pm-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Partition Manager OS abstraction: Platform trait, mock and the Windows implementation"
+
+[dependencies]
+pm-core = { path = "../pm-core" }
+pm-fs = { path = "../pm-fs" }
+pm-parttable = { path = "../pm-parttable" }
+serde.workspace = true
+uuid.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+] }
