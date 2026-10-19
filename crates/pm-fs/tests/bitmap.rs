@@ -55,3 +55,31 @@ fn all_used_and_empty() {
     let exact = UsedMap::all_used(8 * 4096);
     assert_eq!(exact.ranges().collect::<Vec<_>>(), vec![(0, 8 * 4096)]);
 }
+
+#[test]
+fn bitmap_origin_units_align() {
+    let mut m = UsedMap::with_origin(4096 * 10, 4096, 512);
+    assert_eq!(m.origin, 512);
+    // [512, 4608) is exactly one unit
+    m.set(512, 4096);
+    assert_eq!(m.ranges().collect::<Vec<_>>(), vec![(512, 4096)]);
+    assert_eq!(m.used_bytes(), 4096);
+    assert!(!m.is_used(511));
+    assert!(m.is_used(512) && m.is_used(4607));
+    assert!(!m.is_used(4608));
+    // the short head unit covers [0, 512)
+    m.set(0, 10);
+    assert!(m.is_used(0) && m.is_used(511));
+    assert_eq!(m.ranges().collect::<Vec<_>>(), vec![(0, 4608)]);
+    // the tail is clipped to len
+    m.set(4096 * 10 - 1, 1);
+    let r: Vec<_> = m.ranges().collect();
+    assert_eq!(r.last().copied(), Some((512 + 4096 * 9, 4096 * 10 - (512 + 4096 * 9))));
+    assert!(m.ranges().all(|(s, l)| s + l <= 4096 * 10));
+    // plain maps keep origin 0; `with_origin` reduces the origin modulo the unit
+    assert_eq!(UsedMap::new(100, 10).origin, 0);
+    assert_eq!(UsedMap::with_origin(100, 10, 13).origin, 3);
+    let mut z = UsedMap::with_origin(100, 10, 0);
+    z.set(10, 10);
+    assert_eq!(z.ranges().collect::<Vec<_>>(), vec![(10, 10)]);
+}

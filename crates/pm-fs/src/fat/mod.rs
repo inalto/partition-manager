@@ -10,6 +10,9 @@ use bpb::Bpb;
 use pm_core::{BlockDevice, CancelToken, Error, FsKind, ProgressReport, ProgressSink, Result};
 use std::collections::HashSet;
 
+/// Largest possible FAT directory: 65 536 entries of 32 bytes.
+const MAX_DIR_BYTES: usize = 2 * 1024 * 1024;
+
 /// Remembers where the last chain walk ended so sequential reads stay O(1) per cluster.
 #[derive(Clone, Copy)]
 struct Cursor {
@@ -154,17 +157,22 @@ impl FatFs {
         }
     }
 
-    /// All clusters of the chain starting at `first`.
-    fn chain(&mut self, first: u32) -> Result<Vec<u32>> {
+    /// All clusters of the directory chain starting at `first`; chains longer than `limit`
+    /// clusters (or than the volume has clusters) are rejected so corrupt volumes cannot
+    /// force huge allocations.
+    fn dir_chain(&mut self, first: u32, limit: usize) -> Result<Vec<u32>> {
         if !self.valid_cluster(first) {
             return Err(Error::Parse(format!("invalid start cluster {first}")));
         }
-        let limit = self.bpb.cluster_count as usize;
+        let loop_limit = self.bpb.cluster_count as usize;
         let mut v = Vec::new();
         let mut c = first;
         loop {
             v.push(c);
             if v.len() > limit {
+                return Err(Error::Parse("directory chain too long".into()));
+            }
+            if v.len() > loop_limit {
                 return Err(Error::Parse("FAT chain loop".into()));
             }
             match self.next_cluster(c)? {
@@ -205,8 +213,10 @@ impl FatFs {
             self.dev.read_at(self.base + self.bpb.root_dir_start(), &mut buf)?;
             return Ok(buf);
         }
-        let chain = self.chain(id)?;
         let cs = self.bpb.cluster_bytes() as usize;
+        // a FAT directory holds at most 65 536 entries of 32 bytes
+        let cap = MAX_DIR_BYTES.div_ceil(cs).max(1);
+        let chain = self.dir_chain(id, cap)?;
         let mut buf = vec![0u8; chain.len() * cs];
         for (i, &c) in chain.iter().enumerate() {
             self.dev
@@ -279,7 +289,10 @@ impl FileSystem for FatFs {
 
     fn used_map(&mut self) -> Result<UsedMap> {
         let cs = self.bpb.cluster_bytes();
-        let mut map = UsedMap::new(self.bpb.total_bytes(), cs);
+        // Never describe more than the device holds, and align the grid to the data region so
+        // every cluster is exactly one unit even when `data_start` is not a multiple of `cs`.
+        let len = self.bpb.total_bytes().min(self.dev.len().saturating_sub(self.base));
+        let mut map = UsedMap::with_origin(len, cs, self.bpb.data_start() % cs as u64);
         // reserved sectors, every FAT and the fixed root directory
         map.set(0, self.bpb.data_start());
 

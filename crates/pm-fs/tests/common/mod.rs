@@ -312,18 +312,29 @@ pub struct Fat1x {
 }
 
 pub fn fat1x_image(bits: u8) -> Fat1x {
-    // (total sectors, root entries, fat sectors, media)
-    let (total, root_entries, fatsz, media): (u32, u32, u32, u8) = match bits {
-        12 => (2880, 224, 9, 0xF0),
-        _ => (16384, 512, 65, 0xF8),
-    };
+    match bits {
+        12 => fat1x_custom(12, 2880, 1, 1, 9, 224, 0xF0),
+        _ => fat1x_custom(16, 16384, 1, 1, 65, 512, 0xF8),
+    }
+}
+
+/// Hand-built FAT12/16 image with explicit geometry (512-byte sectors, 2 FATs, fixed root).
+pub fn fat1x_custom(
+    bits: u8,
+    total: u32,
+    spc: u8,
+    reserved: u16,
+    fatsz: u32,
+    root_entries: u32,
+    media: u8,
+) -> Fat1x {
     let mut dev = MemDevice::new(total as u64 * 512);
     let mut s0 = [0u8; 512];
     s0[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
     s0[3..11].copy_from_slice(b"MSDOS5.0");
     put16(&mut s0, 11, 512);
-    s0[13] = 1;
-    put16(&mut s0, 14, 1);
+    s0[13] = spc;
+    put16(&mut s0, 14, reserved);
     s0[16] = 2;
     put16(&mut s0, 17, root_entries as u16);
     put16(&mut s0, 19, total as u16);
@@ -339,11 +350,11 @@ pub fn fat1x_image(bits: u8) -> Fat1x {
     s0[510] = 0x55;
     s0[511] = 0xAA;
     dev.write_at(0, &s0).unwrap();
-    let fat_offs: Vec<u64> = vec![512, 512 + fatsz as u64 * 512];
-    let root_off = (1 + 2 * fatsz as u64) * 512;
+    let fat_offs: Vec<u64> = vec![reserved as u64 * 512, (reserved as u64 + fatsz as u64) * 512];
+    let root_off = (reserved as u64 + 2 * fatsz as u64) * 512;
     let root_len = root_entries as u64 * 32;
     let data_off = root_off + root_len;
-    let mut img = Img { dev, bits, bps: 512, spc: 1, fat_offs, data_off, next_free: 2 };
+    let mut img = Img { dev, bits, bps: 512, spc: spc as u64, fat_offs, data_off, next_free: 2 };
     img.set_fat(0, 0xFFFF_FF00 | media as u32);
     img.set_fat(1, 0xFFFF_FFFF);
     Fat1x { img, root: DirLoc::Fixed(root_off, root_len) }

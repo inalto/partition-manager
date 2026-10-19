@@ -230,8 +230,8 @@ fn fat32_used_map_counts_reserved_fats_and_root() {
     assert!(ranges[1].0 > ranges[0].0 + ranges[0].1);
     let used: u64 = ranges.iter().map(|r| r.1).sum();
     assert_eq!(m.used_bytes(), used);
-    // 9 used clusters (2..=5, 7..=10) plus metadata, at unit granularity
-    assert!(used >= data_off + 8 * cs && used <= data_off + 10 * cs + 2 * cs, "used {used}");
+    // exactly the metadata plus 8 used clusters (2..=5, 7..=10); no over-marking
+    assert_eq!(used, data_off + 8 * cs);
 }
 
 #[test]
