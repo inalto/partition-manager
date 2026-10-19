@@ -7,6 +7,11 @@ use crate::theme::DANGER;
 use crate::views::icons;
 use eframe::egui::{self, Color32, RichText};
 
+/// Known limitation shown whenever the system disk is involved (see the README).
+pub const SYSTEM_DISK_BUSY_NOTE: &str = "Note: changes on the running system disk (creating a \
+     partition in free space, growing C:) currently stop with \"device busy\": C: cannot be \
+     locked while Windows runs from it. Nothing is written. A lock-free path is planned.";
+
 pub fn show(
     ctx: &egui::Context,
     s: &AppState,
@@ -41,6 +46,7 @@ pub fn show(
                 "Allow resize, drive letter, label and mount changes on the system disk",
             )
             .on_hover_text("Destructive operations on the system disk are always refused");
+            ui.label(SYSTEM_DISK_BUSY_NOTE);
             ui.add_space(4.0);
         }
         if s.dry_run {

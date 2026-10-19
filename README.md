@@ -51,7 +51,13 @@ can be practised risk-free on image files with `--disk-file`.
   If the system disk cannot be determined, every disk is treated as protected.
 - **Lock and dismount.** Writes happen inside a write session that locks and dismounts every
   volume on the disk (and takes a non-system disk offline). If a volume cannot be locked the
-  operation stops before anything is written. There is no kernel driver.
+  operation stops before anything is written. There is no kernel driver. The direct-copy
+  commands (`pm clone`, `restore`, `rescue`) write disks, partitions and volumes through the
+  same session.
+- **Same disks as queued.** Before each operation the disks are read again, and every disk
+  and partition the operation names must still be the one it was queued against (size, serial
+  number and disk id; partition position and GUID). Otherwise the run stops with "disk layout
+  changed since the operations were queued; refresh and queue again".
 - **Elevation.** The release `partition-manager.exe` carries a `requireAdministrator` manifest
   and asks for UAC on launch. Debug builds do not, so `cargo run` does not prompt.
 - **Practice on image files.** `--disk-file PATH` presents a raw image file as a disk in
@@ -230,6 +236,31 @@ Dismount-DiskImage -ImagePath C:\img\practice.vhd
 
 VMDK files attach to VMware or VirtualBox (`VBoxManage showmediuminfo disk.vmdk`).
 
+## Before the first real-disk run
+
+**Nothing has yet been run elevated against a real disk.** Everything is tested on in-memory
+disks and image files. Before you point Partition Manager at a disk with data on it, work
+through the 12-step checklist in [docs/FIRST-LIVE-TEST.md](docs/FIRST-LIVE-TEST.md) on a
+dedicated USB stick or an attached VHD, with every other external drive unplugged and a
+backup of the machine. In short:
+
+- Start with `pm doctor` (the system disk must match `(Get-Disk | ? IsSystem).Number`) and
+  `pm list --json` against `Get-Partition`, then read-only checks, an image test, and only
+  then the first write (`pm init-disk N --gpt --dry-run`, then `--yes`).
+- Run elevated with `$env:RUST_LOG="debug"` and stderr redirected to a log file; the GUI logs
+  to `%LOCALAPPDATA%\PartitionManager\partition-manager.log` (*Settings > Open log folder*).
+- Operations on the running system disk currently stop with "device busy" (see Known
+  limitations).
+- Migrate OS copies a live C: without VSS: close applications, expect chkdsk on the first
+  boot, and test the copy with the source detached.
+- Smart copies leave old data in unused areas of the destination (wipe it first if that
+  matters); a move cannot be cancelled once copying starts (use a UPS or battery); any open
+  handle on a target volume blocks the session (nothing is written).
+- Still to be verified live: volume reads past the filesystem end
+  (`FSCTL_ALLOW_EXTENDED_DASD_IO`), the automount drive-letter race on create, the drive
+  letter of a migrated clone (`MountedDevices`), copying a live C: without VSS, and
+  formatting on removable media (`FormatEx` media type).
+
 ## Known limitations
 
 - **Creating file systems.** Partition Manager does not implement NTFS, ReFS or exFAT
@@ -237,7 +268,14 @@ VMDK files attach to VMware or VirtualBox (`VBoxManage showmediuminfo disk.vmdk`
   has a built-in formatter, used for images and tests. On image files nothing can be formatted.
 - **Resizing.** Only NTFS can be shrunk and grown (through Windows); ReFS can only be grown.
   Other recognised file systems can be moved but not resized. A partition with no recognised
-  file system changes in the partition table only.
+  file system can grow (in the partition table only) but is never shrunk or trimmed by
+  alignment: its file system may simply be one the disk list could not read ("filesystem
+  unknown; refresh or check the volume").
+- **The running system disk.** Operations on it that are otherwise allowed (creating a
+  partition in free space, growing C:, letters and mounts with `--allow-system-disk` or the
+  GUI's checkbox) currently stop with "device busy": every write session locks all volumes of
+  the disk, and C: cannot be locked while Windows runs from it. Nothing is written. A
+  lock-free path for these changes is planned.
 - **Not supported.** Dynamic disks, BitLocker volumes, RAID/LVM, a bootable rescue-media
   builder, defragmentation.
 - **MBR extended layouts** with less than 1 MiB between the EBRs (legacy cylinder-aligned

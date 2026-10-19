@@ -82,6 +82,8 @@ fix.
         v
   Executor::execute(platform, ops, opts, progress, cancel)
         |   for each operation, on a fresh live Model:
+        |     0. layout_matches(expected, live)   the disks / partitions it names are still
+        |                                         the ones it was queued against
         |     1. guard_system_disk(live, op)      refuse the running system disk
         |     2. precheck(live, op)               static refusals again, on live state
         |     3. Planner::simulate(live, op)      validate against what is really attached
@@ -119,8 +121,8 @@ in one front end does not defeat the others.
 | Layer | Where | What it refuses |
 |---|---|---|
 | 1. Planner | `pm-ops/src/planner.rs` (`Planner::simulate`) | overlaps, misalignment, minimum sizes, an extended-partition container, a destination smaller than the used data, whole-disk destructive operations on the running system disk, and on every disk when the system disk cannot be determined |
-| 2. Precheck | `pm-ops/src/executor.rs` (`precheck`), also run by `OpQueue::push` | operations the executor can never perform, so they are not even accepted into the queue: `SetLabel` (no platform API yet), resizing a recognised non-NTFS filesystem (ReFS may only grow), alignment that would shrink one, a clone into a smaller target when the source is not an NTFS volume that can be shrunk online |
-| 3. Executor pre-flight | `pm-ops/src/executor.rs` (`execute`, `guard_system_disk`) | re-validates every operation against the live model just before running it: the running system disk is refused unless `allow_system_disk` is set, and then only for resize, label, letter, mount, unmount and creating a partition in free space; an undeterminable system disk fails closed |
+| 2. Precheck | `pm-ops/src/executor.rs` (`precheck`), also run by `OpQueue::push` | operations the executor can never perform, so they are not even accepted into the queue: `SetLabel` (no platform API yet), resizing a recognised non-NTFS filesystem (ReFS may only grow), alignment that would shrink one, shrinking or aligning a partition whose filesystem is unknown, any write to a disk Windows reports as read-only or offline, a clone into a smaller target when the source is not an NTFS volume that can be shrunk online |
+| 3. Executor pre-flight | `pm-ops/src/executor.rs` (`execute_queued`, `guard_system_disk`), `pm-ops/src/identity.rs` (`layout_matches`) | re-validates every operation against the live model just before running it: every disk it names must still match the queue's model on size, serial and disk id and every partition on start, length and GPT GUID (MBR logicals are renumbered in the simulation as on disk); the running system disk is refused unless `allow_system_disk` is set, and then only for resize, label, letter, mount, unmount and creating a partition in free space; an undeterminable system disk fails closed. Inside the session, a table-only shrink re-reads the partition head and refuses a filesystem signature |
 | 4. Platform session | `pm-platform` (`WriteSession`, `windows/session.rs`) | writes only through a session that holds locked and dismounted volumes (a volume that cannot be locked aborts the operation); no kernel driver is used |
 
 On top of these:
@@ -130,8 +132,10 @@ On top of these:
   shows a confirmation listing every destructive step. The CLI operation commands write
   only with `--yes`, and `--dry-run` runs the whole validation path without writing.
 - **Direct-copy commands** (`pm clone`, `restore`, `image`, `convert`, `rescue`) refuse the
-  source as destination, overlapping targets, the running system disk, and the extent file
-  of a VMDK descriptor, and write images to `FILE.partial` before renaming.
+  source as destination, overlapping targets, the running system disk (failing closed when it
+  cannot be determined), volumes whose place on a disk is unknown, and the extent file of a
+  VMDK descriptor; they write disks, partitions and volumes through a `WriteSession` and
+  images to `FILE.partial` before renaming.
 - **`--disk-file`** swaps the platform for `FilePlatform`, so practice runs touch only
   image files and need no elevation.
 - **Elevation.** Release builds of `partition-manager.exe` embed a `requireAdministrator`
