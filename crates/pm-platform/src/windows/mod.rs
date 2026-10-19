@@ -130,7 +130,15 @@ impl Platform for WindowsPlatform {
         quick: bool,
         progress: &dyn ProgressSink,
     ) -> Result<()> {
-        format::format(id, fs, label, cluster, quick, progress)
+        // FormatEx wants to know whether the volume is on removable media
+        let removable = self
+            .enumerate_volumes()
+            .ok()
+            .and_then(|vs| vs.into_iter().find(|v| v.id == *id))
+            .and_then(|v| v.disk)
+            .and_then(disk::is_removable)
+            .unwrap_or(false);
+        format::format(id, fs, label, cluster, quick, removable, progress)
     }
 
     fn shrink_volume(&self, id: &VolumeId, new_len: u64) -> Result<()> {

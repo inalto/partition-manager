@@ -41,6 +41,14 @@ fn open_for_query(path: &str) -> Result<(Handle, bool), u32> {
     }
 }
 
+/// Whether disk `index` reports removable media (storage device descriptor); `None` when it
+/// cannot be queried.
+pub fn is_removable(index: u32) -> Option<bool> {
+    let (h, _) = open_for_query(&disk_path(index)).ok()?;
+    let b = ioctl::query_property(&h, StorageDeviceProperty).ok()?;
+    parse_device_descriptor(&b).ok().map(|d| d.removable)
+}
+
 /// Every disk with partitions, merged with `volumes` (by disk and start offset).
 pub fn enumerate_disks(volumes: &[VolumeInfo], system_disk: Option<u32>) -> Vec<DiskInfo> {
     let mut out = Vec::new();

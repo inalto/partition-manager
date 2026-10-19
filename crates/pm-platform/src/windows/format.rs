@@ -39,18 +39,21 @@ fn format_root(id: &VolumeId) -> Result<(String, Option<MountPoint>)> {
     Ok((mp.to_path_string(), Some(mp)))
 }
 
+/// Format volume `id`; `removable` selects FormatEx's media type (removable or fixed disk).
 pub fn format(
     id: &VolumeId,
     fs: FsKind,
     label: &str,
     cluster: Option<u32>,
     quick: bool,
+    removable: bool,
     progress: &dyn ProgressSink,
 ) -> Result<()> {
     let fs_name = fs_format_name(fs)
         .ok_or_else(|| Error::Unsupported(format!("Windows cannot format {}", fs.display_name())))?;
     let (root, temp) = format_root(id)?;
-    let result = format_at(&root, fs_name, label, cluster, quick, progress);
+    let media = ioctl::format_media_type(removable);
+    let result = format_at(&root, media, fs_name, label, cluster, quick, progress);
     if let Some(mp) = temp {
         if let Err(e) = mount::unmount(id, &mp) {
             log::warn!("removing temporary mount point {}: {e}", mp.to_path_string());
@@ -61,6 +64,7 @@ pub fn format(
 
 fn format_at(
     root: &str,
+    media: u32,
     fs_name: &str,
     label: &str,
     cluster: Option<u32>,
@@ -70,7 +74,7 @@ fn format_at(
     let guard = ioctl::format_lock();
     report(progress, 0);
     let outcome = std::thread::scope(|s| {
-        let worker = s.spawn(|| ioctl::format_ex(&guard, root, fs_name, label, quick, cluster.unwrap_or(0)));
+        let worker = s.spawn(|| ioctl::format_ex(&guard, root, media, fs_name, label, quick, cluster.unwrap_or(0)));
         let mut last = u32::MAX;
         while !worker.is_finished() {
             let pct = guard.percent();

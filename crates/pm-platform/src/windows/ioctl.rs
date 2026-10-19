@@ -471,8 +471,19 @@ pub fn system_message(code: Code) -> Option<String> {
 
 // ---- fmifs.dll!FormatEx -------------------------------------------------------------------
 
-/// `FMIFS_HARDDISK` media type.
-const FMIFS_HARDDISK: u32 = 0xC;
+/// `MEDIA_TYPE` values FormatEx takes (winioctl.h: `RemovableMedia` = 11, `FixedMedia` = 12;
+/// 1..=10 are floppy formats).
+pub const MEDIA_REMOVABLE: u32 = 11;
+pub const MEDIA_FIXED: u32 = 12;
+
+/// The FormatEx media type for a volume on a removable (USB stick, card) or fixed disk.
+pub fn format_media_type(removable: bool) -> u32 {
+    if removable {
+        MEDIA_REMOVABLE
+    } else {
+        MEDIA_FIXED
+    }
+}
 /// Callback command codes (`FILE_SYSTEM_CALLBACK_COMMAND`); not in windows-sys.
 const FCC_PROGRESS: u32 = 0;
 const FCC_DONE: u32 = 11;
@@ -545,6 +556,7 @@ extern "system" fn format_callback(command: u32, _action: u32, data: *mut c_void
 pub fn format_ex(
     _guard: &FormatGuard,
     root: &str,
+    media: u32,
     fs: &str,
     label: &str,
     quick: bool,
@@ -573,7 +585,7 @@ pub fn format_ex(
     unsafe {
         format(
             r.as_ptr(),
-            FMIFS_HARDDISK,
+            media,
             f.as_ptr(),
             l.as_ptr(),
             quick as BOOL,
@@ -589,6 +601,12 @@ pub fn format_ex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_media_types_follow_winioctl() {
+        assert_eq!(format_media_type(false), 12, "FixedMedia");
+        assert_eq!(format_media_type(true), 11, "RemovableMedia");
+    }
 
     #[test]
     fn wide_roundtrip() {
