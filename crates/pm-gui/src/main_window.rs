@@ -6,6 +6,7 @@ use crate::args::Args;
 use crate::dialogs::{self, progress, properties};
 use crate::theme::{self, Theme, DANGER};
 use crate::views::{disk_map, disk_table, icons, legend, sidebar, toolbar};
+use crate::wizard::WizardOutcome;
 use eframe::egui::{self, Color32, RichText};
 use pm_platform::Platform;
 use std::sync::Arc;
@@ -95,6 +96,15 @@ impl PartitionApp {
             if matches!(job.kind, JobKind::Apply { .. }) {
                 progress::show(ctx, job, &mut cmds);
             }
+        }
+        if let Some(mut w) = s.wizard.take() {
+            let wctx = s.wizard_ctx(&w);
+            match w.wizard.show(ctx, &wctx) {
+                WizardOutcome::Open => {}
+                WizardOutcome::Cancelled => cmds.push(Cmd::CloseWizard),
+                WizardOutcome::Finished(ops) => cmds.push(Cmd::FinishWizard(ops)),
+            }
+            s.wizard = Some(w);
         }
         if let Some(mut d) = s.dialog.take() {
             if dialogs::show(ctx, s, &mut d, &mut cmds) {
@@ -226,6 +236,11 @@ mod tests {
             frame(&mut app);
             std::thread::sleep(Duration::from_millis(5));
         }
+        // a wizard draws over the main window
+        app.state.handle(Cmd::Action(crate::actions::Action::ResizeMove, crate::selection::Selected::Partition(1, 3)));
+        frame(&mut app);
+        assert!(app.state.wizard.is_some());
+        app.state.handle(Cmd::CloseWizard);
         app.state.handle(Cmd::Action(crate::actions::Action::DeletePartition, crate::selection::Selected::Partition(1, 3)));
         app.state.handle(Cmd::Apply);
         app.state.handle(Cmd::SetTheme(Theme::Dark));

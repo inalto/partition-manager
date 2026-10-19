@@ -16,6 +16,7 @@ pub enum Action {
     // Convert disk
     ConvertMbrToGpt,
     ConvertGptToMbr,
+    InitializeDisk,
     // Clean disk
     WipeDisk,
     DeleteAllPartitions,
@@ -50,7 +51,10 @@ pub const GROUPS: [Group; 5] = [
         title: "Wizards",
         actions: &[Action::MigrateOs, Action::CopyDisk, Action::CopyPartition, Action::PartitionRecovery],
     },
-    Group { title: "Convert disk", actions: &[Action::ConvertMbrToGpt, Action::ConvertGptToMbr] },
+    Group {
+        title: "Convert disk",
+        actions: &[Action::ConvertMbrToGpt, Action::ConvertGptToMbr, Action::InitializeDisk],
+    },
     Group { title: "Clean disk", actions: &[Action::WipeDisk, Action::DeleteAllPartitions] },
     Group {
         title: "Check disk",
@@ -103,6 +107,7 @@ impl Action {
             PartitionRecovery => "Partition Recovery",
             ConvertMbrToGpt => "Convert MBR to GPT",
             ConvertGptToMbr => "Convert GPT to MBR",
+            InitializeDisk => "Initialize Disk",
             WipeDisk => "Wipe Disk",
             DeleteAllPartitions => "Delete All Partitions",
             AlignAllPartitions => "Align All Partitions",
@@ -139,12 +144,18 @@ impl Action {
             PartitionRecovery => disk_sel || (matches!(sel, Selected::Free(..)) && disk.is_some()),
             ConvertMbrToGpt => disk_sel && table == Some(TableKind::Mbr),
             ConvertGptToMbr => disk_sel && table == Some(TableKind::Gpt),
+            InitializeDisk => {
+                matches!(sel, Selected::Disk(_) | Selected::Free(..))
+                    && matches!(table, Some(TableKind::None | TableKind::Unknown))
+            }
             WipeDisk => disk_sel,
             DeleteAllPartitions | AlignAllPartitions => disk_sel && has_parts,
             SurfaceTest => disk.is_some() && !matches!(sel, Selected::Free(..)),
             RebuildMbr => disk_sel && matches!(table, Some(TableKind::Mbr | TableKind::Gpt)),
             DiskProperties => disk.is_some(),
-            CreatePartition => matches!(sel, Selected::Free(..)) && disk.is_some(),
+            CreatePartition => {
+                matches!(sel, Selected::Free(..)) && matches!(table, Some(TableKind::Mbr | TableKind::Gpt))
+            }
             DeletePartition | FormatPartition | ResizeMove | ChangeLetter | ChangeType | WipePartition => {
                 part.is_some()
             }
@@ -170,8 +181,6 @@ impl Action {
             SetActive => one(Operation::SetActive { disk: d, number: part?.number }),
             AlignAllPartitions => one(Operation::AlignPartitions { disk: d }),
             RebuildMbr => one(Operation::RebuildMbr { disk: d }),
-            ConvertMbrToGpt => one(Operation::ConvertTable { disk: d, to: TableKind::Gpt }),
-            ConvertGptToMbr => one(Operation::ConvertTable { disk: d, to: TableKind::Mbr }),
             DeleteAllPartitions => {
                 // Highest number first: logical partitions (5+) go before their extended
                 // container, and deleting the highest never renumbers a lower one.
@@ -190,7 +199,8 @@ impl Action {
             DiskProperties => Some(Effect::ShowProperties { disk: d }),
             Explore => Some(Effect::Explore { path: format!("{}:\\", part?.letter()?) }),
             MigrateOs | CopyDisk | CopyPartition | PartitionRecovery | SurfaceTest | CreatePartition
-            | FormatPartition | ResizeMove | ChangeLabel | ChangeLetter | ChangeType | WipePartition => {
+            | FormatPartition | ResizeMove | ChangeLabel | ChangeLetter | ChangeType | WipePartition
+            | ConvertMbrToGpt | ConvertGptToMbr | InitializeDisk => {
                 Some(Effect::Wizard(self))
             }
         }
@@ -214,7 +224,7 @@ mod tests {
     #[test]
     fn every_action_is_in_exactly_one_group() {
         let all: Vec<Action> = GROUPS.iter().flat_map(|g| g.actions.iter().copied()).collect();
-        assert_eq!(all.len(), 24);
+        assert_eq!(all.len(), 25);
         let unique: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(unique.len(), all.len());
     }
@@ -278,6 +288,23 @@ mod tests {
     }
 
     #[test]
+    fn uninitialized_disk_offers_initialize_not_create() {
+        let mut raw = gpt_disk(2);
+        raw.partitions.clear();
+        raw.table = TableKind::None;
+        let m = model_of(vec![raw, gpt_disk(1)]);
+        let free = disk_items(m.disk(2).unwrap())[0].sel;
+        assert!(Action::InitializeDisk.enabled(&Selected::Disk(2), &m));
+        assert!(Action::InitializeDisk.enabled(&free, &m));
+        assert!(!Action::CreatePartition.enabled(&free, &m));
+        assert!(!Action::InitializeDisk.enabled(&Selected::Disk(1), &m), "already GPT");
+        assert_eq!(
+            Action::InitializeDisk.effect(&Selected::Disk(2), &m),
+            Some(Effect::Wizard(Action::InitializeDisk))
+        );
+    }
+
+    #[test]
     fn effects_build_operations() {
         let m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
         assert_eq!(
@@ -286,7 +313,7 @@ mod tests {
         );
         assert_eq!(
             Action::ConvertGptToMbr.effect(&Selected::Disk(1), &m),
-            Some(Effect::Push(vec![Operation::ConvertTable { disk: 1, to: TableKind::Mbr }]))
+            Some(Effect::Wizard(Action::ConvertGptToMbr))
         );
         assert_eq!(Action::WipeDisk.effect(&Selected::Disk(1), &m), Some(Effect::ChooseWipeMethod { disk: 1 }));
         assert_eq!(

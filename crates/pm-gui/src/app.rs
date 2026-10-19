@@ -8,6 +8,7 @@ use crate::actions::{Action, Effect};
 use crate::jobs::{spawn_job, JobHandle, JobOutput};
 use crate::selection::Selected;
 use crate::theme::Theme;
+use crate::wizard::{Wizard, WizardCtx};
 use pm_core::VolumeId;
 use pm_ops::{execute, ExecOpts, ExecReport, Model, OpQueue, Operation, WipeMethod};
 use pm_platform::Platform;
@@ -80,6 +81,18 @@ pub enum Cmd {
     SetTheme(Theme),
     SetDryRun(bool),
     DismissBanner,
+    /// Queue the operations of the open wizard; it closes on success and shows the error on
+    /// its summary page otherwise.
+    FinishWizard(Vec<Operation>),
+    CloseWizard,
+}
+
+/// A wizard on screen and what it was opened on.
+pub struct OpenWizard {
+    pub wizard: Wizard,
+    pub selection: Selected,
+    /// Free drive letters of the platform, read once when the wizard opened.
+    pub free_letters: Vec<char>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +139,8 @@ pub struct AppState {
     /// Disk whose properties window is open.
     pub properties: Option<u32>,
     pub tool: Option<Tool>,
+    /// The open wizard (modal).
+    pub wizard: Option<OpenWizard>,
     /// The next successful refresh drops the pending operations instead of rebasing them
     /// (set after a failed Apply, when some of them may already have been written).
     pub reset_on_refresh: bool,
@@ -151,6 +166,7 @@ impl AppState {
             dialog: None,
             properties: None,
             tool: None,
+            wizard: None,
             reset_on_refresh: false,
         };
         s.start_refresh();
@@ -166,9 +182,11 @@ impl AppState {
         self.job.is_some()
     }
 
-    /// A modal dialog or Apply is in progress: the main window does not take input.
+    /// A modal dialog, a wizard or Apply is in progress: the main window does not take input.
     pub fn modal(&self) -> bool {
-        self.dialog.is_some() || matches!(self.job, Some(RunningJob { kind: JobKind::Apply { .. }, .. }))
+        self.dialog.is_some()
+            || self.wizard.is_some()
+            || matches!(self.job, Some(RunningJob { kind: JobKind::Apply { .. }, .. }))
     }
 
     pub fn toast(&mut self, text: impl Into<String>) {
@@ -275,18 +293,48 @@ impl AppState {
     /// Queue `ops`, all or none: on the first rejection the ones already pushed are undone
     /// and the planner's message is shown.
     pub fn push_ops(&mut self, ops: Vec<Operation>) {
+        if let Err(e) = self.try_push_ops(ops) {
+            self.error(e);
+        }
+    }
+
+    /// [`AppState::push_ops`] returning the planner's message instead of showing it.
+    pub fn try_push_ops(&mut self, ops: Vec<Operation>) -> Result<(), String> {
         let mut pushed = 0;
         for op in ops {
             if let Err(e) = self.queue.push(op) {
                 for _ in 0..pushed {
                     self.queue.undo();
                 }
-                self.error(e.to_string());
-                return;
+                return Err(e.to_string());
             }
             pushed += 1;
         }
         self.selected = self.selected.revalidate(self.queue.preview());
+        Ok(())
+    }
+
+    /// The context the open wizard `w` is drawn with.
+    pub fn wizard_ctx(&self, w: &OpenWizard) -> WizardCtx<'_> {
+        WizardCtx::new(self.queue.preview(), w.free_letters.clone(), w.selection)
+    }
+
+    /// Open the wizard of `action` on `sel`; actions without one (yet) are remembered in
+    /// `pending_action` with a toast.
+    fn open_wizard(&mut self, action: Action, sel: Selected) {
+        // GetLogicalDrives: instant, fine on the UI thread
+        let free_letters = self.platform.free_letters();
+        let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel);
+        match crate::wizards::for_action(action, &ctx) {
+            Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters }),
+            None if crate::wizards::ACTIONS.contains(&action) => {
+                self.toast(format!("{}: not available for this selection", action.label()))
+            }
+            None => {
+                self.pending_action = Some((action, sel));
+                self.toast(format!("{}: coming in the next step", action.label()));
+            }
+        }
     }
 
     fn dispatch(&mut self, action: Action, sel: Selected) {
@@ -296,26 +344,13 @@ impl AppState {
         };
         match effect {
             Effect::Push(ops) => self.push_ops(ops),
-            Effect::ChooseWipeMethod { disk } => {
-                self.dialog = Some(Dialog::WipeMethod { disk, method: WipeMethod::Zero })
-            }
-            Effect::ChooseMountLetter { volume } => {
-                // GetLogicalDrives: instant, fine on the UI thread
-                let preview = self.queue.preview();
-                let letters: Vec<char> =
-                    self.platform.free_letters().into_iter().filter(|c| !preview.letter_in_use(*c)).collect();
-                let choice = letters.first().copied();
-                self.dialog = Some(Dialog::MountLetter { volume, letters, choice });
-            }
-            Effect::ChooseUnmount { volume, mount_points } => {
-                self.dialog = Some(Dialog::Unmount { volume, mount_points, choice: 0 })
-            }
+            // the wipe / mount / unmount choices are made in their wizards
+            Effect::ChooseWipeMethod { .. }
+            | Effect::ChooseMountLetter { .. }
+            | Effect::ChooseUnmount { .. }
+            | Effect::Wizard(_) => self.open_wizard(action, sel),
             Effect::ShowProperties { disk } => self.properties = Some(disk),
             Effect::Explore { path } => explore(self, &path),
-            Effect::Wizard(a) => {
-                self.pending_action = Some((a, sel));
-                self.toast(format!("{}: coming in the next step", a.label()));
-            }
         }
     }
 
@@ -373,6 +408,14 @@ impl AppState {
             Cmd::SetTheme(t) => self.theme = t,
             Cmd::SetDryRun(d) => self.dry_run = d,
             Cmd::DismissBanner => self.banner = None,
+            Cmd::FinishWizard(ops) => match self.try_push_ops(ops) {
+                Ok(()) => self.wizard = None,
+                Err(e) => match &mut self.wizard {
+                    Some(w) => w.wizard.set_error(e),
+                    None => self.error(e),
+                },
+            },
+            Cmd::CloseWizard => self.wizard = None,
         }
     }
 
@@ -528,26 +571,59 @@ mod tests {
     }
 
     #[test]
-    fn wizard_actions_are_remembered_with_a_toast() {
+    fn actions_without_a_wizard_yet_are_remembered_with_a_toast() {
         let mut s = mock_state();
-        s.handle(Cmd::Action(Action::FormatPartition, Selected::Partition(1, 3)));
-        assert_eq!(s.pending_action, Some((Action::FormatPartition, Selected::Partition(1, 3))));
-        assert!(s.toast.as_ref().unwrap().text.contains("Format"));
+        s.handle(Cmd::Action(Action::CopyDisk, Selected::Disk(1)));
+        assert_eq!(s.pending_action, Some((Action::CopyDisk, Selected::Disk(1))));
+        assert!(s.toast.as_ref().unwrap().text.contains("Copy Disk"));
+        assert!(s.wizard.is_none());
         assert!(s.queue.is_empty());
     }
 
     #[test]
-    fn popups_for_wipe_mount_unmount_properties() {
+    fn wizard_actions_open_their_wizard() {
         let mut s = mock_state();
-        s.handle(Cmd::Action(Action::WipeDisk, Selected::Disk(1)));
-        assert!(matches!(s.dialog, Some(Dialog::WipeMethod { disk: 1, .. })));
+        for (a, sel) in [
+            (Action::FormatPartition, Selected::Partition(1, 3)),
+            (Action::WipeDisk, Selected::Disk(1)),
+            (Action::Unmount, Selected::Partition(1, 3)),
+            (Action::ConvertMbrToGpt, Selected::Disk(0)),
+        ] {
+            s.handle(Cmd::Action(a, sel));
+            let w = s.wizard.as_ref().unwrap_or_else(|| panic!("{a:?}: no wizard"));
+            assert_eq!(w.selection, sel);
+            assert!(s.modal());
+            assert!(s.dialog.is_none() && s.pending_action.is_none());
+            s.handle(Cmd::CloseWizard);
+            assert!(!s.modal());
+        }
+    }
+
+    #[test]
+    fn finishing_a_wizard_queues_or_shows_the_error_on_it() {
+        let mut s = mock_state();
+        s.handle(Cmd::Action(Action::FormatPartition, Selected::Partition(1, 3)));
+        // rejected by the queue: the wizard stays open on its summary page with the message
+        s.handle(Cmd::FinishWizard(vec![Operation::DeletePartition { disk: 1, number: 99 }]));
+        let w = &s.wizard.as_ref().unwrap().wizard;
+        assert!(w.on_summary());
+        assert!(w.error().unwrap().contains("no partition 99"), "{:?}", w.error());
+        assert!(s.queue.is_empty() && s.dialog.is_none());
+        // accepted: queued and closed
+        let ops = s.wizard.as_ref().unwrap().wizard.build_ops().unwrap();
+        s.handle(Cmd::FinishWizard(ops));
+        assert!(s.wizard.is_none());
+        assert_eq!(s.queue.len(), 1);
+        assert!(matches!(s.queue.ops()[0], Operation::FormatPartition { disk: 1, number: 3, .. }));
+    }
+
+    #[test]
+    fn push_command_and_properties_window() {
+        let mut s = mock_state();
         s.handle(Cmd::Push(vec![Operation::WipeDisk { disk: 1, method: WipeMethod::Zero }]));
         assert!(s.dialog.is_none());
         assert_eq!(s.queue.len(), 1);
         s.handle(Cmd::Discard);
-        s.handle(Cmd::Action(Action::Unmount, Selected::Partition(1, 3)));
-        assert!(matches!(&s.dialog, Some(Dialog::Unmount { mount_points, .. }) if mount_points == &vec!["E:\\".to_string()]));
-        s.handle(Cmd::CloseDialog);
         s.handle(Cmd::Action(Action::DiskProperties, Selected::Disk(0)));
         assert_eq!(s.properties, Some(0));
     }

@@ -17,6 +17,8 @@ pub mod main_window;
 pub mod selection;
 pub mod theme;
 pub mod views;
+pub mod wizard;
+pub mod wizards;
 
 #[cfg(test)]
 mod test_util;
