@@ -58,6 +58,7 @@ pub fn open(mut dev: Box<dyn BlockDevice>) -> Result<Box<dyn FileSystem>> {
         .ok_or_else(|| Error::Unsupported("unrecognised filesystem".into()))?;
     match probe.kind {
         FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 => Ok(Box::new(crate::fat::FatFs::open(dev, 0)?)),
+        FsKind::Ntfs => Ok(Box::new(crate::ntfs::Ntfs::open(dev)?)),
         k => Err(Error::Unsupported(format!("no reader for {}", k.display_name()))),
     }
 }
