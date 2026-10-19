@@ -20,6 +20,10 @@ pub(crate) const TYPE_DYNAMIC: u32 = 3;
 const TYPE_DIFFERENCING: u32 = 4;
 /// Largest disk the VHD format supports (2040 GiB).
 const MAX_CAPACITY: u64 = 2040 * 1024 * 1024 * 1024;
+/// Largest dynamic block size accepted on open (qemu uses the same bound).
+const MAX_BLOCK_SIZE: u64 = 256 << 20;
+/// A BAT may not describe more than 2 TiB.
+const MAX_BAT_COVERAGE: u64 = 2 << 40;
 /// 2000-01-01T00:00:00Z as a Unix timestamp.
 const VHD_EPOCH: u64 = 946_684_800;
 
@@ -99,7 +103,9 @@ fn build_footer(capacity: u64, disk_type: u32, data_offset: u64) -> [u8; 512] {
     put_u32(&mut f, 12, 0x0001_0000); // file format version
     put_u64(&mut f, 16, data_offset);
     put_u32(&mut f, 24, timestamp());
-    f[28..32].copy_from_slice(b"pman");
+    // Creator application: what Windows itself writes, so qemu and VirtualBox take
+    // the size from current_size instead of the (smaller) CHS geometry.
+    f[28..32].copy_from_slice(b"win ");
     put_u32(&mut f, 32, 0x0001_0000); // creator version
     f[36..40].copy_from_slice(b"Wi2k");
     put_u64(&mut f, 40, capacity); // original size
@@ -230,19 +236,31 @@ fn open_dynamic(mut file: ImageFile, footer: [u8; 512], capacity: u64) -> Result
     let bat_offset = get_u64(&h, 16);
     let max_entries = get_u32(&h, 28) as u64;
     let block_size = get_u32(&h, 32) as u64;
-    if block_size == 0 || block_size % 512 != 0 {
+    if !block_size.is_power_of_two() || !(512..=MAX_BLOCK_SIZE).contains(&block_size) {
         return Err(Error::Parse(format!("invalid VHD block size {block_size}")));
     }
+    if max_entries > MAX_BAT_COVERAGE / block_size {
+        return Err(Error::Parse(format!("VHD BAT too large ({max_entries} entries)")));
+    }
+    // both factors are bounded above, so this cannot overflow
     if max_entries * block_size < capacity {
         return Err(Error::Parse("VHD BAT does not cover the disk size".into()));
     }
+    let bat_len = max_entries * 4;
+    if bat_offset
+        .checked_add(bat_len)
+        .map_or(true, |end| end > file.len())
+    {
+        return Err(Error::Parse("VHD BAT lies beyond end of file".into()));
+    }
     let bitmap = bitmap_size(block_size);
-    let mut bat = vec![0u8; (max_entries * 4) as usize];
+    let mut bat = vec![0u8; bat_len as usize];
     file.read_at(bat_offset, &mut bat)?;
     let mut map = BlockMap::new(block_size, max_entries);
     for (i, e) in bat.chunks_exact(4).enumerate() {
         let sector = u32::from_be_bytes(e.try_into().unwrap());
         if sector != UNALLOCATED {
+            // sector < 2^32 and bitmap/block_size are bounded: no overflow
             let data = sector as u64 * 512 + bitmap;
             if data + block_size > file.len() {
                 return Err(Error::Parse(format!("VHD block {i} lies beyond end of file")));
@@ -265,8 +283,9 @@ fn open_dynamic(mut file: ImageFile, footer: [u8; 512], capacity: u64) -> Result
     }))
 }
 
-/// Dynamic VHD allocation: new blocks overwrite the footer at the end of the file and
-/// the footer is re-appended behind them.
+/// Dynamic VHD allocation. A new block takes the place of the footer at the end of the
+/// file; the footer is first re-written behind the new block, so the file ends in a
+/// valid footer at every step. Order: footer, bitmap, data (by the engine), BAT entry.
 struct VhdAlloc {
     file: ImageFile,
     footer: [u8; 512],
@@ -290,15 +309,17 @@ impl BlockAllocator for VhdAlloc {
         if start / 512 >= UNALLOCATED as u64 {
             return Err(Error::Unsupported("VHD file exceeds 2 TiB of sectors".into()));
         }
+        let data = start + self.bitmap_size;
+        // Extends the file; the gap up to the new footer reads as zeros until filled.
+        self.file.write_at(data + self.block_size, &self.footer)?;
         // Every sector of the block is written (zero padded), so mark all present.
         self.file.write_at(start, &vec![0xFFu8; self.bitmap_size as usize])?;
-        Ok(start + self.bitmap_size)
+        Ok(data)
     }
 
     fn on_allocate(&mut self, idx: u64, file_off: u64) -> Result<()> {
         let block_start = file_off - self.bitmap_size;
         self.footer_pos = file_off + self.block_size;
-        self.file.write_at(self.footer_pos, &self.footer)?;
         self.file.write_at(
             self.bat_offset + idx * 4,
             &((block_start / 512) as u32).to_be_bytes(),
@@ -320,6 +341,40 @@ mod tests {
         assert_eq!(geometry(127 << 30), (65278, 16, 255));
         // clamped
         assert_eq!(geometry(2000 << 30), (65535, 16, 255));
+    }
+
+    #[test]
+    fn place_block_keeps_a_footer_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.vhd");
+        drop(create_dynamic(&path, 8 << 20).unwrap());
+        let mut file = ImageFile::open(&path, false).unwrap();
+        let footer = read_footer(&mut file).unwrap();
+        let old_pos = file.len() - FOOTER_SIZE;
+        let mut alloc = VhdAlloc {
+            file,
+            footer,
+            footer_pos: old_pos,
+            bat_offset: BAT_OFFSET,
+            block_size: BLOCK_SIZE,
+            bitmap_size: bitmap_size(BLOCK_SIZE),
+        };
+        // State right after place_block, before the data or BAT entry are written
+        // (what a crash at that point would leave behind).
+        let data = alloc.place_block(1).unwrap();
+        assert_eq!(data, old_pos + 512);
+        assert_eq!(alloc.file.len(), data + BLOCK_SIZE + FOOTER_SIZE);
+        assert_eq!(read_footer(&mut alloc.file).unwrap(), footer);
+        let mut bitmap = [0u8; 512];
+        alloc.file.read_at(old_pos, &mut bitmap).unwrap();
+        assert!(bitmap.iter().all(|&b| b == 0xFF));
+        let mut bat = [0u8; 4];
+        alloc.file.read_at(BAT_OFFSET + 4, &mut bat).unwrap();
+        assert_eq!(bat, [0xFF; 4], "BAT entry written last");
+        alloc.on_allocate(1, data).unwrap();
+        alloc.file.read_at(BAT_OFFSET + 4, &mut bat).unwrap();
+        assert_eq!(u32::from_be_bytes(bat) as u64, old_pos / 512);
+        assert_eq!(read_footer(&mut alloc.file).unwrap(), footer);
     }
 
     #[test]

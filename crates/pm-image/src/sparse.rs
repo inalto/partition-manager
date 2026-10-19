@@ -3,6 +3,7 @@
 //! block map" engine that translates virtual offsets to file offsets.
 
 use pm_core::{BlockDevice, Error, FileDevice, Result};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
@@ -78,23 +79,25 @@ impl ImageFile {
     }
 }
 
-/// Sparse virtual-block -> file-offset table. Stored as fixed-size pages that are only
-/// materialised once one of their entries is set, so a mostly empty multi-terabyte image
-/// costs almost no memory.
+/// Sparse virtual-block -> file-offset table. Stored as fixed-size pages in an ordered
+/// map; a page is only materialised once one of its entries is set, so memory is
+/// proportional to the allocated data, never to the (header-supplied) block count.
 pub(crate) struct BlockMap {
     pub block_size: u64,
     count: u64,
-    pages: Vec<Option<Box<[u64]>>>,
+    pages: BTreeMap<u64, Box<[u64]>>,
 }
 
 const PAGE: u64 = 4096;
 
 impl BlockMap {
+    /// `block_size` must be non-zero; callers validate header values before this.
     pub fn new(block_size: u64, count: u64) -> Self {
+        assert!(block_size > 0, "block size must be non-zero");
         BlockMap {
             block_size,
             count,
-            pages: (0..count.div_ceil(PAGE)).map(|_| None).collect(),
+            pages: BTreeMap::new(),
         }
     }
 
@@ -103,12 +106,9 @@ impl BlockMap {
         if idx >= self.count {
             return None;
         }
-        match &self.pages[(idx / PAGE) as usize] {
-            Some(p) => match p[(idx % PAGE) as usize] {
-                0 => None,
-                off => Some(off),
-            },
-            None => None,
+        match self.pages.get(&(idx / PAGE))?[(idx % PAGE) as usize] {
+            0 => None,
+            off => Some(off),
         }
     }
 
@@ -116,8 +116,10 @@ impl BlockMap {
     /// no format places data at file offset 0).
     pub fn set(&mut self, idx: u64, file_off: u64) {
         assert!(idx < self.count && file_off != 0, "invalid block mapping");
-        let page = self.pages[(idx / PAGE) as usize]
-            .get_or_insert_with(|| vec![0u64; PAGE as usize].into_boxed_slice());
+        let page = self
+            .pages
+            .entry(idx / PAGE)
+            .or_insert_with(|| vec![0u64; PAGE as usize].into_boxed_slice());
         page[(idx % PAGE) as usize] = file_off;
     }
 

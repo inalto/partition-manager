@@ -160,7 +160,8 @@ fn check_vhd_footer(f: &[u8], cap: u64, disk_type: u32, data_offset: u64) {
     assert_eq!(be64(f, 16), data_offset, "data offset");
     // seconds since 2000-01-01: any date after 2020 is > 630M
     assert!(be32(f, 24) > 630_000_000, "timestamp");
-    assert_eq!(&f[28..32], b"pman");
+    // what Windows writes; qemu/VirtualBox then trust current_size over CHS
+    assert_eq!(&f[28..32], b"win ", "creator application");
     assert_eq!(be32(f, 32), 0x0001_0000, "creator version");
     assert_eq!(&f[36..40], b"Wi2k");
     assert_eq!(be64(f, 40), cap, "original size");
@@ -601,4 +602,214 @@ fn convert_honours_cancel() {
         convert(&src, &dst, ImageFormat::Qcow2, &NullProgress, &cancel),
         Err(Error::Cancelled)
     ));
+}
+
+// ---------------------------------------------------------------- robustness (fix round 1)
+
+fn put_be32(b: &mut [u8], o: usize, v: u32) {
+    b[o..o + 4].copy_from_slice(&v.to_be_bytes());
+}
+fn put_be64(b: &mut [u8], o: usize, v: u64) {
+    b[o..o + 8].copy_from_slice(&v.to_be_bytes());
+}
+fn put_le32(b: &mut [u8], o: usize, v: u32) {
+    b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn put_le64(b: &mut [u8], o: usize, v: u64) {
+    b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Write `bytes` to a fresh file and assert that `open` fails cleanly (no panic, no abort
+/// from a huge allocation) both read-only and read-write.
+fn assert_open_fails(dir: &Path, name: &str, bytes: &[u8], what: &str) {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    for ro in [true, false] {
+        assert!(
+            open(&path, ro).is_err(),
+            "{what}: open(read_only={ro}) unexpectedly succeeded"
+        );
+    }
+}
+
+/// Recompute the checksum of the VHD footer at EOF.
+fn fix_vhd_footer(b: &mut [u8]) {
+    let n = b.len();
+    let sum = vhd_checksum(&b[n - 512..], 64);
+    put_be32(b, n - 512 + 64, sum);
+}
+
+/// Recompute the checksum of the VHD dynamic header at offset 512.
+fn fix_vhd_header(b: &mut [u8]) {
+    let sum = vhd_checksum(&b[512..1536], 36);
+    put_be32(b, 512 + 36, sum);
+}
+
+type Patch = Box<dyn Fn(&mut Vec<u8>)>;
+
+#[test]
+fn corrupt_headers_never_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = |fmt: ImageFormat, name: &str| -> Vec<u8> {
+        let p = dir.path().join(format!("base-{name}"));
+        {
+            let mut d = create(&p, &opts(fmt, 4 * MIB)).unwrap();
+            d.write_at(0, &pattern(512, 1)).unwrap();
+            d.flush().unwrap();
+        }
+        std::fs::read(&p).unwrap()
+    };
+
+    // ---- qcow2 (big-endian)
+    let q = make(ImageFormat::Qcow2, "q.qcow2");
+    let qcases: Vec<(&str, Patch)> = vec![
+        ("l1_size huge", Box::new(|b| put_be32(b, 36, u32::MAX))),
+        ("l1 table over 32 MiB", Box::new(|b| put_be32(b, 36, (32 << 20) / 8 + 1))),
+        ("refcount_table_clusters huge", Box::new(|b| put_be32(b, 56, u32::MAX))),
+        ("refcount table over 8 MiB", Box::new(|b| put_be32(b, 56, 129))),
+        ("l1_table_offset huge", Box::new(|b| put_be64(b, 40, u64::MAX - 7))),
+        ("refcount_table_offset huge", Box::new(|b| put_be64(b, 48, u64::MAX - 7))),
+        ("cluster_bits 0", Box::new(|b| put_be32(b, 20, 0))),
+        ("cluster_bits 63", Box::new(|b| put_be32(b, 20, 63))),
+        ("size huge", Box::new(|b| put_be64(b, 24, u64::MAX))),
+        (
+            "L1 entry beyond EOF",
+            Box::new(|b| put_be64(b, 65536, (1 << 63) | 0x00ff_ffff_ffff_0000)),
+        ),
+    ];
+    for (what, patch) in qcases {
+        let mut b = q.clone();
+        patch(&mut b);
+        assert_open_fails(dir.path(), "c.qcow2", &b, what);
+    }
+
+    // ---- VHD dynamic (big-endian, checksummed); bool = patch is in the footer
+    let v = make(ImageFormat::VhdDynamic, "v.vhd");
+    let vcases: Vec<(&str, bool, Patch)> = vec![
+        ("block size 0", false, Box::new(|b| put_be32(b, 512 + 32, 0))),
+        ("block size not power of two", false, Box::new(|b| put_be32(b, 512 + 32, 3 << 20))),
+        ("block size 2 GiB", false, Box::new(|b| put_be32(b, 512 + 32, 0x8000_0000))),
+        ("block size 512 MiB", false, Box::new(|b| put_be32(b, 512 + 32, 512 << 20))),
+        ("max table entries huge", false, Box::new(|b| put_be32(b, 512 + 28, u32::MAX))),
+        ("table offset huge", false, Box::new(|b| put_be64(b, 512 + 16, u64::MAX - 3))),
+        (
+            "footer data offset huge",
+            true,
+            Box::new(|b| {
+                let n = b.len();
+                put_be64(b, n - 512 + 16, u64::MAX - 100)
+            }),
+        ),
+        (
+            "current size huge",
+            true,
+            Box::new(|b| {
+                let n = b.len();
+                put_be64(b, n - 512 + 48, u64::MAX)
+            }),
+        ),
+        ("BAT entry beyond EOF", false, Box::new(|b| put_be32(b, 1536, 0xFFFF_FF00))),
+    ];
+    for (what, in_footer, patch) in vcases {
+        let mut b = v.clone();
+        patch(&mut b);
+        if in_footer {
+            fix_vhd_footer(&mut b);
+        } else {
+            fix_vhd_header(&mut b);
+        }
+        assert_open_fails(dir.path(), "c.vhd", &b, what);
+    }
+    let mut f = make(ImageFormat::VhdFixed, "f.vhd");
+    let n = f.len();
+    put_be64(&mut f, n - 512 + 48, u64::MAX);
+    fix_vhd_footer(&mut f);
+    assert_open_fails(dir.path(), "c.vhd", &f, "fixed current size huge");
+
+    // ---- VMDK sparse (little-endian)
+    let s = make(ImageFormat::VmdkSparse, "s.vmdk");
+    let scases: Vec<(&str, Patch)> = vec![
+        ("grain 0", Box::new(|b| put_le64(b, 20, 0))),
+        ("grain not power of two", Box::new(|b| put_le64(b, 20, 100))),
+        ("grain huge", Box::new(|b| put_le64(b, 20, u64::MAX))),
+        ("grain over 0x200000 sectors", Box::new(|b| put_le64(b, 20, 0x40_0000))),
+        ("numGTEsPerGT 0", Box::new(|b| put_le32(b, 44, 0))),
+        ("numGTEsPerGT huge", Box::new(|b| put_le32(b, 44, u32::MAX))),
+        ("capacity huge", Box::new(|b| put_le64(b, 12, u64::MAX))),
+        ("gdOffset huge", Box::new(|b| put_le64(b, 56, u64::MAX / 256))),
+        ("rgdOffset huge", Box::new(|b| put_le64(b, 48, u64::MAX / 256))),
+    ];
+    for (what, patch) in scases {
+        let mut b = s.clone();
+        patch(&mut b);
+        assert_open_fails(dir.path(), "c.vmdk", &b, what);
+    }
+
+    // ---- VMDK flat descriptors whose extent numbers overflow
+    let sub = dir.path().join("flat");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("x-flat.vmdk"), vec![0u8; 8192 * 512]).unwrap();
+    for line in [
+        "RW 8192 FLAT \"x-flat.vmdk\" 18446744073709551615",
+        "RW 18446744073709551615 FLAT \"x-flat.vmdk\" 0",
+        "RW 36028797018963968 FLAT \"x-flat.vmdk\" 36028797018963968",
+    ] {
+        let text =
+            format!("# Disk DescriptorFile\nversion=1\ncreateType=\"monolithicFlat\"\n{line}\n");
+        assert_open_fails(&sub, "x.vmdk", text.as_bytes(), line);
+    }
+}
+
+#[test]
+fn vhd_dynamic_footer_valid_after_each_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.vhd");
+    let cap = 20 * MIB;
+    let mut reference = MemDevice::new(cap);
+    drop(create(&path, &opts(ImageFormat::VhdDynamic, cap)).unwrap());
+    for (i, blk) in [4u64, 0, 9, 2].iter().enumerate() {
+        {
+            let mut dev = open(&path, false).unwrap();
+            let data = pattern(3000, i as u8 + 1);
+            let off = blk * 2 * MIB + 77;
+            dev.write_at(off, &data).unwrap();
+            reference.write_at(off, &data).unwrap();
+            dev.flush().unwrap();
+        }
+        let raw = std::fs::read(&path).unwrap();
+        check_vhd_footer(&raw[raw.len() - 512..], cap, 3, 512);
+        assert_eq!(&raw[..512], &raw[raw.len() - 512..]);
+        assert_eq!(identify(&path).unwrap(), ImageFormat::VhdDynamic);
+        let mut dev = open(&path, true).unwrap();
+        assert_same(dev.as_mut(), &mut reference);
+    }
+}
+
+#[test]
+fn qcow2_autoclear_features_cleared_on_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.qcow2");
+    drop(create(&path, &opts(ImageFormat::Qcow2, 4 * MIB)).unwrap());
+    let mut b = std::fs::read(&path).unwrap();
+    put_be64(&mut b, 88, 1);
+    std::fs::write(&path, &b).unwrap();
+
+    // a read-only open leaves the header untouched
+    {
+        let mut dev = open(&path, true).unwrap();
+        dev.read_at(0, &mut [0u8; 512]).unwrap();
+    }
+    assert_eq!(be64(&std::fs::read(&path).unwrap(), 88), 1);
+
+    // a writer that does not understand autoclear bits must clear them
+    {
+        let mut dev = open(&path, false).unwrap();
+        dev.write_at(512, &pattern(512, 7)).unwrap();
+        dev.flush().unwrap();
+    }
+    assert_eq!(be64(&std::fs::read(&path).unwrap(), 88), 0);
+    let mut dev = open(&path, true).unwrap();
+    let mut got = vec![0u8; 512];
+    dev.read_at(512, &mut got).unwrap();
+    assert_eq!(got, pattern(512, 7));
 }

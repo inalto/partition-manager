@@ -27,16 +27,17 @@ qemu-img compare -f raw source.img -F vmdk  disk.vmdk
 qemu-img compare -f raw source.img -F vpc   disk.vhd
 ```
 
-### VHD size caveat with qemu
+### VHD size and the creator application
 
-The footer's creator application is `pman`. qemu only trusts the footer's
-`current_size` for creators it knows (`win `, `qem2`, `d2v `, `CTXS`, `tap`); for others
-it derives the size from the CHS geometry, which is usually a few KiB smaller than the
-real capacity. Windows, Hyper-V and VirtualBox use `current_size`. To make qemu use it:
+The footer's creator application is `win ` (what Windows itself writes). qemu reads
+the disk size from `current_size` only for creators it knows (`win `, `qem2`, `d2v `,
+`CTXS`, `tap`). For any other creator it derives the size from the CHS geometry, which is
+usually a few KiB smaller than the real capacity. With `win `, `qemu-img info` therefore
+reports the exact capacity, the same value Windows, Hyper-V and VirtualBox use. For VHDs
+from other tools that hit the CHS case, qemu can be told to use `current_size`:
 
 ```sh
-qemu-img info --image-opts driver=vpc,force_size_calc=current_size,file.filename=disk.vhd
-qemu-img compare -f raw source.img --image-opts driver=vpc,force_size_calc=current_size,file.filename=disk.vhd
+qemu-img info --image-opts driver=vpc,force_size_calc=current_size,file.filename=other.vhd
 ```
 
 ## Verifying on Windows

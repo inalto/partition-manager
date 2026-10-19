@@ -17,6 +17,10 @@ const COPIED: u64 = 1 << 63;
 const COMPRESSED: u64 = 1 << 62;
 const ZERO_FLAG: u64 = 1;
 const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
+/// qemu's limits for tables read from a header: 32 MiB of L1, 8 MiB of refcount table.
+const MAX_L1_BYTES: u64 = 32 << 20;
+const MAX_REFTABLE_BYTES: u64 = 8 << 20;
+const AUTOCLEAR_OFFSET: u64 = 88;
 /// One refcount-table cluster addresses 8192 refblocks x 32768 clusters x 64 KiB.
 const MAX_CAPACITY: u64 = 16 << 40;
 
@@ -158,8 +162,25 @@ pub(crate) fn open(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>>
     let cs = 1u64 << cluster_bits;
     let l2_entries = cs / 8;
     let n_clusters = capacity.div_ceil(cs);
+    if l1_size > MAX_L1_BYTES / 8 {
+        return Err(Error::Parse(format!("qcow2 L1 table too large ({l1_size} entries)")));
+    }
+    if rt_clusters == 0 || rt_clusters > MAX_REFTABLE_BYTES / cs {
+        return Err(Error::Parse(format!(
+            "invalid qcow2 refcount table size ({rt_clusters} clusters)"
+        )));
+    }
+    // l1_size <= 2^22 and l2_entries <= 2^18: no overflow
     if l1_size * l2_entries < n_clusters {
         return Err(Error::Parse("qcow2 L1 table does not cover the disk size".into()));
+    }
+    let file_len = file.len();
+    let inside = |off: u64, len: u64| off.checked_add(len).is_some_and(|end| end <= file_len);
+    if l1_offset % cs != 0 || !inside(l1_offset, l1_size * 8) {
+        return Err(Error::Parse("qcow2 L1 table lies outside the file".into()));
+    }
+    if rt_offset % cs != 0 || !inside(rt_offset, rt_clusters * cs) {
+        return Err(Error::Parse("qcow2 refcount table lies outside the file".into()));
     }
 
     let mut b = vec![0u8; (l1_size * 8) as usize];
@@ -171,6 +192,9 @@ pub(crate) fn open(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>>
         let l2_off = e & OFFSET_MASK;
         if l2_off == 0 {
             continue;
+        }
+        if !inside(l2_off, cs) {
+            return Err(Error::Parse(format!("qcow2 L2 table {i} lies beyond end of file")));
         }
         file.read_at(l2_off, &mut l2)?;
         for (j, e2) in be_u64s(&l2).into_iter().enumerate() {
@@ -186,6 +210,7 @@ pub(crate) fn open(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>>
             if off == 0 || (version == 3 && e2 & ZERO_FLAG != 0) {
                 continue;
             }
+            // off < 2^56 and cs <= 2^21: no overflow
             if off + cs > file.len().div_ceil(cs) * cs {
                 return Err(Error::Parse(format!("qcow2 cluster {idx} lies beyond end of file")));
             }
@@ -195,6 +220,14 @@ pub(crate) fn open(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>>
     let mut b = vec![0u8; (rt_clusters * cs) as usize];
     file.read_at(rt_offset, &mut b)?;
     let rt = be_u64s(&b);
+    if let Some(bad) = rt.iter().find(|&&rb| rb != 0 && (rb % cs != 0 || !inside(rb, cs))) {
+        return Err(Error::Parse(format!("invalid qcow2 refcount block offset {bad:#x}")));
+    }
+    if !read_only && version == 3 && get_u64(&h, AUTOCLEAR_OFFSET as usize) != 0 {
+        // We do not understand any autoclear feature, so a writer must clear them all.
+        file.write_at(AUTOCLEAR_OFFSET, &0u64.to_be_bytes())?;
+        file.flush()?;
+    }
     let next_free = file.len().div_ceil(cs) * cs;
     Ok(Box::new(SparseDevice {
         capacity,

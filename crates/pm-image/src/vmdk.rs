@@ -22,6 +22,10 @@ const DESCRIPTOR_OFFSET: u64 = 1;
 const DESCRIPTOR_SECTORS: u64 = 20;
 const GTES_PER_GT: u64 = 512;
 const GD_AT_END: u64 = u64::MAX;
+/// Largest grain accepted on open (qemu's bound: 0x200000 sectors = 1 GiB).
+const MAX_GRAIN_SECTORS: u64 = 0x20_0000;
+/// Text descriptors are tiny; refuse to slurp anything bigger than this.
+const MAX_DESCRIPTOR_FILE: u64 = 1 << 20;
 const ZERO_CHUNK: usize = 1 << 20;
 
 fn put_u32(b: &mut [u8], o: usize, v: u32) {
@@ -130,6 +134,10 @@ fn parse_extent(line: &str) -> Result<Extent> {
 /// Open a text descriptor (`createType="monolithicFlat"`) and its single FLAT extent,
 /// resolved relative to the descriptor's directory.
 pub(crate) fn open_flat(path: &Path, read_only: bool) -> Result<Box<dyn BlockDevice>> {
+    let size = std::fs::metadata(path).map_err(|e| Error::io(0, 0, e))?.len();
+    if size > MAX_DESCRIPTOR_FILE {
+        return Err(Error::Parse(format!("VMDK descriptor file too large ({size} bytes)")));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| Error::io(0, 0, e))?;
     if !text.starts_with(DESCRIPTOR_SIGNATURE) {
         return Err(Error::Parse("not a VMDK descriptor".into()));
@@ -162,7 +170,10 @@ pub(crate) fn open_flat(path: &Path, read_only: bool) -> Result<Box<dyn BlockDev
     };
     let ro = read_only || ext.access == "RDONLY";
     let dev = FileDevice::open(&extent_path, ro)?;
-    let (off, len) = (ext.offset * 512, ext.sectors * 512);
+    let range = ext.offset.checked_mul(512).zip(ext.sectors.checked_mul(512));
+    let Some((off, len)) = range.filter(|(o, l)| o.checked_add(*l).is_some()) else {
+        return Err(Error::Parse("VMDK extent offset/size overflow".into()));
+    };
     if off + len > dev.len() {
         return Err(Error::Parse(format!(
             "flat extent {} is shorter than the descriptor says",
@@ -281,7 +292,15 @@ pub(crate) fn create_sparse(path: &Path, capacity: u64) -> Result<Box<dyn BlockD
     }))
 }
 
+/// Read `n` grain-directory entries at `sector`, refusing anything outside the file
+/// before allocating.
 fn read_directory(file: &mut ImageFile, sector: u64, n: u64) -> Result<Vec<u64>> {
+    let off = sector.checked_mul(512);
+    let len = n.checked_mul(4);
+    match off.zip(len).and_then(|(o, l)| o.checked_add(l)) {
+        Some(end) if end <= file.len() => {}
+        _ => return Err(Error::Parse("VMDK grain directory lies beyond end of file".into())),
+    }
     let mut b = vec![0u8; (n * 4) as usize];
     file.read_at(sector * 512, &mut b)?;
     Ok(b.chunks_exact(4)
@@ -310,9 +329,19 @@ pub(crate) fn open_sparse(path: &Path, read_only: bool) -> Result<Box<dyn BlockD
     let gtes = get_u32(&h, 44) as u64;
     let rgd_off = get_u64(&h, 48);
     let gd_off = get_u64(&h, 56);
-    if grain == 0 || gtes == 0 || gd_off == GD_AT_END || gd_off == 0 {
-        return Err(Error::Parse("invalid VMDK sparse header".into()));
+    if !grain.is_power_of_two() || grain > MAX_GRAIN_SECTORS {
+        return Err(Error::Parse(format!("invalid VMDK grain size {grain}")));
     }
+    if gtes == 0 || gtes > GTES_PER_GT {
+        return Err(Error::Parse(format!("invalid VMDK numGTEsPerGT {gtes}")));
+    }
+    if gd_off == GD_AT_END || gd_off == 0 {
+        return Err(Error::Parse("invalid VMDK grain directory offset".into()));
+    }
+    let capacity = sectors
+        .checked_mul(512)
+        .ok_or_else(|| Error::Parse(format!("VMDK capacity {sectors} sectors overflows")))?;
+    // grain and gtes are non-zero (checked above)
     let n_grains = sectors.div_ceil(grain);
     let num_gts = n_grains.div_ceil(gtes);
     let gd = read_directory(&mut file, gd_off, num_gts)?;
@@ -334,6 +363,7 @@ pub(crate) fn open_sparse(path: &Path, read_only: bool) -> Result<Box<dyn BlockD
             if idx >= n_grains || v == 0 || (v == 1 && flags & FLAG_ZEROED_GTE != 0) {
                 continue;
             }
+            // v < 2^32 and grain <= 2^21: no overflow
             if (v + grain) * 512 > file.len() {
                 return Err(Error::Parse(format!("VMDK grain {idx} lies beyond end of file")));
             }
@@ -341,7 +371,7 @@ pub(crate) fn open_sparse(path: &Path, read_only: bool) -> Result<Box<dyn BlockD
         }
     }
     Ok(Box::new(SparseDevice {
-        capacity: sectors * 512,
+        capacity,
         map,
         alloc: VmdkAlloc {
             file,
