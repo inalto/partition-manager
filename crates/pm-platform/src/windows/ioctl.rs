@@ -35,8 +35,8 @@ use windows_sys::Win32::System::Ioctl::{
     SHRINK_VOLUME_REQUEST_TYPES,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
@@ -393,16 +393,33 @@ pub fn logical_drives() -> u32 {
     unsafe { GetLogicalDrives() }
 }
 
-/// `GetWindowsDirectoryW()`, e.g. `C:\Windows`.
-pub fn windows_directory() -> Result<String, Code> {
-    let mut buf = [0u16; 512];
-    // SAFETY: `buf` is writable for its length.
-    let n = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
-    if n == 0 || n as usize >= buf.len() {
+/// Interpret the return value `n` of a `Get*DirectoryW(buf, len)` call: 0 → `GetLastError`,
+/// `n >= len` → the buffer was too small (`n` is then the required size; no error code is set).
+fn directory_result(n: u32, buf: &[u16]) -> Result<String, Code> {
+    if n == 0 {
         Err(last_error())
+    } else if n as usize >= buf.len() {
+        Err(ERROR_INSUFFICIENT_BUFFER)
     } else {
         Ok(String::from_utf16_lossy(&buf[..n as usize]))
     }
+}
+
+/// `GetSystemWindowsDirectoryW()`, e.g. `C:\Windows`. Unlike `%SystemRoot%` this cannot be
+/// redirected by the (medium-integrity) user environment.
+pub fn windows_directory() -> Result<String, Code> {
+    let mut buf = [0u16; 512];
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    directory_result(n, &buf)
+}
+
+/// `GetSystemDirectoryW()`, e.g. `C:\Windows\System32`.
+pub fn system_directory() -> Result<String, Code> {
+    let mut buf = [0u16; 512];
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    directory_result(n, &buf)
 }
 
 /// Whether the current process token is elevated (`TokenElevation`).
@@ -534,15 +551,16 @@ pub fn format_ex(
     cluster: u32,
 ) -> Result<bool, Code> {
     let dll = wide("fmifs.dll");
-    // SAFETY: NUL-terminated library name.
-    let module = unsafe { LoadLibraryW(dll.as_ptr()) };
+    // SAFETY: NUL-terminated library name; null file handle is required. The search is
+    // restricted to System32 so a planted fmifs.dll next to the (elevated) exe is never loaded.
+    let module = unsafe { LoadLibraryExW(dll.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
     if module.is_null() {
         return Err(last_error());
     }
     // SAFETY: `module` is a loaded library; the name is a NUL-terminated ANSI string.
     let Some(proc) = (unsafe { GetProcAddress(module, b"FormatEx\0".as_ptr()) }) else {
         let e = last_error();
-        // SAFETY: releases the reference taken by LoadLibraryW above.
+        // SAFETY: releases the reference taken by LoadLibraryExW above.
         unsafe { FreeLibrary(module) };
         return Err(e);
     };
@@ -563,7 +581,7 @@ pub fn format_ex(
             format_callback,
         )
     };
-    // SAFETY: releases the reference taken by LoadLibraryW above; FormatEx has returned.
+    // SAFETY: releases the reference taken by LoadLibraryExW above; FormatEx has returned.
     unsafe { FreeLibrary(module) };
     Ok(FORMAT_DONE.load(Ordering::SeqCst) == 1)
 }
@@ -586,6 +604,23 @@ mod tests {
         let m = system_message(5).expect("message for ERROR_ACCESS_DENIED");
         assert!(!m.is_empty());
         assert!(!m.ends_with('.') && !m.ends_with('\n'));
+    }
+
+    #[test]
+    fn system_directories_come_from_the_api() {
+        let sys = system_directory().unwrap();
+        let win = windows_directory().unwrap();
+        assert!(sys.to_ascii_lowercase().ends_with("\\system32"), "{sys}");
+        assert!(sys.to_ascii_lowercase().starts_with(&win.to_ascii_lowercase()), "{sys} / {win}");
+        assert!(std::path::Path::new(&sys).join("fmifs.dll").exists());
+    }
+
+    #[test]
+    fn directory_result_distinguishes_too_small_buffer() {
+        let buf = [b'C' as u16, b':' as u16, 0, 0];
+        assert_eq!(directory_result(2, &buf), Ok("C:".to_string()));
+        assert_eq!(directory_result(4, &buf), Err(ERROR_INSUFFICIENT_BUFFER));
+        assert_eq!(directory_result(300, &buf), Err(ERROR_INSUFFICIENT_BUFFER));
     }
 
     #[test]

@@ -4,11 +4,16 @@ use super::device::WinDevice;
 use super::disk::disk_path;
 use super::error::platform_error;
 use super::ioctl::{self, Handle, GENERIC_READ, GENERIC_WRITE};
-use super::volume::{device_path, enumerate_volumes};
+use super::layout::parse_disk_extents;
+use super::volume::{device_path, root_path};
 use crate::traits::{OpenMode, WriteSession};
-use pm_core::{BlockDevice, Error, Result, VolumeInfo};
+use pm_core::{BlockDevice, Error, Result, VolumeId};
 use pm_parttable::{write_table, Table};
 use std::time::Duration;
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_DATA, ERROR_INVALID_FUNCTION, ERROR_NOT_READY, ERROR_NOT_SUPPORTED,
+};
+use windows_sys::Win32::System::Ioctl::DISK_ATTRIBUTE_OFFLINE;
 
 const LOCK_ATTEMPTS: u32 = 5;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -20,20 +25,65 @@ struct LockedVolume {
 }
 
 /// Write session on one disk; see [`WriteSession`]. Dropping it without `finish` still
-/// restores the disk (online, unlocked), ignoring errors.
+/// restores the disk (online if this session took it offline, unlocked), ignoring errors.
 pub struct WindowsWriteSession {
     disk: u32,
     device: WinDevice,
     locked: Vec<LockedVolume>,
+    /// This session took the disk offline and must bring it back online.
     offlined: bool,
     finished: bool,
 }
 
-fn describe(v: &VolumeInfo) -> String {
-    if v.mount_points.is_empty() {
-        v.id.0.clone()
+/// What `begin_write` does with one volume of the system.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VolumeAction {
+    /// Has at least one extent on the target disk: lock + dismount.
+    Lock,
+    /// Lives entirely on other disks, or is not disk-backed at all.
+    Skip,
+    /// Its extents cannot be determined: refuse the session (`Error::Busy`).
+    Refuse(String),
+}
+
+/// Decide what to do with volume `name` given its extent query result.
+///
+/// A volume with ANY extent on `disk` is locked (spanned volumes included). Failure codes
+/// meaning "this volume is not backed by a disk volume manager" (`ERROR_INVALID_FUNCTION` /
+/// `ERROR_NOT_SUPPORTED`: CD/DVD and similar class drivers) or "no media"
+/// (`ERROR_NOT_READY`: nothing mounted that a raw write could corrupt) are skipped; any other
+/// failure refuses the session rather than writing under a possibly mounted filesystem.
+pub(crate) fn volume_action(
+    extents: std::result::Result<Vec<(u32, u64, u64)>, u32>,
+    disk: u32,
+    name: &str,
+) -> VolumeAction {
+    match extents {
+        Ok(e) if e.iter().any(|&(d, _, _)| d == disk) => VolumeAction::Lock,
+        Ok(_) => VolumeAction::Skip,
+        Err(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_NOT_READY) => VolumeAction::Skip,
+        Err(code) => VolumeAction::Refuse(format!(
+            "cannot determine extents of {name} ({})",
+            super::friendly_error(code)
+        )),
+    }
+}
+
+/// Whether the session should take the disk offline (and later bring it back online):
+/// never for the system disk, only when the disk is known to be online now, so a disk that was
+/// already offline (user, SAN policy, Hyper-V pass-through) is left offline afterwards.
+pub(crate) fn should_take_offline(is_system_disk: bool, attributes: Option<u64>) -> bool {
+    match attributes {
+        Some(a) => !is_system_disk && a & DISK_ATTRIBUTE_OFFLINE == 0,
+        None => false,
+    }
+}
+
+fn describe(id: &VolumeId, mount_points: &[String]) -> String {
+    if mount_points.is_empty() {
+        id.0.clone()
     } else {
-        v.mount_points.join(", ")
+        mount_points.join(", ")
     }
 }
 
@@ -61,37 +111,46 @@ fn lock_with_retry(h: &Handle) -> std::result::Result<(), u32> {
     Err(last)
 }
 
-/// Lock and dismount every volume on `disk`, take it offline unless it is the system disk,
-/// and open it read-write.
+/// Extents of a volume, queried directly (query-only handle).
+fn query_extents(id: &VolumeId) -> std::result::Result<Vec<(u32, u64, u64)>, u32> {
+    let h = ioctl::open(&device_path(id), 0)?;
+    let buf = ioctl::volume_extents(&h)?;
+    parse_disk_extents(&buf).map_err(|_| ERROR_INVALID_DATA)
+}
+
+/// Lock + dismount one volume, pushing it onto `locked`.
+fn lock_volume(id: &VolumeId, name: String, locked: &mut Vec<LockedVolume>) -> Result<()> {
+    let handle = ioctl::open(&device_path(id), GENERIC_READ | GENERIC_WRITE)
+        .map_err(|c| platform_error(c, &format!("open volume {name}")))?;
+    if let Err(c) = lock_with_retry(&handle) {
+        log::warn!("lock {name} failed: error {c}");
+        return Err(Error::Busy(name));
+    }
+    if let Err(c) = ioctl::dismount_volume(&handle) {
+        let _ = ioctl::unlock_volume(&handle);
+        return Err(platform_error(c, &format!("dismount {name}")));
+    }
+    locked.push(LockedVolume { handle, name });
+    Ok(())
+}
+
+/// Lock and dismount every volume with an extent on `disk`, open the disk read-write and take
+/// it offline if it is online and not the system disk.
 pub fn begin_write(disk: u32, system_disk: Option<u32>) -> Result<Box<dyn WriteSession>> {
-    let volumes: Vec<VolumeInfo> = enumerate_volumes()?
-        .into_iter()
-        .filter(|v| v.disk == Some(disk))
-        .collect();
+    let ids = ioctl::list_volumes().map_err(|c| platform_error(c, "enumerate volumes"))?;
     let mut locked: Vec<LockedVolume> = Vec::new();
-    for v in &volumes {
-        let path = device_path(&v.id);
-        let handle = match ioctl::open(&path, GENERIC_READ | GENERIC_WRITE) {
-            Ok(h) => h,
-            Err(c) => {
-                release(&mut locked);
-                return Err(platform_error(c, &format!("open volume {}", describe(v))));
-            }
+    for id in ids.into_iter().map(VolumeId) {
+        let mount_points = ioctl::volume_path_names(&root_path(&id)).unwrap_or_default();
+        let name = describe(&id, &mount_points);
+        let step = match volume_action(query_extents(&id), disk, &name) {
+            VolumeAction::Skip => Ok(()),
+            VolumeAction::Refuse(msg) => Err(Error::Busy(msg)),
+            VolumeAction::Lock => lock_volume(&id, name, &mut locked),
         };
-        if let Err(c) = lock_with_retry(&handle) {
+        if let Err(e) = step {
             release(&mut locked);
-            log::warn!("lock {} failed: error {c}", describe(v));
-            return Err(Error::Busy(describe(v)));
+            return Err(e);
         }
-        if let Err(c) = ioctl::dismount_volume(&handle) {
-            let _ = ioctl::unlock_volume(&handle);
-            release(&mut locked);
-            return Err(platform_error(c, &format!("dismount {}", describe(v))));
-        }
-        locked.push(LockedVolume {
-            handle,
-            name: describe(v),
-        });
     }
 
     let device = match WinDevice::open(&disk_path(disk), OpenMode::ReadWrite) {
@@ -101,8 +160,11 @@ pub fn begin_write(disk: u32, system_disk: Option<u32>) -> Result<Box<dyn WriteS
             return Err(e);
         }
     };
+    let attributes = ioctl::disk_attributes(device.handle())
+        .map_err(|c| log::warn!("disk {disk}: cannot read attributes ({c}); leaving it online"))
+        .ok();
     let mut offlined = false;
-    if system_disk != Some(disk) {
+    if should_take_offline(system_disk == Some(disk), attributes) {
         match ioctl::set_disk_offline(device.handle(), true, false) {
             Ok(()) => offlined = true,
             // the volumes are locked and dismounted, which already gives exclusive access
@@ -168,5 +230,53 @@ impl Drop for WindowsWriteSession {
         if let Err(e) = self.restore() {
             log::warn!("disk {}: restoring after write session failed: {e}", self.disk);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn volumes_with_any_extent_on_the_disk_are_locked() {
+        assert_eq!(volume_action(Ok(vec![(2, MIB, MIB)]), 2, "E:"), VolumeAction::Lock);
+        // spanned volume: second extent on the target disk
+        assert_eq!(
+            volume_action(Ok(vec![(0, MIB, MIB), (2, MIB, MIB)]), 2, "S:"),
+            VolumeAction::Lock
+        );
+        assert_eq!(volume_action(Ok(vec![(0, MIB, MIB), (1, 0, MIB)]), 2, "C:"), VolumeAction::Skip);
+        assert_eq!(volume_action(Ok(vec![]), 2, "X:"), VolumeAction::Skip);
+    }
+
+    #[test]
+    fn unknown_extents_refuse_the_session() {
+        for code in [ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA] {
+            match volume_action(Err(code), 2, "F:") {
+                VolumeAction::Refuse(msg) => {
+                    assert!(msg.starts_with("cannot determine extents of F:"), "{msg}")
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+        }
+        // not disk-backed (CD/DVD) or no media
+        for code in [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_NOT_READY] {
+            assert_eq!(volume_action(Err(code), 2, "R:"), VolumeAction::Skip);
+        }
+    }
+
+    #[test]
+    fn offline_only_when_online_and_not_system() {
+        assert!(should_take_offline(false, Some(0)));
+        // already offline: leave it alone, so finish/drop will not bring it online
+        assert!(!should_take_offline(false, Some(DISK_ATTRIBUTE_OFFLINE)));
+        assert!(!should_take_offline(false, Some(DISK_ATTRIBUTE_OFFLINE | 2)));
+        assert!(should_take_offline(false, Some(2))); // read-only but online
+        assert!(!should_take_offline(true, Some(0)));
+        // unknown state: do not touch it
+        assert!(!should_take_offline(false, None));
     }
 }

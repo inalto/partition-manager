@@ -41,19 +41,22 @@ impl WindowsPlatform {
     }
 }
 
-/// `%SystemRoot%\System32\<exe>`.
-fn system32_path(exe: &str) -> PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .or_else(|| ioctl::windows_directory().ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    root.join("System32").join(exe)
+/// `<System32>\<exe>`, with System32 from `GetSystemDirectoryW`. The environment
+/// (`%SystemRoot%`, `PATH`) is deliberately not used: a medium-integrity user can change it,
+/// and this process runs elevated.
+fn system32_path(exe: &str) -> Result<PathBuf> {
+    let dir = ioctl::system_directory().map_err(|c| error::platform_error(c, "locate System32"))?;
+    Ok(PathBuf::from(dir).join(exe))
 }
 
 /// Run a system tool, returning stdout followed by stderr; non-zero exit → `Error::Platform`.
 pub(crate) fn run_tool(tool: ExternalTool, args: &[String]) -> Result<String> {
-    let exe = system32_path(tool.exe_name());
-    let out = Command::new(&exe)
+    run_exe(&system32_path(tool.exe_name())?, tool.exe_name(), args)
+}
+
+/// Run `exe` (absolute path) with `args`; see [`run_tool`].
+fn run_exe(exe: &std::path::Path, name: &str, args: &[String]) -> Result<String> {
+    let out = Command::new(exe)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -68,7 +71,7 @@ pub(crate) fn run_tool(tool: ExternalTool, args: &[String]) -> Result<String> {
     } else {
         Err(Error::Platform {
             code: out.status.code().unwrap_or(-1) as u32,
-            msg: format!("{} failed: {}", tool.exe_name(), text.trim()),
+            msg: format!("{name} failed: {}", text.trim()),
         })
     }
 }
@@ -162,19 +165,33 @@ mod tests {
 
     #[test]
     fn tools_resolve_in_system32() {
-        let p = system32_path(ExternalTool::FormatCom.exe_name());
-        assert!(p.ends_with(r"System32\format.com"), "{}", p.display());
+        // resolution only; nothing is executed
+        let p = system32_path(ExternalTool::FormatCom.exe_name()).unwrap();
+        assert!(
+            p.to_string_lossy().to_ascii_lowercase().ends_with(r"system32\format.com"),
+            "{}",
+            p.display()
+        );
+        assert!(p.is_absolute());
         assert!(p.exists());
-        assert!(system32_path(ExternalTool::BcdBoot.exe_name()).exists());
+        assert!(system32_path(ExternalTool::BcdBoot.exe_name()).unwrap().exists());
+    }
+
+    fn cmd(args: &[&str]) -> Result<String> {
+        let exe = system32_path("cmd.exe").unwrap();
+        run_exe(&exe, "cmd.exe", &args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
     #[test]
-    fn run_tool_reports_nonzero_exit() {
-        // `bcdboot` with no arguments prints usage and exits with 87 without touching anything
-        match run_tool(ExternalTool::BcdBoot, &[]) {
-            Err(Error::Platform { code, .. }) => assert_ne!(code, 0),
-            Ok(out) => panic!("expected failure, got {out}"),
-            Err(e) => panic!("unexpected error {e}"),
+    fn run_exe_captures_output_and_exit_code() {
+        // benign stand-in for the real tools: `cmd /c ...`
+        assert_eq!(cmd(&["/c", "echo hello"]).unwrap().trim(), "hello");
+        match cmd(&["/c", "echo oops 1>&2 & exit 3"]) {
+            Err(Error::Platform { code, msg }) => {
+                assert_eq!(code, 3);
+                assert!(msg.starts_with("cmd.exe failed: ") && msg.contains("oops"), "{msg}");
+            }
+            other => panic!("expected exit-code failure, got {other:?}"),
         }
     }
 }

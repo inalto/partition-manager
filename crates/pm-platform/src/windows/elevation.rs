@@ -15,7 +15,8 @@ pub fn drive_device_of(path: &str) -> Option<String> {
         .then(|| format!(r"\\.\{}:", (b[0] as char).to_ascii_uppercase()))
 }
 
-/// Disk number of the (first extent of the) volume holding `%SystemRoot%`.
+/// Disk number of the (first extent of the) volume holding the Windows directory
+/// (`GetSystemWindowsDirectoryW`, not the user-changeable `%SystemRoot%`).
 pub fn find_system_disk() -> Option<u32> {
     let windir = ioctl::windows_directory().ok()?;
     let dev = drive_device_of(&windir)?;
