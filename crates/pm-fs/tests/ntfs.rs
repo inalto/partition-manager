@@ -262,6 +262,18 @@ fn ntfs_used_map_from_bitmap() {
     assert!(!map.is_used(1000 * 4096));
     assert!(map.is_used(built.total_sectors * 512), "backup boot sector");
     assert_eq!(map.used_bytes(), (built.used_clusters.len() as u64 + 1) * 4096);
+
+    // a $Bitmap whose real or initialized size falls short of the volume: every cluster it
+    // does not describe must count as used (a clone must never drop data)
+    for (real, init, covered) in [(Some(256u64), None, 256u64), (None, Some(300u64), 300)] {
+        let short = build(&NtfsOpts { bitmap_real: real, bitmap_init: init, ..NtfsOpts::default() });
+        let mut fs = open_image(short.image.clone());
+        let map = fs.used_map().unwrap();
+        for c in 0..clusters {
+            let want = c >= covered * 8 || short.used_clusters.contains(&c);
+            assert_eq!(map.is_used(c * 4096), want, "cluster {c}, $Bitmap covers {covered} bytes");
+        }
+    }
 }
 
 #[test]
@@ -299,6 +311,29 @@ fn ntfs_deleted_record_listed() {
     let cancel = CancelToken::new();
     cancel.cancel();
     assert!(matches!(fs.deleted_entries(&NullProgress, &cancel), Err(Error::Cancelled)));
+
+    // a corrupt, huge $MFT size: the scan is bounded by the mapped runs, not by the size field
+    let huge = 1u64 << 60;
+    let built = build(&NtfsOpts { mft_real: Some(huge), mft_alloc: Some(huge), ..NtfsOpts::default() });
+    let mut fs = open_image(built.image);
+    let cancel = CancelToken::new();
+    let guard = cancel.clone();
+    // stop a runaway scan instead of hanging the test
+    let sink = FnProgress(move |p: &ProgressReport| {
+        if p.total > MFT_RECORDS {
+            guard.cancel()
+        }
+    });
+    let mut again = fs.deleted_entries(&sink, &cancel).expect("bounded scan");
+    again.sort_by(|a, b| a.name.cmp(&b.name));
+    let again: Vec<&str> = again.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(again, names);
+    let hello = find(&fs.list(&fs.root()).unwrap(), "hello.txt").clone();
+    assert_eq!(read_all(&mut fs, &hello), HELLO.to_vec());
+
+    // a real size beyond the allocated size is rejected when opening
+    let built = build(&NtfsOpts { mft_real: Some(2 * MFT_RECORDS * 1024), ..NtfsOpts::default() });
+    assert!(matches!(open_ntfs(Box::new(MemDevice::from_vec(built.image))), Err(Error::Parse(_))));
 }
 
 #[test]
@@ -311,10 +346,25 @@ fn ntfs_attribute_list_followed() {
     assert_eq!(split.modified, Some(MODIFIED_UNIX));
     let expected = expected_split();
     assert_eq!(read_all(&mut fs, &split), expected);
-    // straight into the second extent (extension record 27)
-    let mut buf = vec![0u8; 3000];
-    assert_eq!(fs.read_file(&split, 4000, &mut buf).unwrap(), 2000);
-    assert_eq!(buf[..2000], expected[4000..]);
+    // straight across the second extent (extension record 27) into the third
+    let mut buf = vec![0u8; 5000];
+    assert_eq!(fs.read_file(&split, 4000, &mut buf).unwrap(), 5000);
+    assert_eq!(buf, expected[4000..9000]);
+    assert_eq!(fs.read_file(&split, SPLIT_SIZE - 100, &mut buf).unwrap(), 100);
+    assert_eq!(buf[..100], expected[(SPLIT_SIZE - 100) as usize..]);
     // extension records are not files of their own
-    assert!(!list.iter().any(|e| e.id == REC_SPLIT_EXT1 || e.id == REC_SPLIT_EXT2));
+    assert!(!list.iter().any(|e| [REC_SPLIT_EXT1, REC_SPLIT_EXT2, REC_SPLIT_EXT3].contains(&e.id)));
+
+    // the attribute list lost its middle $DATA extent: a parse error, never silent zeros,
+    // even for reads that only touch the extents still present
+    let broken = build(&NtfsOpts { split_drop_middle_extent: true, ..NtfsOpts::default() });
+    let mut fs = open_image(broken.image);
+    let mut buf = vec![0u8; 100];
+    for off in [0u64, 4096, 2 * 4096] {
+        assert!(matches!(fs.read_file(&split, off, &mut buf), Err(Error::Parse(_))), "offset {off}");
+    }
+    // the sparse runs inside one extent still read fine
+    let list = fs.list(&fs.root()).unwrap();
+    let sparse = find(&list, "sparse.bin").clone();
+    assert_eq!(read_all(&mut fs, &sparse), expected_sparse());
 }

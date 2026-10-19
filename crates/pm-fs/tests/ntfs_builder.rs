@@ -28,6 +28,7 @@ pub const REC_OLD: u64 = 26;
 pub const REC_SPLIT_EXT2: u64 = 27;
 pub const REC_GHOST: u64 = 28;
 pub const REC_ENC: u64 = 29;
+pub const REC_SPLIT_EXT3: u64 = 30;
 
 pub const LCN_MFTMIRR: u64 = 2;
 pub const LCN_BITMAP: u64 = 30;
@@ -36,6 +37,7 @@ pub const LCN_BIG_A: u64 = 50;
 pub const LCN_BIG_B: u64 = 200;
 pub const LCN_SPLIT_1: u64 = 300;
 pub const LCN_SPLIT_2: u64 = 310;
+pub const LCN_SPLIT_3: u64 = 320;
 pub const LCN_SPARSE_A: u64 = 400;
 pub const LCN_SPARSE_B: u64 = 401;
 pub const LCN_COMP: u64 = 500;
@@ -45,7 +47,7 @@ pub const LCN_ORPHAN: u64 = 3000;
 
 pub const HELLO: &[u8; 20] = b"Hello, NTFS world!\r\n";
 pub const BIG_SIZE: u64 = 4 * 4096 + 1000;
-pub const SPLIT_SIZE: u64 = 6000;
+pub const SPLIT_SIZE: u64 = 2 * 4096 + 1808;
 pub const SPARSE_SIZE: u64 = 4 * 4096;
 pub const SPARSE_INIT: u64 = 3 * 4096 + 100;
 pub const GONE_DATA: &[u8] = b"bye bye";
@@ -76,11 +78,30 @@ pub struct NtfsOpts {
     pub mft_lcn: u64,
     /// When set, MFT records 8.. live in a second run starting at this LCN.
     pub mft_second_lcn: Option<u64>,
+    /// Override the real / initialized size of the `$Bitmap` `$DATA` (corruption tests).
+    pub bitmap_real: Option<u64>,
+    pub bitmap_init: Option<u64>,
+    /// Override the real / allocated size of the `$MFT` `$DATA` (corruption tests).
+    pub mft_real: Option<u64>,
+    pub mft_alloc: Option<u64>,
+    /// Leave the middle `$DATA` extent of split.dat out of its attribute list.
+    pub split_drop_middle_extent: bool,
 }
 
 impl Default for NtfsOpts {
     fn default() -> Self {
-        NtfsOpts { cluster_size: 4096, record_size: 1024, total_size: 16 * MIB, mft_lcn: 16, mft_second_lcn: None }
+        NtfsOpts {
+            cluster_size: 4096,
+            record_size: 1024,
+            total_size: 16 * MIB,
+            mft_lcn: 16,
+            mft_second_lcn: None,
+            bitmap_real: None,
+            bitmap_init: None,
+            mft_real: None,
+            mft_alloc: None,
+            split_drop_middle_extent: false,
+        }
     }
 }
 
@@ -528,6 +549,7 @@ pub fn build(opts: &NtfsOpts) -> Built {
     img.use_clusters(LCN_BIG_B, 2);
     img.use_clusters(LCN_SPLIT_1, 1);
     img.use_clusters(LCN_SPLIT_2, 1);
+    img.use_clusters(LCN_SPLIT_3, 1);
     img.use_clusters(LCN_SPARSE_A, 1);
     img.use_clusters(LCN_SPARSE_B, 1);
     img.use_clusters(LCN_COMP, 1);
@@ -539,6 +561,7 @@ pub fn build(opts: &NtfsOpts) -> Built {
     img.fill(LCN_BIG_B, 3, 2, 1);
     img.fill(LCN_SPLIT_1, 0, 1, 2);
     img.fill(LCN_SPLIT_2, 1, 1, 2);
+    img.fill(LCN_SPLIT_3, 2, 1, 2);
     img.fill(LCN_SPARSE_A, 0, 1, 3);
     img.fill(LCN_SPARSE_B, 3, 1, 3); // VCN 3; bytes past SPARSE_INIT must still read as zeros
     img.fill(LCN_COMP, 0, 1, 4);
@@ -671,7 +694,17 @@ pub fn build(opts: &NtfsOpts) -> Built {
         6,
         IN_USE,
         0,
-        vec![si(), sys("$Bitmap", bm_len), nr_data("", vec![(Some(LCN_BITMAP), 1)], bm_len, bm_len, cs)],
+        vec![
+            si(),
+            sys("$Bitmap", bm_len),
+            nr_data(
+                "",
+                vec![(Some(LCN_BITMAP), 1)],
+                opts.bitmap_real.unwrap_or(bm_len),
+                opts.bitmap_init.unwrap_or(opts.bitmap_real.unwrap_or(bm_len)),
+                cs,
+            ),
+        ],
         &mut in_use,
     );
     add(7, 7, IN_USE, 0, vec![si(), sys("$Boot", 8192), nr_data("", vec![(Some(0), 2)], 8192, 8192, cs)], &mut in_use);
@@ -741,7 +774,7 @@ pub fn build(opts: &NtfsOpts) -> Built {
         &mut in_use,
     );
 
-    // split.dat: base record with an attribute list; $DATA split over two extension records
+    // split.dat: base record with an attribute list; $DATA split over three extension records
     let split_fn = fname(root_ref, "split.dat", FILE_ATTR_ARCHIVE, SPLIT_SIZE, NS_BOTH);
     let mut al = Vec::new();
     let al_entry = |ty: u32, vcn: u64, rec: u64, id: u16| {
@@ -758,7 +791,10 @@ pub fn build(opts: &NtfsOpts) -> Built {
     al.extend(al_entry(AT_SI, 0, REC_SPLIT, 0));
     al.extend(al_entry(AT_FN, 0, REC_SPLIT, 2));
     al.extend(al_entry(AT_DATA, 0, REC_SPLIT_EXT1, 0));
-    al.extend(al_entry(AT_DATA, 1, REC_SPLIT_EXT2, 0));
+    if !opts.split_drop_middle_extent {
+        al.extend(al_entry(AT_DATA, 1, REC_SPLIT_EXT2, 0));
+    }
+    al.extend(al_entry(AT_DATA, 2, REC_SPLIT_EXT3, 0));
     add(REC_SPLIT, 1, IN_USE, 0, vec![si(), resident(AT_AL, "", &al), split_fn], &mut in_use);
     add(
         REC_SPLIT_EXT1,
@@ -772,7 +808,7 @@ pub fn build(opts: &NtfsOpts) -> Built {
             start_vcn: 0,
             end_vcn: 0,
             runs: vec![(Some(LCN_SPLIT_1), 1)],
-            alloc: 2 * cs,
+            alloc: 3 * cs,
             real: SPLIT_SIZE,
             init: SPLIT_SIZE,
             comp_unit: 0,
@@ -792,6 +828,25 @@ pub fn build(opts: &NtfsOpts) -> Built {
             end_vcn: 1,
             runs: vec![(Some(LCN_SPLIT_2), 1)],
             // sizes are only meaningful in the first extent
+            alloc: 0,
+            real: 0,
+            init: 0,
+            comp_unit: 0,
+        })],
+        &mut in_use,
+    );
+    add(
+        REC_SPLIT_EXT3,
+        1,
+        IN_USE,
+        fref(REC_SPLIT),
+        vec![nonresident(&NonRes {
+            ty: AT_DATA,
+            name: "",
+            flags: 0,
+            start_vcn: 2,
+            end_vcn: 2,
+            runs: vec![(Some(LCN_SPLIT_3), 1)],
             alloc: 0,
             real: 0,
             init: 0,
@@ -967,8 +1022,8 @@ pub fn build(opts: &NtfsOpts) -> Built {
                 start_vcn: 0,
                 end_vcn: mft_clusters - 1,
                 runs: mft_runs.clone(),
-                alloc: mft_clusters * cs,
-                real: mft_real,
+                alloc: opts.mft_alloc.unwrap_or(mft_clusters * cs),
+                real: opts.mft_real.unwrap_or(mft_real),
                 init: mft_real,
                 comp_unit: 0,
             }),

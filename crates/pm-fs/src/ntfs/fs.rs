@@ -31,7 +31,7 @@ struct Run {
 #[derive(Clone, Debug)]
 enum Stream {
     Resident { flags: u16, data: Vec<u8> },
-    NonResident { flags: u16, runs: Vec<Run>, real: u64, init: u64 },
+    NonResident { flags: u16, runs: Vec<Run>, alloc: u64, real: u64, init: u64 },
 }
 
 impl Stream {
@@ -58,26 +58,58 @@ impl Stream {
             let AttrBody::NonResident(n) = &a.body else {
                 return Err(Error::Parse("resident attribute split into extents".into()));
             };
+            // extents must tile the VCN space exactly: a gap means a lost extent, which must
+            // never read back as zeros
             if n.start_vcn < next {
                 return Err(Error::Parse("overlapping attribute extents".into()));
             }
             if n.start_vcn > next {
-                // unmapped gap between extents: reads as a hole
-                runs.push(Run { vcn: next, lcn: None, len: n.start_vcn - next });
-                next = n.start_vcn;
+                return Err(Error::Parse(format!(
+                    "attribute extents leave VCNs {next}..{} unmapped",
+                    n.start_vcn
+                )));
+            }
+            // `end_vcn` is -1 for an empty attribute, hence the wrapping arithmetic
+            let after_end = n.end_vcn.wrapping_add(1);
+            if after_end < n.start_vcn {
+                return Err(Error::Parse(format!("attribute extent VCN range {}..={} is inverted", n.start_vcn, n.end_vcn)));
             }
             for &(lcn, len) in &n.runs {
                 runs.push(Run { vcn: next, lcn, len });
                 next = next.checked_add(len).ok_or_else(|| Error::Parse("runlist overflows".into()))?;
             }
+            if next != after_end {
+                return Err(Error::Parse(format!(
+                    "runlist of extent VCN {}..={} ends at VCN {next}",
+                    n.start_vcn, n.end_vcn
+                )));
+            }
         }
-        Ok(Stream::NonResident { flags, runs, real: first.real, init: first.init.min(first.real) })
+        Ok(Stream::NonResident { flags, runs, alloc: first.alloc, real: first.real, init: first.init.min(first.real) })
     }
 
     fn len(&self) -> u64 {
         match self {
             Stream::Resident { data, .. } => data.len() as u64,
             Stream::NonResident { real, .. } => *real,
+        }
+    }
+
+    /// Bytes holding defined data; the rest up to `len()` reads as zeros.
+    fn init(&self) -> u64 {
+        match self {
+            Stream::Resident { data, .. } => data.len() as u64,
+            Stream::NonResident { init, .. } => *init,
+        }
+    }
+
+    /// Bytes covered by the runlist (allocated or sparse).
+    fn mapped_bytes(&self, cs: u64) -> u64 {
+        match self {
+            Stream::Resident { data, .. } => data.len() as u64,
+            Stream::NonResident { runs, .. } => {
+                runs.last().map_or(0, |r| r.vcn.saturating_add(r.len).saturating_mul(cs))
+            }
         }
     }
 
@@ -245,14 +277,20 @@ impl Ntfs {
                 self.mft = Stream::from_extents(extents.clone())?;
             }
         }
-        if matches!(self.mft, Stream::Resident { .. }) {
-            return Err(Error::Parse("$MFT $DATA is resident".into()));
+        match self.mft {
+            Stream::Resident { .. } => Err(Error::Parse("$MFT $DATA is resident".into())),
+            Stream::NonResident { real, alloc, .. } if real > alloc => Err(Error::Parse(format!(
+                "$MFT real size {real} exceeds its allocated size {alloc}"
+            ))),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
+    /// Records in the MFT: its size, bounded by what its runs map and by the volume, so a
+    /// corrupt size field cannot make scans run (practically) forever.
     fn record_count(&self) -> u64 {
-        self.mft.len() / self.boot.record_size as u64
+        let bytes = self.mft.len().min(self.mft.mapped_bytes(self.cs())).min(self.boot.volume_bytes());
+        bytes / self.boot.record_size as u64
     }
 
     fn read_record(&mut self, n: u64) -> Result<Record> {
@@ -543,8 +581,10 @@ impl FileSystem for Ntfs {
 
         let rec = self.read_record(BITMAP_RECORD)?;
         let bitmap = self.data_stream(&rec)?.ok_or_else(|| Error::Parse("$Bitmap has no $DATA".into()))?;
-        // bit i of $Bitmap (LSB first) is cluster i: the same layout as UsedMap with unit = cluster
-        let bytes = total_clusters.div_ceil(8).min(bitmap.len()).min(map.bits.len() as u64) as usize;
+        // bit i of $Bitmap (LSB first) is cluster i: the same layout as UsedMap with unit = cluster.
+        // Only bytes inside both the real and the initialized size describe clusters.
+        let needed = total_clusters.div_ceil(8);
+        let bytes = needed.min(bitmap.len()).min(bitmap.init()).min(map.bits.len() as u64) as usize;
         let mut chunk = vec![0u8; 1 << 20];
         let mut done = 0usize;
         while done < bytes {
@@ -559,6 +599,12 @@ impl FileSystem for Ntfs {
         // bits past the last cluster are padding
         if total_clusters % 8 != 0 && (total_clusters / 8) < bytes as u64 {
             map.bits[(total_clusters / 8) as usize] &= (1u8 << (total_clusters % 8)) - 1;
+        }
+        // a $Bitmap too short for the volume is damaged: clusters it does not describe are
+        // conservatively in use, so a copy never drops data
+        let described = bytes as u64 * 8;
+        if described < total_clusters {
+            map.set(described * cs, (total_clusters - described) * cs);
         }
 
         // belt and braces: boot area, $MFT and $MFTMirr are always in use
@@ -625,5 +671,45 @@ impl FileSystem for Ntfs {
         }
         report(count);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extent(start: u64, end: u64, runs: Vec<(Option<u64>, u64)>) -> Attr {
+        Attr {
+            ty: AT_DATA,
+            name: String::new(),
+            flags: 0,
+            id: 0,
+            body: AttrBody::NonResident(NonResident {
+                start_vcn: start,
+                end_vcn: end,
+                runs,
+                comp_unit: 0,
+                alloc: 4 * 4096,
+                real: 4 * 4096,
+                init: 4 * 4096,
+            }),
+        }
+    }
+
+    #[test]
+    fn extents_must_tile_their_vcn_ranges() {
+        // intra-extent sparse runs are fine
+        let ok = Stream::from_extents(vec![extent(2, 3, vec![(None, 1), (Some(9), 1)]), extent(0, 1, vec![(Some(5), 2)])]);
+        assert_eq!(ok.unwrap().mapped_bytes(4096), 4 * 4096);
+        // an empty non-resident attribute has end_vcn = -1 and no runs
+        assert!(Stream::from_extents(vec![extent(0, u64::MAX, vec![])]).is_ok());
+        let bad = |v: Vec<Attr>| matches!(Stream::from_extents(v), Err(Error::Parse(_)));
+        // runlist shorter / longer than the declared range
+        assert!(bad(vec![extent(0, 3, vec![(Some(5), 2)])]));
+        assert!(bad(vec![extent(0, 0, vec![(Some(5), 2)])]));
+        // gap and overlap between extents, inverted range
+        assert!(bad(vec![extent(0, 1, vec![(Some(5), 2)]), extent(3, 3, vec![(Some(9), 1)])]));
+        assert!(bad(vec![extent(0, 1, vec![(Some(5), 2)]), extent(1, 1, vec![(Some(9), 1)])]));
+        assert!(bad(vec![extent(0, 1, vec![(Some(5), 2)]), extent(3, 1, vec![])]));
     }
 }
