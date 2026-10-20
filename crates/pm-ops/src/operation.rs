@@ -47,6 +47,31 @@ pub enum BootFix {
     All,
 }
 
+/// Rescue mode of an image export (GNU ddrescue's algorithm): read errors do not stop the
+/// copy. A failed block is skipped, then trimmed, scraped and retried sector by sector;
+/// sectors that stay unreadable are left unwritten in the image, which reads them as zeros.
+/// A ddrescue mapfile records what was rescued, so an interrupted export resumes from
+/// `<image>.partial` when the same operation runs again.
+///
+/// The defaults are those of `pm rescue`: 128 KiB reads, a 64 KiB initial skip that doubles
+/// on further errors, trimming and scraping on, no retry passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RescueSettings {
+    /// Retry passes over the bad sectors after scraping.
+    pub retries: u32,
+    /// Initial skip after a read error in bytes (`None`: 64 KiB).
+    pub skip_size: Option<u64>,
+    /// Sectors per copy-phase read (`None`: 128 KiB worth), like ddrescue's `-c`.
+    pub cluster_size: Option<u32>,
+    pub no_trim: bool,
+    pub no_scrape: bool,
+    /// Copy from the end of the source towards the start.
+    pub reverse: bool,
+    /// The ddrescue mapfile (`None`: `<image path>.map`, e.g. `disk.vhd.map`).
+    pub mapfile: Option<PathBuf>,
+}
+
 /// Serde mirror of [`MountPoint`] (which lives in `pm-platform` without serde derives).
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "MountPoint")]
@@ -178,6 +203,9 @@ pub enum Operation {
         path: PathBuf,
         format: ImageFormat,
         mode: CloneMode,
+        /// Continue on read errors (see [`RescueSettings`]); `None` fails on the first one.
+        #[serde(default)]
+        rescue: Option<RescueSettings>,
     },
     ImagePartition {
         disk: u32,
@@ -185,6 +213,9 @@ pub enum Operation {
         path: PathBuf,
         format: ImageFormat,
         mode: CloneMode,
+        /// Continue on read errors (see [`RescueSettings`]); `None` fails on the first one.
+        #[serde(default)]
+        rescue: Option<RescueSettings>,
     },
     RestoreImage {
         path: PathBuf,
@@ -229,6 +260,11 @@ fn sizing_name(s: Sizing) -> &'static str {
         Sizing::Fit => "fit",
         Sizing::Proportional => "proportional",
     }
+}
+
+/// `", rescue mode (N retries)"` when rescue mode is on, `""` otherwise.
+fn rescue_suffix(r: &Option<RescueSettings>) -> String {
+    r.as_ref().map_or(String::new(), |s| format!(", rescue mode ({} retries)", s.retries))
 }
 
 /// `NTFS "Data"`, `NTFS`, or `unformatted`.
@@ -314,17 +350,19 @@ impl Operation {
                 target_table_suffix(*target_table),
                 if *keep_ids { ", keep ids" } else { "" }
             ),
-            ImageDisk { disk, path, format, mode } => format!(
-                "Image Disk {disk} → {} ({}, {})",
+            ImageDisk { disk, path, format, mode, rescue } => format!(
+                "Image Disk {disk} → {} ({}, {}{})",
                 path.display(),
                 format.display(),
-                mode_name(*mode)
+                mode_name(*mode),
+                rescue_suffix(rescue)
             ),
-            ImagePartition { disk, number, path, format, mode } => format!(
-                "Image partition {number} on Disk {disk} → {} ({}, {})",
+            ImagePartition { disk, number, path, format, mode, rescue } => format!(
+                "Image partition {number} on Disk {disk} → {} ({}, {}{})",
                 path.display(),
                 format.display(),
-                mode_name(*mode)
+                mode_name(*mode),
+                rescue_suffix(rescue)
             ),
             RestoreImage { path, dst_disk, dst_start: None } => {
                 format!("Restore {} → Disk {dst_disk}", path.display())

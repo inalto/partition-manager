@@ -10,7 +10,68 @@ use pm_parttable::{read_table, write_table, Table};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-type SharedDisk = Arc<Mutex<MemDevice>>;
+type SharedDisk = Arc<Mutex<Store>>;
+
+/// What backs a mock disk: an in-memory buffer ([`MockPlatform::add_disk`]) or any device
+/// ([`MockPlatform::add_device`], e.g. an error-injecting one).
+enum Store {
+    Mem(MemDevice),
+    Dev(Box<dyn BlockDevice + Send>),
+}
+
+impl Store {
+    fn dev(&self) -> &dyn BlockDevice {
+        match self {
+            Store::Mem(m) => m,
+            Store::Dev(d) => &**d,
+        }
+    }
+
+    fn dev_mut(&mut self) -> &mut dyn BlockDevice {
+        match self {
+            Store::Mem(m) => m,
+            Store::Dev(d) => &mut **d,
+        }
+    }
+
+    /// Every byte of the device; sectors that cannot be read come back as zeros.
+    fn bytes(&mut self) -> Vec<u8> {
+        if let Store::Mem(m) = self {
+            return m.as_slice().to_vec();
+        }
+        let d = self.dev_mut();
+        let mut out = vec![0u8; d.len() as usize];
+        if d.read_at(0, &mut out).is_err() {
+            for (i, sector) in out.chunks_mut(512).enumerate() {
+                if d.read_at(i as u64 * 512, sector).is_err() {
+                    sector.fill(0);
+                }
+            }
+        }
+        out
+    }
+}
+
+impl BlockDevice for Store {
+    fn len(&self) -> u64 {
+        self.dev().len()
+    }
+    fn sector_size(&self) -> u32 {
+        self.dev().sector_size()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.dev_mut().read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.dev_mut().write_at(offset, buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.dev_mut().flush()
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+}
 
 struct MockDisk {
     dev: SharedDisk,
@@ -36,7 +97,8 @@ struct State {
 
 /// Test double for [`Platform`].
 ///
-/// * disks are `Arc<Mutex<MemDevice>>`; [`MockPlatform::disk_bytes`] exposes their content;
+/// * disks are shared [`MemDevice`]s ([`MockPlatform::add_disk`]) or any [`BlockDevice`]
+///   ([`MockPlatform::add_device`]); [`MockPlatform::disk_bytes`] exposes their content;
 /// * `enumerate_disks` re-reads the partition table on every call;
 /// * `format`, `shrink_volume`, `extend_volume`, `set_offline`, `rescan` and `run_tool` are
 ///   recorded in [`MockPlatform::calls`] and succeed unless [`MockPlatform::fail_calls_matching`]
@@ -64,10 +126,21 @@ impl MockPlatform {
     /// Add (or replace) disk `index`. `meta` supplies model/serial/bus/flags; size, sector size,
     /// table and partitions are derived from `dev` when enumerating.
     pub fn add_disk(&self, index: u32, dev: MemDevice, meta: DiskInfo) {
+        self.insert(index, Store::Mem(dev), meta);
+    }
+
+    /// Add (or replace) disk `index` backed by any device, e.g. a
+    /// `pm_image::rescue::FaultyDevice` that fails reads of chosen sectors. Like
+    /// [`MockPlatform::add_disk`] otherwise; the device sees every read and write of the disk.
+    pub fn add_device(&self, index: u32, dev: Box<dyn BlockDevice + Send>, meta: DiskInfo) {
+        self.insert(index, Store::Dev(dev), meta);
+    }
+
+    fn insert(&self, index: u32, store: Store, meta: DiskInfo) {
         self.st().disks.insert(
             index,
             MockDisk {
-                dev: Arc::new(Mutex::new(dev)),
+                dev: Arc::new(Mutex::new(store)),
                 meta,
             },
         );
@@ -138,11 +211,12 @@ impl MockPlatform {
         self.st().fail_prefixes.push(prefix.to_string());
     }
 
-    /// Snapshot of the bytes of disk `index` (panics if the disk does not exist).
+    /// Snapshot of the bytes of disk `index` (panics if the disk does not exist). Sectors a
+    /// device from [`MockPlatform::add_device`] cannot read are returned as zeros.
     pub fn disk_bytes(&self, index: u32) -> Vec<u8> {
         let dev = self.disk(index).expect("mock disk exists");
-        let guard = dev.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_slice().to_vec()
+        let mut guard = dev.lock().unwrap_or_else(|e| e.into_inner());
+        guard.bytes()
     }
 
     fn disk(&self, index: u32) -> Result<SharedDisk> {
@@ -187,7 +261,7 @@ impl MockPlatform {
 struct MockDiskDevice(SharedDisk);
 
 impl MockDiskDevice {
-    fn lock(&self) -> MutexGuard<'_, MemDevice> {
+    fn lock(&self) -> MutexGuard<'_, Store> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

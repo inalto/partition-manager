@@ -112,8 +112,8 @@ impl ImageCreateState {
         let path = PathBuf::from(t);
         let (format, mode) = (self.format, self.mode);
         Ok(vec![match self.source {
-            Device::Disk(disk) => Operation::ImageDisk { disk, path, format, mode },
-            Device::Partition(disk, number) => Operation::ImagePartition { disk, number, path, format, mode },
+            Device::Disk(disk) => Operation::ImageDisk { disk, path, format, mode, rescue: None },
+            Device::Partition(disk, number) => Operation::ImagePartition { disk, number, path, format, mode, rescue: None },
         }])
     }
 }
@@ -246,14 +246,14 @@ mod tests {
         let ops = s.build().unwrap();
         assert_eq!(
             ops,
-            vec![Operation::ImagePartition { disk: 1, number: 3, path: path.clone(), format: ImageFormat::Qcow2, mode: CloneMode::Smart }]
+            vec![Operation::ImagePartition { disk: 1, number: 3, path: path.clone(), format: ImageFormat::Qcow2, mode: CloneMode::Smart, rescue: None }]
         );
         assert!(check_ops(&m, &ops).is_ok());
         s.source = Device::Disk(1);
         s.mode = CloneMode::Sector;
         s.format = ImageFormat::VhdFixed;
         let ops = wizard(s).build_ops().unwrap();
-        assert_eq!(ops, vec![Operation::ImageDisk { disk: 1, path, format: ImageFormat::VhdFixed, mode: CloneMode::Sector }]);
+        assert_eq!(ops, vec![Operation::ImageDisk { disk: 1, path, format: ImageFormat::VhdFixed, mode: CloneMode::Sector, rescue: None }]);
     }
 
     #[test]

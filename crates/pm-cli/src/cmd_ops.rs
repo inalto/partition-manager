@@ -525,11 +525,11 @@ impl OpCommand {
             ),
             ImageDisk { disk, path, format, mode, run } => {
                 let format = pick_format(format, &path)?;
-                (Operation::ImageDisk { disk, path, format, mode: clone_mode(mode) }, run)
+                (Operation::ImageDisk { disk, path, format, mode: clone_mode(mode), rescue: None }, run)
             }
             ImagePartition { disk, part, path, format, mode, run } => {
                 let format = pick_format(format, &path)?;
-                (Operation::ImagePartition { disk, number: part, path, format, mode: clone_mode(mode) }, run)
+                (Operation::ImagePartition { disk, number: part, path, format, mode: clone_mode(mode), rescue: None }, run)
             }
             RestoreImage { path, disk, start, run } => {
                 (Operation::RestoreImage { path, dst_disk: disk, dst_start: start }, run)

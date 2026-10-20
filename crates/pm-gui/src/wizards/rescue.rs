@@ -773,6 +773,7 @@ mod tests {
             read_errors: 5,
             elapsed_secs: 0.0,
             passes: 1,
+            mapfile: None,
         };
         let text = format_rescue_status(&s, Duration::from_secs(125), "Scraping");
         let lines: Vec<&str> = text.lines().collect();

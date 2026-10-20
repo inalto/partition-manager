@@ -827,6 +827,7 @@ fn execute_image_and_restore_partition() {
         path: img.clone(),
         format: ImageFormat::Raw,
         mode: CloneMode::Smart,
+        rescue: None,
     };
     let r = run(&p, &[image]);
     assert_eq!(r.failed, None, "{:?}", r.log);
@@ -845,7 +846,7 @@ fn execute_image_and_restore_partition() {
 
     // a failing image leaves no file behind
     let missing = dir.path().join("nope").join("x.img");
-    let r = run(&p, &[Operation::ImageDisk { disk: 0, path: missing.clone(), format: ImageFormat::Raw, mode: CloneMode::Sector }]);
+    let r = run(&p, &[Operation::ImageDisk { disk: 0, path: missing.clone(), format: ImageFormat::Raw, mode: CloneMode::Sector, rescue: None }]);
     assert!(r.failed.is_some());
     assert!(!missing.exists());
 }
@@ -1461,6 +1462,7 @@ fn read_only_or_offline_disks_and_extended_types_are_refused() {
             path: std::env::temp_dir().join("pm-never-written.img"),
             format: ImageFormat::Raw,
             mode: CloneMode::Sector,
+            rescue: None,
         };
         pm_ops::precheck(&m, &img).unwrap();
     }

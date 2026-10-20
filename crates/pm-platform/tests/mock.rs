@@ -245,3 +245,48 @@ fn mock_smart_returns_configured_data_per_disk() {
     assert_eq!((d.healthy, d.temperature_c), (Some(true), Some(40)));
     assert!(p.smart(1).unwrap().is_none());
 }
+
+/// A device whose sector at byte 4096 cannot be read.
+struct OneBadSector(MemDevice);
+
+impl BlockDevice for OneBadSector {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> pm_core::Result<()> {
+        if offset < 4096 + 512 && 4096 < offset + buf.len() as u64 {
+            return Err(pm_core::Error::Invalid("bad sector".into()));
+        }
+        self.0.read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> pm_core::Result<()> {
+        self.0.write_at(offset, buf)
+    }
+    fn flush(&mut self) -> pm_core::Result<()> {
+        Ok(())
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn mock_add_device_backs_a_disk_with_any_device() {
+    let p = MockPlatform::new();
+    let dev = mbr_disk(8 * MIB, &[(MIB, 4 * MIB, 0x07)]);
+    let mut raw = dev.as_slice().to_vec();
+    p.add_device(2, Box::new(OneBadSector(dev)), meta("Faulty"));
+    p.add_disk(0, MemDevice::new(MIB), meta("Plain"));
+    let disks = p.enumerate_disks().unwrap();
+    assert_eq!(disks.iter().map(|d| d.index).collect::<Vec<_>>(), [0, 2]);
+    let d = disks.iter().find(|d| d.index == 2).unwrap();
+    assert_eq!((d.size, d.table, d.partitions.len()), (8 * MIB, TableKind::Mbr, 1));
+    // reads go to the device, errors included
+    let mut dev = p.open_disk(2, OpenMode::ReadOnly).unwrap();
+    let mut buf = vec![0u8; 1024];
+    assert!(dev.read_at(4096, &mut buf).is_err());
+    assert!(dev.read_at(8192, &mut buf).is_ok());
+    // a snapshot zero-fills what cannot be read
+    raw[4096..4608].fill(0);
+    assert!(p.disk_bytes(2) == raw);
+}

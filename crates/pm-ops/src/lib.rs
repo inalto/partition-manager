@@ -15,7 +15,7 @@ pub mod sizing;
 mod steps;
 
 pub use model::{table_from_disk, Model};
-pub use operation::{BootFix, CloneMode, Operation, Sizing, WipeMethod};
+pub use operation::{BootFix, CloneMode, Operation, RescueSettings, Sizing, WipeMethod};
 pub use planner::Planner;
 pub use sizing::{plan_disk_clone, windows_partition, LayoutSpec, TargetLayout};
 pub use executor::{execute, execute_queued, precheck, ExecOpts, ExecReport, StepEvent};

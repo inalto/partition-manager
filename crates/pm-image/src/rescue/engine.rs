@@ -80,6 +80,9 @@ pub struct RescueStats {
     pub elapsed_secs: f64,
     /// Retry passes run.
     pub passes: u32,
+    /// The mapfile of the run (`RescueOpts::mapfile`), if any.
+    #[serde(default)]
+    pub mapfile: Option<PathBuf>,
 }
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -513,6 +516,7 @@ impl<'a> Engine<'a> {
             read_errors: self.read_errors,
             elapsed_secs: self.start.elapsed().as_secs_f64(),
             passes: self.passes,
+            mapfile: self.opts.mapfile.clone(),
         }
     }
 }

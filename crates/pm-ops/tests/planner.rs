@@ -617,6 +617,7 @@ fn simulate_all_chains_models() {
         path: dir.path().join("disk0.vhd"),
         format: ImageFormat::VhdDynamic,
         mode: CloneMode::Smart,
+        rescue: None,
     };
     let out = Planner::simulate(&m, &op).unwrap();
     assert_eq!(out.disks, m.disks);
@@ -626,6 +627,7 @@ fn simulate_all_chains_models() {
         path: dir.path().join("missing").join("p3.img"),
         format: ImageFormat::Raw,
         mode: CloneMode::Sector,
+        rescue: None,
     };
     invalid_msg(Planner::simulate(&m, &op));
 
@@ -769,6 +771,7 @@ fn operation_summary_text() {
                 path: PathBuf::from(r"C:\img.vhd"),
                 format: ImageFormat::VhdDynamic,
                 mode: CloneMode::Smart,
+                rescue: None,
             },
             r"Image Disk 1 → C:\img.vhd (VHD (dynamic), smart)",
         ),

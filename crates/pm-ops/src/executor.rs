@@ -76,7 +76,9 @@ pub struct ExecReport {
 /// * a clone / migration that puts a source partition into a smaller target unless the source
 ///   is an NTFS volume that can be shrunk online. (Conservative: a filesystem smaller
 ///   than its partition would fit, but the model does not know filesystem sizes.)
-/// * any write to a disk Windows reports as read-only or offline.
+/// * any write to a disk Windows reports as read-only or offline;
+/// * a rescue-mode image whose mapfile folder does not exist, whose mapfile is the image
+///   itself, or whose cluster size is zero.
 pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
     if let Some(d) = written_disk(model, op).and_then(|d| model.disk(d)) {
         let i = d.index;
@@ -106,6 +108,10 @@ pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
                 steps::table_ops::align_changes(d, false)?;
             }
             Ok(())
+        }
+        Operation::ImageDisk { path, rescue: Some(r), .. }
+        | Operation::ImagePartition { path, rescue: Some(r), .. } => {
+            steps::image::check_rescue_settings(path, r)
         }
         _ => {
             for (src_disk, p, _) in steps::clone::smaller_targets(model, op) {
@@ -412,11 +418,11 @@ fn run_op(ctx: &mut Ctx, op: &Operation) -> Result<()> {
                 *boot_fix,
             )
         }
-        ImageDisk { disk, path, format, mode } => {
-            image::image(ctx, *disk, None, path, *format, *mode)
+        ImageDisk { disk, path, format, mode, rescue } => {
+            image::image(ctx, *disk, None, path, *format, *mode, rescue.as_ref())
         }
-        ImagePartition { disk, number, path, format, mode } => {
-            image::image(ctx, *disk, Some(*number), path, *format, *mode)
+        ImagePartition { disk, number, path, format, mode, rescue } => {
+            image::image(ctx, *disk, Some(*number), path, *format, *mode, rescue.as_ref())
         }
         RestoreImage { path, dst_disk, dst_start } => {
             image::restore(ctx, path, *dst_disk, *dst_start)
