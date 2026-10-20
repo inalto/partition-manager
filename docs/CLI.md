@@ -780,6 +780,7 @@ Options:
       --smart                Copy only the blocks the filesystem marks used
       --sector               Copy every sector
       --boot-fix <BOOT_FIX>  [default: none] [possible values: none, uefi, bios, all]
+      --table <TABLE>        Partition table of the copy (default: the same kind as the source); converting maps the partition types, an MBR copy holds at most 4 partitions within 2 TiB [possible values: gpt, mbr]
       --dry-run              Validate and show what would be done; write nothing
       --yes                  Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk    Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -804,6 +805,8 @@ Options:
       --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --sizing <SIZING>      [default: fit] [possible values: exact, fit, proportional]
       --boot-fix <BOOT_FIX>  [default: none] [possible values: none, uefi, bios, all]
+      --table <TABLE>        Partition table of the copy (default: the same kind as the source); converting maps the partition types, an MBR copy holds at most 4 partitions within 2 TiB [possible values: gpt, mbr]
+      --keep-ids             Keep the source's disk and partition ids on the copy, so Windows keeps its drive letters (MountedDevices); detach the source before the copy boots, Windows takes a disk with a duplicate id offline. Needs the same table kind as the source
       --dry-run              Validate and show what would be done; write nothing
       --yes                  Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk    Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)

@@ -10,7 +10,7 @@ pub mod mbr;
 pub mod search;
 pub mod table;
 
-pub use convert::{align_table, gpt_to_mbr, mbr_to_gpt};
+pub use convert::{align_table, convert_type, gpt_to_mbr, mbr_to_gpt};
 pub use gpt::{
     gpt_health, gpt_repair_backup_from_primary, gpt_repair_primary_from_backup, parse_gpt, write_gpt,
     GptHealth,

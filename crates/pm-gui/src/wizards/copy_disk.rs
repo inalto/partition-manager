@@ -1,8 +1,8 @@
 //! Copy Disk wizard: Source disk → Target disk (every disk but the source and the running
 //! system disk; everything on it is erased) → Copy options (sizing Fit / Proportional /
-//! Exact, Smart / sector-by-sector, 1 MB alignment, boot fix) → Preview (the source bar and
-//! the planned target bar, and which source volumes will be shrunk) → summary →
-//! [`Operation::CloneDisk`].
+//! Exact, Smart / sector-by-sector, 1 MB alignment, the partition table of the copy, boot
+//! fix) → Preview (the source bar and the planned target bar, and which source volumes will
+//! be shrunk) → summary → [`Operation::CloneDisk`].
 //!
 //! The pickers, option groups and the preview are shared with the Migrate OS wizard.
 
@@ -10,8 +10,10 @@ use super::{disk_preview, row};
 use crate::tools::WARN;
 use crate::wizard::{check_ops, shared, StepResult, Wizard, WizardCtx};
 use eframe::egui::{self, RichText};
-use pm_core::{format_size, DiskInfo, TableKind};
+use pm_core::{format_size, DiskInfo, TableKind, GIB};
 use pm_ops::{BootFix, CloneMode, Model, Operation, Planner, Sizing};
+
+const TIB: u64 = 1024 * GIB;
 
 /// Disks that can be copied: initialized, with partitions.
 pub fn source_disks(m: &Model) -> Vec<u32> {
@@ -55,6 +57,72 @@ pub fn boot_fix_name(b: BootFix) -> &'static str {
     }
 }
 
+/// The partition table kind a copy of `src` gets by default: GPT when the source is MBR
+/// and either the target is larger than an MBR can address (2 TiB) or the source boots
+/// through an EFI partition (a UEFI machine); otherwise the source's kind (`None`).
+pub fn default_target_table(src: &DiskInfo, dst: &DiskInfo) -> Option<TableKind> {
+    let efi = src.partitions.iter().any(|p| p.ptype.is_some_and(|t| t.is_efi()));
+    (src.table == TableKind::Mbr && (dst.size > 2 * TIB || efi)).then_some(TableKind::Gpt)
+}
+
+/// The kind the target gets: `choice`, else the source's.
+pub fn effective_table(src: &DiskInfo, choice: Option<TableKind>) -> TableKind {
+    choice.unwrap_or(src.table)
+}
+
+pub fn table_kind_name(k: TableKind) -> &'static str {
+    match k {
+        TableKind::Gpt => "GPT",
+        TableKind::Mbr => "MBR",
+        _ => "unknown",
+    }
+}
+
+/// `"Same as the source (GPT)"`, `"GPT"` or `"MBR"`.
+pub fn table_choice_name(src: &DiskInfo, choice: Option<TableKind>) -> String {
+    match choice {
+        None => format!("Same as the source ({})", table_kind_name(src.table)),
+        Some(k) => table_kind_name(k).to_string(),
+    }
+}
+
+/// An MBR copy on a target larger than 2 TiB cannot use the space past 2 TiB.
+pub fn mbr_size_note(kind: TableKind, dst: &DiskInfo) -> Option<String> {
+    (kind == TableKind::Mbr && dst.size > 2 * TIB).then(|| {
+        format!(
+            "An MBR partition table cannot address more than 2 TB of the {} target; choose GPT \
+             to use all of it.",
+            format_size(dst.size)
+        )
+    })
+}
+
+/// The partition-table picker of a copy: the source's kind, GPT or MBR, with the size note
+/// and what a conversion does.
+pub fn table_ui(ui: &mut egui::Ui, m: &Model, src: u32, dst: Option<u32>, choice: &mut Option<TableKind>) {
+    let Some(s) = m.disk(src) else { return };
+    ui.horizontal(|ui| {
+        ui.label("Partition table on the target:");
+        egui::ComboBox::from_id_salt("target_table").selected_text(table_choice_name(s, *choice)).show_ui(ui, |ui| {
+            for c in [None, Some(TableKind::Gpt), Some(TableKind::Mbr)] {
+                ui.selectable_value(choice, c, table_choice_name(s, c));
+            }
+        });
+    });
+    let kind = effective_table(s, *choice);
+    if kind != s.table {
+        ui.indent("table_help", |ui| {
+            ui.weak(match kind {
+                TableKind::Gpt => "Converted while copying: partition types are mapped and logical partitions become ordinary GPT partitions.",
+                _ => "Converted while copying: partition types are mapped, the Microsoft reserved partition is dropped and the Windows partition is made active; at most 4 partitions fit.",
+            })
+        });
+    }
+    if let Some(note) = dst.and_then(|d| m.disk(d)).and_then(|d| mbr_size_note(kind, d)) {
+        ui.colored_label(WARN, note);
+    }
+}
+
 pub fn mode_name(m: CloneMode) -> &'static str {
     match m {
         CloneMode::Smart => "Smart (used sectors only)",
@@ -72,6 +140,8 @@ pub struct CopyDiskState {
     pub sizing: Sizing,
     pub mode: CloneMode,
     pub boot_fix: BootFix,
+    /// The copy's partition table kind; `None` keeps the source's.
+    pub target_table: Option<TableKind>,
 }
 
 impl CopyDiskState {
@@ -80,7 +150,7 @@ impl CopyDiskState {
         let sources = source_disks(ctx.model);
         let src = ctx.selection.disk().filter(|d| sources.contains(d)).or_else(|| sources.first().copied())?;
         let boot_fix = default_boot_fix(ctx.model.disk(src)?, BootFix::None);
-        Some(CopyDiskState { src, dst: None, sizing: Sizing::Fit, mode: CloneMode::Smart, boot_fix })
+        Some(CopyDiskState { src, dst: None, sizing: Sizing::Fit, mode: CloneMode::Smart, boot_fix, target_table: None })
     }
 
     pub fn op(&self) -> Option<Operation> {
@@ -90,6 +160,7 @@ impl CopyDiskState {
             sizing: self.sizing,
             mode: self.mode,
             boot_fix: self.boot_fix,
+            target_table: self.target_table,
         })
     }
 
@@ -217,15 +288,24 @@ fn source_ui(s: &mut CopyDiskState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepR
 }
 
 fn target_step(s: &mut CopyDiskState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
-    target_ui(ui, ctx.model, s.src, ctx.system_disk, &mut s.dst)
+    let before = s.dst;
+    let r = target_ui(ui, ctx.model, s.src, ctx.system_disk, &mut s.dst);
+    if s.dst != before {
+        if let (Some(src), Some(dst)) = (ctx.model.disk(s.src), s.dst.and_then(|d| ctx.model.disk(d))) {
+            s.target_table = default_target_table(src, dst);
+        }
+    }
+    r
 }
 
-fn options_ui(s: &mut CopyDiskState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
+fn options_ui(s: &mut CopyDiskState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
     sizing_ui(ui, &mut s.sizing);
     ui.add_space(8.0);
     ui.label(RichText::new("Copy mode").strong());
     ui.radio_value(&mut s.mode, CloneMode::Smart, mode_name(CloneMode::Smart));
     ui.radio_value(&mut s.mode, CloneMode::Sector, mode_name(CloneMode::Sector));
+    ui.add_space(8.0);
+    table_ui(ui, ctx.model, s.src, s.dst, &mut s.target_table);
     ui.add_space(8.0);
     boot_fix_ui(ui, &mut s.boot_fix);
     StepResult::Continue
@@ -251,6 +331,7 @@ fn options_summary(s: &CopyDiskState) -> Vec<(String, String)> {
         row("Sizing", sizing_name(s.sizing)),
         row("Copy mode", mode_name(s.mode)),
         row("Alignment", "1 MB"),
+        row("Partition table", s.target_table.map_or("same as the source", table_kind_name)),
         row("Boot repair", boot_fix_name(s.boot_fix)),
     ]
 }
@@ -313,12 +394,57 @@ mod tests {
                 dst_disk: 2,
                 sizing: Sizing::Proportional,
                 mode: CloneMode::Sector,
-                boot_fix: BootFix::Uefi
+                boot_fix: BootFix::Uefi,
+                target_table: None,
             }]
         );
         let after = check_ops(&m, &ops).unwrap();
         assert_eq!(after.disk(2).unwrap().partitions.len(), 3);
         assert_eq!(wizard(s).build_ops().unwrap(), ops);
+
+        // the MBR disk copied as GPT: the option reaches the operation and the planner
+        let ctx = WizardCtx::new(&m, vec![], Selected::Disk(0));
+        let mut s = CopyDiskState::initial(&ctx).unwrap();
+        s.dst = Some(2);
+        s.target_table = Some(TableKind::Gpt);
+        let ops = s.build().unwrap();
+        assert!(matches!(ops[0], Operation::CloneDisk { src_disk: 0, target_table: Some(TableKind::Gpt), .. }));
+        let after = check_ops(&m, &ops).unwrap();
+        let d2 = after.disk(2).unwrap();
+        assert_eq!(d2.table, TableKind::Gpt);
+        assert_eq!(d2.partitions.len(), 3, "primary and the two logicals, no container");
+        assert_eq!(options_summary(&s)[3], row("Partition table", "GPT"));
+    }
+
+    #[test]
+    fn target_table_defaults_to_gpt_for_mbr_sources_that_need_it() {
+        let m = model();
+        let (mbr, gpt) = (m.disk(0).unwrap(), m.disk(1).unwrap());
+        let mut big = gpt.clone();
+        big.size = 3 * TIB;
+        // small target, BIOS source: keep MBR
+        assert_eq!(default_target_table(mbr, gpt), None);
+        // past 2 TiB: GPT
+        assert_eq!(default_target_table(mbr, &big), Some(TableKind::Gpt));
+        // an MBR source with an EFI partition (UEFI machine): GPT
+        let mut uefi = mbr.clone();
+        uefi.partitions[0].ptype = Some(pm_core::PartitionType::Mbr(0xEF));
+        assert_eq!(default_target_table(&uefi, gpt), Some(TableKind::Gpt));
+        // a GPT source stays GPT
+        assert_eq!(default_target_table(gpt, &big), None);
+
+        assert_eq!(effective_table(mbr, None), TableKind::Mbr);
+        assert_eq!(effective_table(mbr, Some(TableKind::Gpt)), TableKind::Gpt);
+        assert_eq!(table_choice_name(mbr, None), "Same as the source (MBR)");
+        assert!(mbr_size_note(TableKind::Mbr, &big).unwrap().contains("GPT"));
+        assert!(mbr_size_note(TableKind::Gpt, &big).is_none());
+        assert!(mbr_size_note(TableKind::Mbr, gpt).is_none());
+
+        // the wizard applies the default when the target is chosen (target_step); the
+        // initial state has no target and keeps the source's kind
+        let ctx = WizardCtx::new(&m, vec![], Selected::Disk(0));
+        let s = CopyDiskState::initial(&ctx).unwrap();
+        assert_eq!((s.dst, s.target_table), (None, None));
     }
 
     #[test]

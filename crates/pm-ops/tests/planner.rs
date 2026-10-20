@@ -6,8 +6,8 @@ use pm_core::{
 };
 use pm_image::ImageFormat;
 use pm_ops::{
-    plan_disk_clone, table_from_disk, BootFix, CloneMode, Model, Operation, Planner, Sizing,
-    WipeMethod,
+    plan_disk_clone, table_from_disk, BootFix, CloneMode, LayoutSpec, Model, Operation, Planner,
+    Sizing, WipeMethod,
 };
 use pm_platform::MountPoint;
 use std::path::PathBuf;
@@ -256,14 +256,14 @@ fn plan_clone_rejects_small_target() {
     let m = model();
     let src = m.disk(0).unwrap();
     // 25 GiB used + 10 % does not fit on 20 GiB.
-    let err = plan_disk_clone(src, 20 * GIB, 512, Sizing::Fit, false, &used_or_len, None);
+    let err = plan_disk_clone(src, 20 * GIB, 512, LayoutSpec::new(Sizing::Fit, false), &used_or_len, None);
     let msg = invalid_msg(err);
     assert!(msg.contains("partition 3"), "{msg}");
-    let err = plan_disk_clone(src, 20 * GIB, 512, Sizing::Proportional, true, &used_or_len, None);
+    let err = plan_disk_clone(src, 20 * GIB, 512, LayoutSpec::new(Sizing::Proportional, true), &used_or_len, None);
     let msg = invalid_msg(err);
     assert!(msg.contains("partition 3"), "{msg}");
     // Exact needs the whole source layout.
-    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, Sizing::Exact, false, &used_or_len, None));
+    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, LayoutSpec::new(Sizing::Exact, false), &used_or_len, None));
     assert!(msg.contains("partition 3"), "{msg}");
 
     // Through the planner.
@@ -273,6 +273,7 @@ fn plan_clone_rejects_small_target() {
         sizing: Sizing::Fit,
         mode: CloneMode::Smart,
         boot_fix: BootFix::Uefi,
+        target_table: None,
     };
     let msg = invalid_msg(Planner::simulate(&m, &op));
     assert!(msg.contains("partition 3"), "{msg}");
@@ -327,6 +328,7 @@ fn planner_guards_system_disk() {
             sizing: Sizing::Fit,
             mode: CloneMode::Smart,
             boot_fix: BootFix::None,
+            target_table: None,
         },
         Operation::WipeDisk { disk: 0, method: WipeMethod::Zero },
         Operation::InitializeDisk { disk: 0, kind: TableKind::Mbr },
@@ -341,6 +343,8 @@ fn planner_guards_system_disk() {
             only_system_parts: true,
             sizing: Sizing::Proportional,
             boot_fix: BootFix::All,
+            target_table: None,
+            keep_ids: false,
         },
         Operation::ConvertTable { disk: 0, to: TableKind::Mbr },
     ];
@@ -407,6 +411,7 @@ fn planner_guards_system_disk() {
             sizing: Sizing::Proportional,
             mode: CloneMode::Smart,
             boot_fix: BootFix::Uefi,
+            target_table: None,
         },
     )
     .unwrap();
@@ -417,7 +422,7 @@ fn plan_disk_clone_proportional_keeps_efi_msr() {
     let m = model();
     let src = m.disk(0).unwrap();
     let layout =
-        plan_disk_clone(src, 200 * GIB, 512, Sizing::Proportional, false, &used_or_len, None).unwrap();
+        plan_disk_clone(src, 200 * GIB, 512, LayoutSpec::new(Sizing::Proportional, false), &used_or_len, None).unwrap();
     let t = &layout.table;
     assert_eq!(t.kind, TableKind::Gpt);
     assert_eq!(t.entries.len(), 4);
@@ -444,7 +449,7 @@ fn plan_disk_clone_proportional_keeps_efi_msr() {
 
     // Shrinking proportionally to 50 GiB keeps the fixed partitions too.
     let layout =
-        plan_disk_clone(src, 50 * GIB, 512, Sizing::Proportional, false, &used_or_len, None).unwrap();
+        plan_disk_clone(src, 50 * GIB, 512, LayoutSpec::new(Sizing::Proportional, false), &used_or_len, None).unwrap();
     let t = &layout.table;
     assert_eq!(t.entries.iter().find(|e| e.ptype.is_efi()).unwrap().len, 100 * MIB);
     let win = t.entries.iter().find(|e| e.number == 3).unwrap();
@@ -459,17 +464,17 @@ fn plan_disk_clone_proportional_keeps_efi_msr() {
     data.mount_points = vec!["D:\\".into()];
     src2.partitions.push(data);
     let all =
-        plan_disk_clone(&src2, 200 * GIB, 512, Sizing::Proportional, false, &used_or_len, None).unwrap();
+        plan_disk_clone(&src2, 200 * GIB, 512, LayoutSpec::new(Sizing::Proportional, false), &used_or_len, None).unwrap();
     assert_eq!(all.table.entries.len(), 5);
     let sys =
-        plan_disk_clone(&src2, 200 * GIB, 512, Sizing::Proportional, true, &used_or_len, None).unwrap();
+        plan_disk_clone(&src2, 200 * GIB, 512, LayoutSpec::new(Sizing::Proportional, true), &used_or_len, None).unwrap();
     assert_eq!(sys.table.entries.len(), 4);
     assert!(sys.map.iter().all(|(s, _)| *s != 5));
     assert_layout_sane(&all.table);
     assert_layout_sane(&sys.table);
 
     // Exact keeps starts and lengths.
-    let exact = plan_disk_clone(src, 200 * GIB, 512, Sizing::Exact, false, &used_or_len, None).unwrap();
+    let exact = plan_disk_clone(src, 200 * GIB, 512, LayoutSpec::new(Sizing::Exact, false), &used_or_len, None).unwrap();
     for p in &src.partitions {
         let e = exact.table.entries.iter().find(|e| e.number == p.number).unwrap();
         assert_eq!((e.start, e.len), (p.start, p.len));
@@ -481,7 +486,7 @@ fn plan_disk_clone_fit_uses_used_sizes() {
     let m = model();
     let src = m.disk(0).unwrap();
     let fixed = 100 * MIB + 16 * MIB + GIB;
-    let layout = plan_disk_clone(src, 50 * GIB, 512, Sizing::Fit, false, &used_or_len, None).unwrap();
+    let layout = plan_disk_clone(src, 50 * GIB, 512, LayoutSpec::new(Sizing::Fit, false), &used_or_len, None).unwrap();
     let t = &layout.table;
     let win = t.entries.iter().find(|e| e.number == 3).unwrap();
     let min = 25 * GIB + 25 * GIB / 10; // used + 10 %
@@ -494,7 +499,7 @@ fn plan_disk_clone_fit_uses_used_sizes() {
     assert_layout_sane(t);
 
     // A bigger target: every partition keeps at least its source size, leftover to Windows.
-    let big = plan_disk_clone(src, 200 * GIB, 512, Sizing::Fit, false, &used_or_len, None).unwrap();
+    let big = plan_disk_clone(src, 200 * GIB, 512, LayoutSpec::new(Sizing::Fit, false), &used_or_len, None).unwrap();
     let win = big.table.entries.iter().find(|e| e.number == 3).unwrap();
     assert!(win.len > 60 * GIB);
     assert_layout_sane(&big.table);
@@ -506,6 +511,8 @@ fn plan_disk_clone_fit_uses_used_sizes() {
         only_system_parts: true,
         sizing: Sizing::Fit,
         boot_fix: BootFix::Uefi,
+        target_table: None,
+        keep_ids: false,
     };
     let out = Planner::simulate(&m, &op).unwrap();
     let d1 = out.disk(1).unwrap();
@@ -717,6 +724,7 @@ fn operation_summary_text() {
                 sizing: Sizing::Fit,
                 mode: CloneMode::Smart,
                 boot_fix: BootFix::Uefi,
+                target_table: None,
             },
             "Clone Disk 1 → Disk 2 (fit, smart)",
         ),
@@ -727,8 +735,33 @@ fn operation_summary_text() {
                 only_system_parts: true,
                 sizing: Sizing::Proportional,
                 boot_fix: BootFix::Uefi,
+                target_table: None,
+                keep_ids: false,
             },
             "Migrate OS from Disk 1 → Disk 2 (system partitions only, proportional)",
+        ),
+        (
+            Operation::CloneDisk {
+                src_disk: 1,
+                dst_disk: 2,
+                sizing: Sizing::Fit,
+                mode: CloneMode::Smart,
+                boot_fix: BootFix::Uefi,
+                target_table: Some(TableKind::Gpt),
+            },
+            "Clone Disk 1 → Disk 2 (fit, smart, to GPT)",
+        ),
+        (
+            Operation::MigrateOs {
+                src_disk: 1,
+                dst_disk: 2,
+                only_system_parts: false,
+                sizing: Sizing::Exact,
+                boot_fix: BootFix::None,
+                target_table: Some(TableKind::Mbr),
+                keep_ids: true,
+            },
+            "Migrate OS from Disk 1 → Disk 2 (all partitions, exact, to MBR, keep ids)",
         ),
         (
             Operation::ImageDisk {
@@ -780,6 +813,7 @@ fn operation_summary_text() {
         sizing: Sizing::Exact,
         mode: CloneMode::Sector,
         boot_fix: BootFix::None,
+        target_table: None,
     };
     assert!(clone.touches_disk(1) && clone.touches_disk(2) && !clone.touches_disk(0));
     assert!(Operation::SetLabel { disk: 3, number: 1, label: String::new() }.touches_disk(3));
@@ -889,7 +923,7 @@ fn mbr_logicals_need_ebr_room() {
     // Exact clone of a legacy (63-sector gap) MBR layout cannot be written.
     let legacy = model_with_mbr(true);
     let src = legacy.disk(4).unwrap();
-    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, Sizing::Exact, false, &used_or_len, None));
+    let msg = invalid_msg(plan_disk_clone(src, 50 * GIB, 512, LayoutSpec::new(Sizing::Exact, false), &used_or_len, None));
     assert!(msg.contains("Disk 4") && msg.contains("Fit or Proportional"), "{msg}");
     let op = Operation::CloneDisk {
         src_disk: 4,
@@ -897,12 +931,13 @@ fn mbr_logicals_need_ebr_room() {
         sizing: Sizing::Exact,
         mode: CloneMode::Sector,
         boot_fix: BootFix::Bios,
+        target_table: None,
     };
     let msg = invalid_msg(Planner::simulate(&legacy, &op));
     assert!(msg.contains("Fit or Proportional"), "{msg}");
     // Proportional / Fit rebuild the container with 1 MiB EBR slots.
     for sizing in [Sizing::Proportional, Sizing::Fit] {
-        let layout = plan_disk_clone(src, 50 * GIB, 512, sizing, false, &used_or_len, None).unwrap();
+        let layout = plan_disk_clone(src, 50 * GIB, 512, LayoutSpec::new(sizing, false), &used_or_len, None).unwrap();
         let t = &layout.table;
         t.validate().unwrap();
         let ext = t.entries.iter().find(|e| e.ptype.is_extended_mbr()).unwrap();
@@ -973,6 +1008,7 @@ fn system_disk_fallbacks() {
             sizing: Sizing::Fit,
             mode: CloneMode::Smart,
             boot_fix: BootFix::None,
+            target_table: None,
         },
         Operation::MigrateOs {
             src_disk: 0,
@@ -980,6 +1016,8 @@ fn system_disk_fallbacks() {
             only_system_parts: true,
             sizing: Sizing::Fit,
             boot_fix: BootFix::None,
+            target_table: None,
+            keep_ids: false,
         },
         Operation::RestoreImage { path: PathBuf::from("x.img"), dst_disk: 3, dst_start: None },
     ] {
@@ -1097,9 +1135,224 @@ fn windows_partition_detection_order() {
     // Sizing uses the same rule: with only_system the data partition is dropped when C:\ or
     // the probe identifies Windows.
     for (m, probe) in [(with_data(true), None), (with_data(false), Some(&says_windows as &dyn Fn(u32, &PartitionInfo) -> bool))] {
-        let sys = plan_disk_clone(m.disk(0).unwrap(), 200 * GIB, 512, Sizing::Fit, true, &used_or_len, probe)
+        let sys = plan_disk_clone(m.disk(0).unwrap(), 200 * GIB, 512, LayoutSpec::new(Sizing::Fit, true), &used_or_len, probe)
             .unwrap();
         assert!(sys.map.iter().any(|(s, _)| *s == 3));
         assert!(sys.map.iter().all(|(s, _)| *s != 5));
     }
+}
+
+// ---- Target table kind and kept ids ------------------------------------------------------
+
+fn mbr_kind(t: &PartitionInfo) -> u8 {
+    match t.ptype {
+        Some(PartitionType::Mbr(b)) => b,
+        other => panic!("expected an MBR type, got {other:?}"),
+    }
+}
+
+#[test]
+fn plan_disk_clone_gpt_source_to_mbr_target() {
+    let m = model();
+    let src = m.disk(0).unwrap();
+    let spec = LayoutSpec { target_table: Some(TableKind::Mbr), ..LayoutSpec::new(Sizing::Fit, false) };
+    let l = plan_disk_clone(src, 200 * GIB, 512, spec, &used_or_len, None).unwrap();
+    assert_eq!(l.table.kind, TableKind::Mbr);
+    assert_ne!(l.table.mbr_signature, 0);
+    // the MSR has no MBR equivalent and is dropped; types are mapped; Windows is active
+    assert_eq!(l.map, vec![(1, 1), (3, 2), (4, 3)]);
+    let e: Vec<_> = l.table.entries.iter().map(|e| (e.number, e.ptype, e.attrs, e.logical)).collect();
+    assert_eq!(e[0], (1, PartitionType::Mbr(0xEF), 0, false));
+    assert_eq!(e[1], (2, PartitionType::Mbr(0x07), 1, false), "the Windows partition is active");
+    assert_eq!(e[2], (3, PartitionType::Mbr(0x27), 0, false));
+    assert!(l.table.entries.iter().all(|e| e.guid.is_none() && e.name.is_empty()));
+    assert_layout_sane(&l.table);
+
+    // through the planner: the target becomes an MBR disk with 3 partitions
+    let op = Operation::MigrateOs {
+        src_disk: 0,
+        dst_disk: 2,
+        only_system_parts: true,
+        sizing: Sizing::Fit,
+        boot_fix: BootFix::None,
+        target_table: Some(TableKind::Mbr),
+        keep_ids: false,
+    };
+    let out = Planner::simulate(&m, &op).unwrap();
+    let d2 = out.disk(2).unwrap();
+    assert_eq!(d2.table, TableKind::Mbr);
+    assert_eq!(d2.partitions.len(), 3);
+    assert_eq!(mbr_kind(&d2.partitions[0]), 0xEF);
+    assert!(d2.partitions[1].flags.active);
+    assert_eq!(d2.partitions[1].fs, Some(FsKind::Ntfs));
+    assert_eq!(op.shrinks_source(&m), Vec::<String>::new());
+
+    // an MBR cannot address past 2 TiB: Exact placement there is refused
+    let far = {
+        let mut d = src.clone();
+        d.partitions[3].start = 3 * 1024 * GIB;
+        d
+    };
+    let spec_exact = LayoutSpec { target_table: Some(TableKind::Mbr), ..LayoutSpec::new(Sizing::Exact, false) };
+    let msg = invalid_msg(plan_disk_clone(&far, 4 * 1024 * GIB, 512, spec_exact, &used_or_len, None));
+    assert!(msg.contains("partition 4"), "{msg}");
+    // Fit lays it out within the first 2 TiB instead
+    let l = plan_disk_clone(&far, 4 * 1024 * GIB, 512, spec, &used_or_len, None).unwrap();
+    assert!(l.table.entries.iter().all(|e| e.end() <= 2 * 1024 * GIB), "{:?}", l.table.entries);
+
+    // more than four partitions do not fit an MBR
+    let mut many = src.clone();
+    for n in 5..=7 {
+        let mut p = part(n, 80 * GIB + (n as u64) * GIB, GIB, gpt(gpt_types::BASIC_DATA));
+        p.fs = Some(FsKind::Ntfs);
+        many.partitions.push(p);
+    }
+    let msg = invalid_msg(plan_disk_clone(&many, 200 * GIB, 512, spec, &used_or_len, None));
+    assert!(msg.contains("at most 4 partitions") && msg.contains("6 would be copied"), "{msg}");
+    // ... unless only the system partitions go
+    let sys = LayoutSpec { target_table: Some(TableKind::Mbr), ..LayoutSpec::new(Sizing::Fit, true) };
+    assert_eq!(plan_disk_clone(&many, 200 * GIB, 512, sys, &used_or_len, None).unwrap().map.len(), 3);
+}
+
+#[test]
+fn plan_disk_clone_mbr_source_to_gpt_target() {
+    let mut m = model_with_mbr(false);
+    m.disk_mut(4).unwrap().partitions[2].ptype = mbr(0x0B);
+    m.disk_mut(4).unwrap().partitions[3].ptype = mbr(0x83);
+    let src = m.disk(4).unwrap();
+    for sizing in [Sizing::Fit, Sizing::Proportional, Sizing::Exact] {
+        let spec = LayoutSpec { target_table: Some(TableKind::Gpt), ..LayoutSpec::new(sizing, false) };
+        let l = plan_disk_clone(src, 50 * GIB, 512, spec, &used_or_len, None).unwrap();
+        assert_eq!(l.table.kind, TableKind::Gpt, "{sizing:?}");
+        assert!(l.table.disk_guid.is_some());
+        // no container, the logicals are ordinary entries numbered in layout order
+        assert_eq!(l.map, vec![(1, 1), (5, 2), (6, 3)], "{sizing:?}");
+        let types: Vec<_> = l.table.entries.iter().map(|e| e.ptype).collect();
+        assert_eq!(
+            types,
+            vec![
+                PartitionType::Gpt(gpt_types::BASIC_DATA),
+                PartitionType::Gpt(gpt_types::BASIC_DATA),
+                PartitionType::Gpt(gpt_types::LINUX_FS)
+            ],
+            "{sizing:?}"
+        );
+        assert!(l.table.entries.iter().all(|e| !e.logical && e.guid.is_some()));
+        assert_layout_sane(&l.table);
+        if sizing == Sizing::Exact {
+            let starts: Vec<_> = l.table.entries.iter().map(|e| e.start).collect();
+            assert_eq!(starts, src.partitions.iter().filter(|p| p.number != 2).map(|p| p.start).collect::<Vec<_>>());
+        }
+    }
+    // the planner's view
+    let op = Operation::CloneDisk {
+        src_disk: 4,
+        dst_disk: 1,
+        sizing: Sizing::Fit,
+        mode: CloneMode::Sector,
+        boot_fix: BootFix::None,
+        target_table: Some(TableKind::Gpt),
+    };
+    let out = Planner::simulate(&m, &op).unwrap();
+    let d1 = out.disk(1).unwrap();
+    assert_eq!(d1.table, TableKind::Gpt);
+    assert_eq!(d1.partitions.iter().map(|p| p.number).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert!(d1.partitions.iter().all(|p| !p.logical));
+    // the same kind as the source is a no-op choice
+    let same = LayoutSpec { target_table: Some(TableKind::Mbr), ..LayoutSpec::new(Sizing::Fit, false) };
+    let a = plan_disk_clone(src, 50 * GIB, 512, same, &used_or_len, None).unwrap();
+    let b = plan_disk_clone(src, 50 * GIB, 512, LayoutSpec::new(Sizing::Fit, false), &used_or_len, None).unwrap();
+    assert_eq!(a.map, b.map);
+    assert_eq!(a.table.entries.len(), b.table.entries.len());
+    // a target kind that is no table at all
+    let none = LayoutSpec { target_table: Some(TableKind::None), ..LayoutSpec::new(Sizing::Fit, false) };
+    assert!(invalid_msg(plan_disk_clone(src, 50 * GIB, 512, none, &used_or_len, None)).contains("GPT or MBR"));
+}
+
+#[test]
+fn plan_disk_clone_keeps_source_ids_on_request() {
+    let mut m = model();
+    let keep = LayoutSpec { keep_ids: true, ..LayoutSpec::new(Sizing::Fit, false) };
+    // the model's disk ids are unknown: refused with a reason
+    let msg = invalid_msg(plan_disk_clone(m.disk(0).unwrap(), 200 * GIB, 512, keep, &used_or_len, None));
+    assert!(msg.contains("Cannot keep the ids of Disk 0") && msg.contains("GUID is unknown"), "{msg}");
+
+    let disk_guid = uuid::Uuid::new_v4();
+    m.disk_mut(0).unwrap().disk_id = disk_guid.to_string();
+    let src = m.disk(0).unwrap();
+    let l = plan_disk_clone(src, 200 * GIB, 512, keep, &used_or_len, None).unwrap();
+    assert_eq!(l.table.disk_guid, Some(disk_guid));
+    for &(sn, dn) in &l.map {
+        let sp = src.partitions.iter().find(|p| p.number == sn).unwrap();
+        let e = l.table.entries.iter().find(|e| e.number == dn).unwrap();
+        assert_eq!(e.guid, sp.guid, "partition {sn} keeps its GUID");
+    }
+    // without the flag every id is fresh
+    let fresh = plan_disk_clone(src, 200 * GIB, 512, LayoutSpec::new(Sizing::Fit, false), &used_or_len, None).unwrap();
+    assert_ne!(fresh.table.disk_guid, Some(disk_guid));
+    assert!(fresh.table.entries.iter().all(|e| !src.partitions.iter().any(|p| p.guid == e.guid)));
+    // a partition without a GUID cannot be kept
+    let mut no_guid = src.clone();
+    no_guid.partitions[2].guid = None;
+    let msg = invalid_msg(plan_disk_clone(&no_guid, 200 * GIB, 512, keep, &used_or_len, None));
+    assert!(msg.contains("partition 3 has no GUID"), "{msg}");
+    // not across table kinds
+    let conv = LayoutSpec { target_table: Some(TableKind::Mbr), ..keep };
+    let msg = invalid_msg(plan_disk_clone(src, 200 * GIB, 512, conv, &used_or_len, None));
+    assert!(msg.contains("same partition table kind"), "{msg}");
+
+    // MBR: the signature
+    let mut m4 = model_with_mbr(false);
+    m4.disk_mut(4).unwrap().disk_id = "DEADBEEF".into();
+    let l = plan_disk_clone(m4.disk(4).unwrap(), 50 * GIB, 512, keep, &used_or_len, None).unwrap();
+    assert_eq!(l.table.mbr_signature, 0xDEAD_BEEF);
+    m4.disk_mut(4).unwrap().disk_id = "00000000".into();
+    let msg = invalid_msg(plan_disk_clone(m4.disk(4).unwrap(), 50 * GIB, 512, keep, &used_or_len, None));
+    assert!(msg.contains("signature is unknown"), "{msg}");
+
+    // through the planner the copy carries the source's disk id
+    let op = Operation::MigrateOs {
+        src_disk: 0,
+        dst_disk: 2,
+        only_system_parts: false,
+        sizing: Sizing::Fit,
+        boot_fix: BootFix::None,
+        target_table: None,
+        keep_ids: true,
+    };
+    let out = Planner::simulate(&m, &op).unwrap();
+    assert_eq!(out.disk(2).unwrap().disk_id, disk_guid.to_string());
+    assert!(matches!(op.layout_spec(), Some(LayoutSpec { keep_ids: true, only_system: false, .. })));
+}
+
+#[test]
+fn clone_operations_without_the_new_fields_still_deserialize() {
+    let json = r#"{"MigrateOs":{"src_disk":0,"dst_disk":1,"only_system_parts":true,"sizing":"Fit","boot_fix":"Uefi"}}"#;
+    let op: Operation = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        op,
+        Operation::MigrateOs {
+            src_disk: 0,
+            dst_disk: 1,
+            only_system_parts: true,
+            sizing: Sizing::Fit,
+            boot_fix: BootFix::Uefi,
+            target_table: None,
+            keep_ids: false,
+        }
+    );
+    let json = r#"{"CloneDisk":{"src_disk":0,"dst_disk":1,"sizing":"Exact","mode":"Sector","boot_fix":"None"}}"#;
+    let op: Operation = serde_json::from_str(json).unwrap();
+    assert!(matches!(op, Operation::CloneDisk { target_table: None, .. }));
+    // and the new fields round-trip
+    let op = Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Fit,
+        mode: CloneMode::Smart,
+        boot_fix: BootFix::None,
+        target_table: Some(TableKind::Gpt),
+    };
+    let back: Operation = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+    assert_eq!(back, op);
 }

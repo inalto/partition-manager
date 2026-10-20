@@ -37,6 +37,18 @@ fn mbr_type_is_mapped(mbr: u8) -> bool {
     )
 }
 
+/// `t` expressed in the type system of a `to` table: an MBR type byte becomes its GPT type
+/// GUID ([`mbr_to_gpt`]'s mapping: FAT/NTFS and unknown bytes become basic data), a GPT GUID
+/// its MBR byte ([`gpt_to_mbr`]'s mapping: anything without one becomes 0x07). A type that
+/// already belongs to `to` (or any other `to`) is returned unchanged.
+pub fn convert_type(t: PartitionType, to: TableKind) -> PartitionType {
+    match (t, to) {
+        (PartitionType::Mbr(b), TableKind::Gpt) => PartitionType::Gpt(gpt_type_for(b)),
+        (PartitionType::Gpt(g), TableKind::Mbr) => PartitionType::Mbr(mbr_type_for(g)),
+        (t, _) => t,
+    }
+}
+
 fn mbr_type_for(gpt: Uuid) -> u8 {
     match gpt {
         g::EFI_SYSTEM => 0xEF,

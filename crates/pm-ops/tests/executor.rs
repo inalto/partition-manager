@@ -11,6 +11,7 @@ use pm_ops::{
     execute, BootFix, CloneMode, ExecOpts, ExecReport, Model, OpQueue, Operation, Sizing,
     WipeMethod,
 };
+use pm_parttable::convert_type;
 use pm_parttable::{read_table, write_table, Entry, Table};
 use pm_platform::{MockPlatform, MountPoint, OpenMode, Platform};
 use std::sync::Mutex;
@@ -328,6 +329,7 @@ fn execute_clone_disk_copies_used_clusters_only() {
         sizing: Sizing::Exact,
         mode: CloneMode::Smart,
         boot_fix: BootFix::None,
+        target_table: None,
     };
     let r = run(&p, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);
@@ -368,6 +370,7 @@ fn execute_clone_disk_copies_used_clusters_only() {
         sizing: Sizing::Exact,
         mode: CloneMode::Sector,
         boot_fix: BootFix::None,
+        target_table: None,
     };
     let r = run(&p, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);
@@ -376,6 +379,131 @@ fn execute_clone_disk_copies_used_clusters_only() {
     assert!(d[part.clone()] == s[part], "sector clone copies everything");
     assert_eq!(fs_files(&p, 1, start, len).len(), 2);
     assert_sessions_finished(&p);
+}
+
+#[test]
+fn execute_clone_disk_to_the_other_table_kind() {
+    // GPT → MBR: the copy is an MBR disk with the mapped type, the data is still readable.
+    let (p, start, len) = clone_fixture();
+    let op = Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Exact,
+        mode: CloneMode::Smart,
+        boot_fix: BootFix::None,
+        target_table: Some(TableKind::Mbr),
+    };
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_sessions_finished(&p);
+    let dt = table_of(&p, 1);
+    assert_eq!(dt.kind, TableKind::Mbr);
+    assert_ne!(dt.mbr_signature, 0);
+    assert_eq!(dt.entries.len(), 1);
+    assert_eq!((dt.entries[0].start, dt.entries[0].len), (start, len));
+    assert_eq!(dt.entries[0].ptype, PartitionType::Mbr(0x07));
+    assert_eq!(fs_files(&p, 1, start, len), fs_files(&p, 0, start, len));
+    // no GPT left behind the MBR
+    let b = p.disk_bytes(1);
+    assert!(&b[512..520] != b"EFI PART", "the primary GPT header area is cleared");
+
+    // MBR → GPT: an MBR source with a primary and a logical becomes a GPT with two entries.
+    let (ext_start, ext_len) = (start + len + MIB, 4 * MIB);
+    let log_start = ext_start + MIB;
+    let mut src = MemDevice::from_vec(vec![0x33; DISK_LEN as usize]);
+    let mut t = Table::empty(TableKind::Mbr, DISK_LEN, 512);
+    let mbr_entry = |number, start, len, b, logical| Entry {
+        number,
+        start,
+        len,
+        ptype: PartitionType::Mbr(b),
+        guid: None,
+        name: String::new(),
+        attrs: 0,
+        logical,
+    };
+    t.entries = vec![
+        mbr_entry(1, start, len, 0x0C, false),
+        mbr_entry(2, ext_start, ext_len, 0x0F, false),
+        mbr_entry(5, log_start, 2 * MIB, 0x83, true),
+    ];
+    write_table(&mut src, &t).unwrap();
+    format_fat(&mut src, start, len, "SRC");
+    fat_add_file(&mut src, start, b"HELLO   TXT", b"hello, gpt");
+    let p = MockPlatform::new();
+    p.add_disk(0, src, meta(0));
+    p.add_disk(1, MemDevice::from_vec(vec![0xAA; DISK_LEN as usize]), meta(1));
+    p.set_system_disk(ELSEWHERE);
+    let op = Operation::CloneDisk {
+        src_disk: 0,
+        dst_disk: 1,
+        sizing: Sizing::Fit,
+        mode: CloneMode::Sector,
+        boot_fix: BootFix::None,
+        target_table: Some(TableKind::Gpt),
+    };
+    let r = run(&p, &[op]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_sessions_finished(&p);
+    let dt = table_of(&p, 1);
+    assert_eq!(dt.kind, TableKind::Gpt);
+    assert_eq!(dt.entries.len(), 2, "{:?}", dt.entries);
+    assert_eq!(dt.entries[0].ptype, convert_type(PartitionType::Mbr(0x0C), TableKind::Gpt));
+    assert_eq!(dt.entries[1].ptype, PartitionType::Gpt(gpt_types::LINUX_FS));
+    assert!(dt.entries.iter().all(|e| !e.logical && e.guid.is_some()));
+    let (s, d) = (p.disk_bytes(0), p.disk_bytes(1));
+    let (ds, dl) = (dt.entries[0].start, dt.entries[0].len);
+    assert!(dl >= len, "Fit gives the leftover to the largest data partition");
+    assert_eq!(fs_files(&p, 1, ds, len), fs_files(&p, 0, start, len));
+    let (ls, ll) = (dt.entries[1].start, dt.entries[1].len);
+    assert_eq!(&d[ls as usize..(ls + ll) as usize], &s[log_start as usize..(log_start + 2 * MIB) as usize]);
+}
+
+#[test]
+fn execute_migrate_keeps_source_ids_on_request() {
+    let (efi, win) = ((MIB, 2 * MIB), (4 * MIB, 36 * MIB));
+    let mut src = gpt_dev(
+        DISK_LEN,
+        0,
+        Some(vec![
+            entry(1, efi.0, efi.1, gpt_types::EFI_SYSTEM, 0),
+            entry(2, win.0, win.1, gpt_types::BASIC_DATA, 0),
+        ]),
+    );
+    format_fat(&mut src, win.0, win.1, "WINDOWS");
+    let p = MockPlatform::new();
+    p.add_disk(0, src, meta(0));
+    p.add_disk(1, MemDevice::new(DISK_LEN), meta(1));
+    p.set_system_disk(0);
+    p.add_volume(volume("src-win", Some(FsKind::Fat32), &["C:\\"], win.1, win.1 / 2), 0, win.0, win.1);
+    let op = Operation::MigrateOs {
+        src_disk: 0,
+        dst_disk: 1,
+        only_system_parts: false,
+        sizing: Sizing::Exact,
+        boot_fix: BootFix::None,
+        target_table: None,
+        keep_ids: true,
+    };
+    let r = run(&p, &[op.clone()]);
+    assert_eq!(r.failed, None, "{:?}", r.log);
+    assert_sessions_finished(&p);
+    let (st, dt) = (table_of(&p, 0), table_of(&p, 1));
+    assert_eq!(dt.disk_guid, st.disk_guid, "the disk GUID is kept");
+    assert_eq!(
+        dt.entries.iter().map(|e| (e.start, e.guid)).collect::<Vec<_>>(),
+        st.entries.iter().map(|e| (e.start, e.guid)).collect::<Vec<_>>(),
+        "every partition GUID is kept"
+    );
+    assert!(
+        r.log.iter().any(|l| l.contains("warning: the copy keeps the disk and partition ids of Disk 0")),
+        "{:?}",
+        r.log
+    );
+    assert_eq!(fs_files(&p, 1, win.0, win.1), fs_files(&p, 0, win.0, win.1));
+    // the precheck lets it through, the identity check sees the same source afterwards
+    let m = Model::from_platform(&p).unwrap();
+    assert_eq!(m.disk(1).unwrap().disk_id, m.disk(0).unwrap().disk_id);
 }
 
 #[test]
@@ -409,6 +537,8 @@ fn execute_migrate_regenerates_disk_guid_and_calls_bcdboot() {
         only_system_parts: true,
         sizing: Sizing::Exact,
         boot_fix: BootFix::Uefi,
+        target_table: None,
+        keep_ids: false,
     };
     let r = run(&p, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);
@@ -456,6 +586,8 @@ fn execute_migrate_regenerates_disk_guid_and_calls_bcdboot() {
         only_system_parts: false,
         sizing: Sizing::Fit,
         boot_fix: BootFix::All,
+        target_table: None,
+        keep_ids: false,
     };
     let r = run(&p2, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);
@@ -868,6 +1000,7 @@ fn fit_clone() -> Operation {
         sizing: Sizing::Fit,
         mode: CloneMode::Smart,
         boot_fix: BootFix::None,
+        target_table: None,
     }
 }
 
@@ -993,6 +1126,7 @@ fn execute_mbr_over_gpt_clears_stale_gpt() {
         sizing: Sizing::Exact,
         mode: CloneMode::Sector,
         boot_fix: BootFix::None,
+        target_table: None,
     };
     let r = run(&p, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);

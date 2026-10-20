@@ -7,9 +7,36 @@ use pm_core::{
     format_size, DiskInfo, Error, PartitionInfo, PartitionType, Result, TableKind,
 };
 use crate::operation::Sizing;
+use crate::operation::table_name;
 use crate::planner::err_text;
-use pm_parttable::{Entry, Table};
+use pm_parttable::{convert_type, Entry, Table};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// What a disk clone / OS migration lays out on the target besides the partition sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutSpec {
+    pub sizing: Sizing,
+    /// Copy only the EFI, MSR, Windows recovery and Windows partitions.
+    pub only_system: bool,
+    /// Partition table kind of the target; `None` keeps the source's kind.
+    pub target_table: Option<TableKind>,
+    /// Keep the source's disk id and partition GUIDs instead of generating fresh ones
+    /// (same table kind only).
+    pub keep_ids: bool,
+}
+
+impl LayoutSpec {
+    /// Sizing and partition choice only: the source's table kind, fresh ids.
+    pub fn new(sizing: Sizing, only_system: bool) -> LayoutSpec {
+        LayoutSpec { sizing, only_system, target_table: None, keep_ids: false }
+    }
+
+    /// The table kind the target gets for a source of kind `src`.
+    pub fn table_kind(&self, src: TableKind) -> TableKind {
+        self.target_table.unwrap_or(src)
+    }
+}
 
 /// The partition table to write on the target disk, and which source partition is copied
 /// into which target partition.
@@ -74,25 +101,48 @@ fn too_small(src: &DiskInfo, item: &Item, room: u64) -> Error {
 ///
 /// Partitions are laid out in source order from the first usable byte, 1 MiB aligned (MBR
 /// logicals inside a rebuilt extended container with 1 MiB EBR slots), numbered 1..n (MBR
-/// logicals from 5), with fresh disk/partition GUIDs (GPT) or signature (MBR). `used_of`
-/// returns the bytes that must be copied for a partition; `probe` is passed on to
-/// [`windows_partition`] (e.g. [`crate::Model::windows_probe`]).
+/// logicals from 5), with fresh disk/partition GUIDs (GPT) or signature (MBR) unless
+/// `spec.keep_ids` asks for the source's. `used_of` returns the bytes that must be copied
+/// for a partition; `probe` is passed on to [`windows_partition`] (e.g.
+/// [`crate::Model::windows_probe`]).
+///
+/// With a `spec.target_table` of the other kind the partitions are converted on the way:
+/// types are mapped ([`pm_parttable::convert_type`]), MBR logicals become ordinary GPT
+/// entries, a GPT Microsoft reserved partition is dropped on an MBR target (which has no
+/// such thing) and the Windows partition becomes the active one there, an MBR target holds
+/// at most four partitions and nothing past 2 TiB, and the ids cannot be kept.
 pub fn plan_disk_clone(
     src: &DiskInfo,
     dst_len: u64,
     dst_sector: u32,
-    sizing: Sizing,
-    only_system: bool,
+    spec: LayoutSpec,
     used_of: &dyn Fn(&PartitionInfo) -> u64,
     probe: Option<&dyn Fn(u32, &PartitionInfo) -> bool>,
 ) -> Result<TargetLayout> {
-    let kind = src.table;
-    if !matches!(kind, TableKind::Mbr | TableKind::Gpt) {
+    let src_kind = src.table;
+    if !matches!(src_kind, TableKind::Mbr | TableKind::Gpt) {
         return Err(Error::Invalid(format!(
             "Disk {} has no partition table to clone",
             src.index
         )));
     }
+    let kind = spec.table_kind(src_kind);
+    if !matches!(kind, TableKind::Mbr | TableKind::Gpt) {
+        return Err(Error::Invalid(format!(
+            "The target of a copy of Disk {} must use GPT or MBR",
+            src.index
+        )));
+    }
+    if spec.keep_ids && kind != src_kind {
+        return Err(Error::Invalid(format!(
+            "The ids of Disk {} can only be kept on a target with the same partition table \
+             kind ({}); a {} copy gets new ids",
+            src.index,
+            table_name(src_kind),
+            table_name(kind)
+        )));
+    }
+    let sizing = spec.sizing;
     let ss = if dst_sector == 0 { 512 } else { dst_sector };
     let mut table = Table::empty(kind, dst_len, ss);
     let (lo, hi) = usable(&table);
@@ -108,13 +158,23 @@ pub fn plan_disk_clone(
     let mut parts: Vec<&PartitionInfo> = src
         .partitions
         .iter()
-        .filter(|p| p.len > 0 && !is_container(kind, p))
-        .filter(|p| !only_system || is_fixed_system(p) || Some(p.number) == windows)
+        .filter(|p| p.len > 0 && !is_container(src_kind, p))
+        .filter(|p| !spec.only_system || is_fixed_system(p) || Some(p.number) == windows)
+        // an MBR has no Microsoft reserved partition; Windows recreates it when needed
+        .filter(|p| !(kind == TableKind::Mbr && p.ptype.is_some_and(|t| t.is_msr())))
         .collect();
     parts.sort_by_key(|p| p.start);
     if parts.is_empty() {
         return Err(Error::Invalid(format!(
             "Disk {} has no partitions to clone",
+            src.index
+        )));
+    }
+    if kind == TableKind::Mbr && src_kind == TableKind::Gpt && parts.len() > 4 {
+        return Err(Error::Invalid(format!(
+            "An MBR target holds at most 4 partitions; {} would be copied from Disk {} (copy \
+             to GPT, or copy only the system partitions)",
+            parts.len(),
             src.index
         )));
     }
@@ -128,15 +188,15 @@ pub fn plan_disk_clone(
         })
         .collect();
 
-    let src_container = src.partitions.iter().find(|p| is_container(kind, p));
+    let src_container = src.partitions.iter().find(|p| is_container(src_kind, p));
     let entries = if sizing == Sizing::Exact {
-        place_exact(src, &items, src_container, lo, hi).map_err(|e| with_exact_hint(sizing, e))?
+        place_exact(src, kind, &items, src_container, lo, hi).map_err(|e| with_exact_hint(sizing, e))?
     } else {
         let sizes = match sizing {
-            Sizing::Fit => fit_sizes(src, &items, hi - lo)?,
-            _ => proportional_sizes(src, &items, hi - lo)?,
+            Sizing::Fit => fit_sizes(src, kind, &items, hi - lo)?,
+            _ => proportional_sizes(src, kind, &items, hi - lo)?,
         };
-        place_sequential(src, &items, &sizes, src_container, lo, hi)?
+        place_sequential(src, kind, &items, &sizes, src_container, lo, hi)?
     };
 
     // Number in layout order: GPT 1..n; MBR primaries (and the container) 1.., logicals 5...
@@ -153,10 +213,18 @@ pub fn plan_disk_clone(
         }
         if let Some(n) = source {
             map.push((n, e.number));
+            // a BIOS boots the active partition: on a GPT → MBR copy that is Windows
+            if kind == TableKind::Mbr && src_kind == TableKind::Gpt && Some(n) == windows {
+                e.attrs |= 1;
+            }
         }
         table.entries.push(e);
     }
-    table.regenerate_ids();
+    if spec.keep_ids {
+        keep_source_ids(src, &mut table, &map)?;
+    } else {
+        table.regenerate_ids();
+    }
     table.validate().map_err(|e| {
         let e = Error::Invalid(format!(
             "Cannot clone Disk {} to the target: {}",
@@ -166,6 +234,45 @@ pub fn plan_disk_clone(
         with_exact_hint(sizing, e)
     })?;
     Ok(TargetLayout { table, map })
+}
+
+/// Give `table` (of the source's kind) the source's disk id and, on GPT, the GUID of the
+/// source partition behind every mapped entry. `Error::Invalid` when the source's ids are
+/// not known (a disk id that is not a GUID / signature, a partition without a GUID).
+fn keep_source_ids(src: &DiskInfo, table: &mut Table, map: &[(u32, u32)]) -> Result<()> {
+    let id = src.disk_id.trim();
+    match table.kind {
+        TableKind::Mbr => {
+            table.mbr_signature = u32::from_str_radix(id, 16).ok().filter(|s| *s != 0).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "Cannot keep the ids of Disk {}: its MBR signature is unknown ({id:?})",
+                    src.index
+                ))
+            })?;
+        }
+        TableKind::Gpt => {
+            table.disk_guid = Some(Uuid::parse_str(id).map_err(|_| {
+                Error::Invalid(format!(
+                    "Cannot keep the ids of Disk {}: its disk GUID is unknown ({id:?})",
+                    src.index
+                ))
+            })?);
+            for &(sn, dn) in map {
+                let guid = src.partitions.iter().find(|p| p.number == sn).and_then(|p| p.guid);
+                let Some(guid) = guid else {
+                    return Err(Error::Invalid(format!(
+                        "Cannot keep the ids of Disk {}: partition {sn} has no GUID",
+                        src.index
+                    )));
+                };
+                if let Some(e) = table.entries.iter_mut().find(|e| e.number == dn) {
+                    e.guid = Some(guid);
+                }
+            }
+        }
+        TableKind::None | TableKind::Unknown => {}
+    }
+    Ok(())
 }
 
 /// For `Exact`, point the user at the sizings that re-lay the partitions out.
@@ -180,12 +287,13 @@ fn with_exact_hint(sizing: Sizing, e: Error) -> Error {
     ))
 }
 
+/// The entry of a `kind` table for `p` (whose type is mapped when the kinds differ).
 fn entry_for(kind: TableKind, p: &PartitionInfo, start: u64, len: u64) -> Entry {
     Entry {
         number: 0,
         start,
         len,
-        ptype: p.ptype.unwrap_or_else(|| default_ptype(kind)),
+        ptype: p.ptype.map_or_else(|| default_ptype(kind), |t| convert_type(t, kind)),
         guid: None,
         name: if kind == TableKind::Gpt { p.name.clone() } else { String::new() },
         attrs: attrs_of(kind, p),
@@ -211,12 +319,12 @@ type Slots = Vec<(Entry, Option<u32>)>;
 
 fn place_exact(
     src: &DiskInfo,
+    kind: TableKind,
     items: &[Item],
     container: Option<&PartitionInfo>,
     lo: u64,
     hi: u64,
 ) -> Result<Slots> {
-    let kind = src.table;
     let mut out: Slots = Vec::new();
     let mut container_done = false;
     for it in items {
@@ -253,11 +361,12 @@ fn place_exact(
     Ok(out)
 }
 
-/// Bytes taken by fixed-size partitions (rounded up to the 1 MiB layout grid) and MBR EBR slots.
-fn fixed_overhead(items: &[Item]) -> u64 {
+/// Bytes taken by fixed-size partitions (rounded up to the 1 MiB layout grid) and, on an MBR
+/// target, the EBR slots of logicals.
+fn fixed_overhead(kind: TableKind, items: &[Item]) -> u64 {
     items.iter().fold(0u64, |acc, it| {
         let own = if it.data { 0 } else { align_up(it.p.len, MIB) };
-        let ebr = if it.p.logical { MIB } else { 0 };
+        let ebr = if kind == TableKind::Mbr && it.p.logical { MIB } else { 0 };
         acc.saturating_add(own).saturating_add(ebr)
     })
 }
@@ -277,8 +386,8 @@ fn fixed_too_small(src: &DiskInfo, avail: u64, fixed: u64) -> Error {
     ))
 }
 
-fn fit_sizes(src: &DiskInfo, items: &[Item], avail: u64) -> Result<Vec<u64>> {
-    let fixed = fixed_overhead(items);
+fn fit_sizes(src: &DiskInfo, kind: TableKind, items: &[Item], avail: u64) -> Result<Vec<u64>> {
+    let fixed = fixed_overhead(kind, items);
     let mins: u64 = items.iter().filter(|i| i.data).fold(0u64, |a, i| a.saturating_add(i.min));
     let needed = fixed.saturating_add(mins);
     if needed > avail {
@@ -318,8 +427,8 @@ fn fit_sizes(src: &DiskInfo, items: &[Item], avail: u64) -> Result<Vec<u64>> {
     Ok(sizes)
 }
 
-fn proportional_sizes(src: &DiskInfo, items: &[Item], avail: u64) -> Result<Vec<u64>> {
-    let fixed = fixed_overhead(items);
+fn proportional_sizes(src: &DiskInfo, kind: TableKind, items: &[Item], avail: u64) -> Result<Vec<u64>> {
+    let fixed = fixed_overhead(kind, items);
     let data_avail = avail
         .checked_sub(fixed)
         .ok_or_else(|| fixed_too_small(src, avail, fixed))?;
@@ -373,13 +482,13 @@ fn proportional_sizes(src: &DiskInfo, items: &[Item], avail: u64) -> Result<Vec<
 
 fn place_sequential(
     src: &DiskInfo,
+    kind: TableKind,
     items: &[Item],
     sizes: &[u64],
     container: Option<&PartitionInfo>,
     lo: u64,
     hi: u64,
 ) -> Result<Slots> {
-    let kind = src.table;
     let mut out: Slots = Vec::new();
     let mut cursor = lo;
     // Index in `out` of the open extended container.

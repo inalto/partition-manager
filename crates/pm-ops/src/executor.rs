@@ -17,7 +17,8 @@
 
 use crate::identity::{adopt_generated_ids, layout_matches};
 use crate::model::Model;
-use crate::operation::Operation;
+use crate::operation::{Operation, Sizing};
+use crate::sizing::LayoutSpec;
 use crate::planner::Planner;
 use crate::steps::{self, message, Ctx};
 use pm_core::{CancelToken, Error, ProgressReport, ProgressSink, Result};
@@ -396,17 +397,18 @@ fn run_op(ctx: &mut Ctx, op: &Operation) -> Result<()> {
         ClonePartition { src_disk, src_number, dst_disk, mode, .. } => {
             clone::clone_partition(ctx, (*src_disk, *src_number), *dst_disk, *mode)
         }
-        CloneDisk { src_disk, dst_disk, sizing, mode, boot_fix } => {
-            migrate::clone_disk(ctx, *src_disk, *dst_disk, *sizing, *mode, false, *boot_fix)
+        CloneDisk { src_disk, dst_disk, mode, boot_fix, .. } => {
+            let spec = op.layout_spec().unwrap_or(LayoutSpec::new(Sizing::Fit, false));
+            migrate::clone_disk(ctx, *src_disk, *dst_disk, spec, *mode, *boot_fix)
         }
-        MigrateOs { src_disk, dst_disk, only_system_parts, sizing, boot_fix } => {
+        MigrateOs { src_disk, dst_disk, boot_fix, .. } => {
+            let spec = op.layout_spec().unwrap_or(LayoutSpec::new(Sizing::Fit, true));
             migrate::clone_disk(
                 ctx,
                 *src_disk,
                 *dst_disk,
-                *sizing,
+                spec,
                 crate::operation::CloneMode::Smart,
-                *only_system_parts,
                 *boot_fix,
             )
         }

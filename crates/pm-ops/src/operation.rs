@@ -153,6 +153,9 @@ pub enum Operation {
         sizing: Sizing,
         mode: CloneMode,
         boot_fix: BootFix,
+        /// Partition table kind of the copy; `None` keeps the source's.
+        #[serde(default)]
+        target_table: Option<TableKind>,
     },
     MigrateOs {
         src_disk: u32,
@@ -160,6 +163,15 @@ pub enum Operation {
         only_system_parts: bool,
         sizing: Sizing,
         boot_fix: BootFix,
+        /// Partition table kind of the copy; `None` keeps the source's.
+        #[serde(default)]
+        target_table: Option<TableKind>,
+        /// Keep the source's disk and partition ids on the copy (so Windows' `MountedDevices`
+        /// maps the copied system volume to the same letter) instead of generating fresh
+        /// ones. The source must be detached before the copy boots: Windows takes a disk with
+        /// a duplicate id offline.
+        #[serde(default)]
+        keep_ids: bool,
     },
     ImageDisk {
         disk: u32,
@@ -204,6 +216,11 @@ fn mode_name(m: CloneMode) -> &'static str {
         CloneMode::Smart => "smart",
         CloneMode::Sector => "sector by sector",
     }
+}
+
+/// `", to GPT"` / `", to MBR"` for an explicit target table kind, `""` for "keep the source's".
+fn target_table_suffix(k: Option<TableKind>) -> String {
+    k.map_or(String::new(), |k| format!(", to {}", table_name(k)))
 }
 
 fn sizing_name(s: Sizing) -> &'static str {
@@ -284,15 +301,18 @@ impl Operation {
                 format_size(*dst_len),
                 mode_name(*mode)
             ),
-            CloneDisk { src_disk, dst_disk, sizing, mode, .. } => format!(
-                "Clone Disk {src_disk} → Disk {dst_disk} ({}, {})",
+            CloneDisk { src_disk, dst_disk, sizing, mode, target_table, .. } => format!(
+                "Clone Disk {src_disk} → Disk {dst_disk} ({}, {}{})",
                 sizing_name(*sizing),
-                mode_name(*mode)
+                mode_name(*mode),
+                target_table_suffix(*target_table)
             ),
-            MigrateOs { src_disk, dst_disk, only_system_parts, sizing, .. } => format!(
-                "Migrate OS from Disk {src_disk} → Disk {dst_disk} ({}, {})",
+            MigrateOs { src_disk, dst_disk, only_system_parts, sizing, target_table, keep_ids, .. } => format!(
+                "Migrate OS from Disk {src_disk} → Disk {dst_disk} ({}, {}{}{})",
                 if *only_system_parts { "system partitions only" } else { "all partitions" },
-                sizing_name(*sizing)
+                sizing_name(*sizing),
+                target_table_suffix(*target_table),
+                if *keep_ids { ", keep ids" } else { "" }
             ),
             ImageDisk { disk, path, format, mode } => format!(
                 "Image Disk {disk} → {} ({}, {})",
@@ -314,6 +334,28 @@ impl Operation {
                 path.display(),
                 format_size(*s)
             ),
+        }
+    }
+
+    /// The target layout a disk clone / OS migration asks for; `None` for other operations.
+    pub fn layout_spec(&self) -> Option<crate::sizing::LayoutSpec> {
+        use crate::sizing::LayoutSpec;
+        match self {
+            Operation::CloneDisk { sizing, target_table, .. } => Some(LayoutSpec {
+                sizing: *sizing,
+                only_system: false,
+                target_table: *target_table,
+                keep_ids: false,
+            }),
+            Operation::MigrateOs { only_system_parts, sizing, target_table, keep_ids, .. } => {
+                Some(LayoutSpec {
+                    sizing: *sizing,
+                    only_system: *only_system_parts,
+                    target_table: *target_table,
+                    keep_ids: *keep_ids,
+                })
+            }
+            _ => None,
         }
     }
 

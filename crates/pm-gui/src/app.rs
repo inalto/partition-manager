@@ -891,6 +891,7 @@ mod tests {
                 sizing: pm_ops::Sizing::Fit,
                 mode: pm_ops::CloneMode::Smart,
                 boot_fix: pm_ops::BootFix::None,
+                target_table: None,
             },
         ];
         assert_eq!(system_disk_ops(&base, &ops), [1, 2, 3]);

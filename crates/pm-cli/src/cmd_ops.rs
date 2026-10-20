@@ -345,6 +345,10 @@ pub enum OpCommand {
         mode: CopyModeArgs,
         #[arg(long, value_enum, default_value = "none")]
         boot_fix: BootFixArg,
+        /// Partition table of the copy (default: the same kind as the source); converting
+        /// maps the partition types, an MBR copy holds at most 4 partitions within 2 TiB
+        #[arg(long, value_enum)]
+        table: Option<TableArg>,
         #[command(flatten)]
         run: OpRun,
     },
@@ -361,6 +365,15 @@ pub enum OpCommand {
         sizing: SizingArg,
         #[arg(long, value_enum, default_value = "none")]
         boot_fix: BootFixArg,
+        /// Partition table of the copy (default: the same kind as the source); converting
+        /// maps the partition types, an MBR copy holds at most 4 partitions within 2 TiB
+        #[arg(long, value_enum)]
+        table: Option<TableArg>,
+        /// Keep the source's disk and partition ids on the copy, so Windows keeps its drive
+        /// letters (MountedDevices); detach the source before the copy boots, Windows takes
+        /// a disk with a duplicate id offline. Needs the same table kind as the source
+        #[arg(long)]
+        keep_ids: bool,
         #[command(flatten)]
         run: OpRun,
     },
@@ -487,23 +500,26 @@ impl OpCommand {
             ConvertTable { disk, to, run } => (Operation::ConvertTable { disk, to: to.kind() }, run),
             Align { disk, run } => (Operation::AlignPartitions { disk }, run),
             RebuildMbr { disk, run } => (Operation::RebuildMbr { disk }, run),
-            CloneDisk { src, dst, sizing, mode, boot_fix, run } => (
+            CloneDisk { src, dst, sizing, mode, boot_fix, table, run } => (
                 Operation::CloneDisk {
                     src_disk: src,
                     dst_disk: dst,
                     sizing: sizing.sizing(),
                     mode: clone_mode(mode),
                     boot_fix: boot_fix.fix(),
+                    target_table: table.map(TableArg::kind),
                 },
                 run,
             ),
-            MigrateOs { src, dst, all_partitions, sizing, boot_fix, run } => (
+            MigrateOs { src, dst, all_partitions, sizing, boot_fix, table, keep_ids, run } => (
                 Operation::MigrateOs {
                     src_disk: src,
                     dst_disk: dst,
                     only_system_parts: !all_partitions,
                     sizing: sizing.sizing(),
                     boot_fix: boot_fix.fix(),
+                    target_table: table.map(TableArg::kind),
+                    keep_ids,
                 },
                 run,
             ),

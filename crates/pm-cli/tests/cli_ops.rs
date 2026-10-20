@@ -263,6 +263,54 @@ fn cli_clone_disk_dry_run_writes_nothing_and_self_clone_is_refused() {
 }
 
 #[test]
+fn cli_clone_disk_and_migrate_os_take_a_target_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.img");
+    let dst = dir.path().join("dst.img");
+    gpt_fat32_image(&src, 64 * MIB, MIB, 40 * MIB);
+    blank(&dst, 128 * MIB);
+
+    let out = pm(&["--disk-file", s(&src), "--disk-file", s(&dst), "clone-disk", "0", "1", "--table", "mbr", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Clone Disk 0 → Disk 1 (fit, smart, to MBR)"), "{}", stdout(&out));
+    let t = table_of(&dst);
+    assert_eq!(t.kind, TableKind::Mbr);
+    assert_eq!(t.entries.len(), 1);
+    assert_eq!(t.entries[0].ptype, PartitionType::Mbr(0x07));
+    let cat = pm(&["cat", &format!("{}:1", s(&dst)), "/DATA.BIN"]);
+    assert_eq!(cat.stdout, data_bin());
+
+    // and back to GPT from the MBR copy
+    let back = dir.path().join("back.img");
+    blank(&back, 256 * MIB);
+    let out = pm(&["--disk-file", s(&dst), "--disk-file", s(&back), "clone-disk", "0", "1", "--table", "gpt", "--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let t = table_of(&back);
+    assert_eq!(t.kind, TableKind::Gpt);
+    assert_eq!(t.entries[0].ptype, PartitionType::Gpt(gpt_types::BASIC_DATA));
+
+    // migrate-os: --keep-ids is only possible without a conversion, and shows in the summary
+    let out = pm(&[
+        "--disk-file", s(&src), "--disk-file", s(&dst),
+        "migrate-os", "0", "1", "--all-partitions", "--table", "mbr", "--keep-ids", "--dry-run",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("same partition table kind"), "{}", stderr(&out));
+    let out = pm(&[
+        "--disk-file", s(&src), "--disk-file", s(&dst),
+        "migrate-os", "0", "1", "--all-partitions", "--keep-ids", "--dry-run",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("would: Migrate OS from Disk 0 → Disk 1 (all partitions, fit, keep ids)"),
+        "{}",
+        stdout(&out)
+    );
+    let out = pm(&["--disk-file", s(&src), "--disk-file", s(&dst), "clone-disk", "0", "1", "--table", "xyz", "--dry-run"]);
+    assert!(!out.status.success() && stderr(&out).contains("[possible values: gpt, mbr]"), "{}", stderr(&out));
+}
+
+#[test]
 fn cli_image_and_restore_ops_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src.img");

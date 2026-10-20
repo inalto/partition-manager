@@ -3,25 +3,25 @@
 use super::clone::{copy_partition, grow_after_clone, prepare_copies};
 use super::table_ops::zero_table_areas;
 use super::{locate_volume, with_session, Ctx};
-use crate::operation::{BootFix, CloneMode, Sizing};
-use crate::sizing::{plan_disk_clone, TargetLayout};
+use crate::operation::{BootFix, CloneMode};
+use crate::sizing::{plan_disk_clone, LayoutSpec, TargetLayout};
 use pm_core::{DiskInfo, Error, PartitionInfo, Result, TableKind, VolumeId};
 use pm_parttable::{Entry, Table};
 use pm_platform::{ExternalTool, MountPoint, OpenMode};
 
 /// Clone `src_disk` onto `dst_disk` with the layout [`plan_disk_clone`] computes (the same
 /// call the planner made). Inside one session on the destination: an empty table of the
-/// source's kind is committed first (a half-done clone is never mistaken for a good disk),
+/// target's kind is committed first (a half-done clone is never mistaken for a good disk),
 /// every mapped partition is copied, then the final table — with fresh disk and partition
-/// ids, since Windows takes a disk with a duplicate signature offline — is committed. The
-/// boot fix runs afterwards; its failure is logged and does not fail the operation.
+/// ids, since Windows takes a disk with a duplicate signature offline, unless `spec.keep_ids`
+/// keeps the source's (logged as a warning) — is committed. The boot fix runs afterwards;
+/// its failure is logged and does not fail the operation.
 pub(crate) fn clone_disk(
     ctx: &mut Ctx,
     src_disk: u32,
     dst_disk: u32,
-    sizing: Sizing,
+    spec: LayoutSpec,
     mode: CloneMode,
-    only_system: bool,
     boot_fix: BootFix,
 ) -> Result<()> {
     let src = ctx.live_disk(src_disk)?;
@@ -31,10 +31,17 @@ pub(crate) fn clone_disk(
         CloneMode::Sector => p.len,
     };
     let probe = ctx.live.windows_probe();
-    let layout =
-        plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of, Some(&probe))?;
+    let layout = plan_disk_clone(src, dst.size, dst.sector_size, spec, &used_of, Some(&probe))?;
     let mut table = layout.table.clone();
-    table.regenerate_ids();
+    if spec.keep_ids {
+        ctx.note(&format!(
+            "warning: the copy keeps the disk and partition ids of Disk {src_disk}; detach one \
+             of the two disks before Windows starts, which takes a disk with a duplicate id \
+             offline"
+        ));
+    } else {
+        table.regenerate_ids();
+    }
     // keep the source's MBR boot code (BIOS boot) rather than the planner's zeroed one
     if let Ok(src_table) = ctx
         .platform

@@ -2,9 +2,9 @@
 
 use super::{added_partition, entry_of, fs_facts, locate_volume, with_session, Ctx, Session, StepSink};
 use crate::model::Model;
-use crate::operation::{CloneMode, Operation, Sizing};
+use crate::operation::{CloneMode, Operation};
 use crate::planner::Planner;
-use crate::sizing::plan_disk_clone;
+use crate::sizing::{plan_disk_clone, LayoutSpec};
 use pm_core::{format_size, Error, FsKind, PartitionInfo, Result, SliceDevice, VolumeId};
 use pm_fs::UsedMap;
 use pm_platform::OpenMode;
@@ -53,14 +53,14 @@ pub(crate) fn smaller_targets<'m>(
             let len = after.disk(*dst_disk).and_then(|d| added_partition(before, d)).map(|p| p.len);
             pick(*src_disk, len.map(|l| vec![(*src_number, l)]).unwrap_or_default())
         }
-        Operation::CloneDisk { src_disk, dst_disk, sizing, mode, .. } => {
-            disk_pairs(model, (*src_disk, *dst_disk), *sizing, *mode, false)
-                .map_or_else(Vec::new, |v| pick(*src_disk, v))
-        }
-        Operation::MigrateOs { src_disk, dst_disk, only_system_parts, sizing, .. } => {
-            disk_pairs(model, (*src_disk, *dst_disk), *sizing, CloneMode::Smart, *only_system_parts)
-                .map_or_else(Vec::new, |v| pick(*src_disk, v))
-        }
+        Operation::CloneDisk { src_disk, dst_disk, mode, .. } => op
+            .layout_spec()
+            .and_then(|spec| disk_pairs(model, (*src_disk, *dst_disk), spec, *mode))
+            .map_or_else(Vec::new, |v| pick(*src_disk, v)),
+        Operation::MigrateOs { src_disk, dst_disk, .. } => op
+            .layout_spec()
+            .and_then(|spec| disk_pairs(model, (*src_disk, *dst_disk), spec, CloneMode::Smart))
+            .map_or_else(Vec::new, |v| pick(*src_disk, v)),
         _ => Vec::new(),
     }
 }
@@ -69,9 +69,8 @@ pub(crate) fn smaller_targets<'m>(
 fn disk_pairs(
     model: &Model,
     (src_disk, dst_disk): (u32, u32),
-    sizing: Sizing,
+    spec: LayoutSpec,
     mode: CloneMode,
-    only_system: bool,
 ) -> Option<Vec<(u32, u64)>> {
     let (src, dst) = (model.disk(src_disk)?, model.disk(dst_disk)?);
     let used_of = |p: &PartitionInfo| match mode {
@@ -80,8 +79,7 @@ fn disk_pairs(
     };
     let probe = model.windows_probe();
     let layout =
-        plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of, Some(&probe))
-            .ok()?;
+        plan_disk_clone(src, dst.size, dst.sector_size, spec, &used_of, Some(&probe)).ok()?;
     Some(
         layout
             .map

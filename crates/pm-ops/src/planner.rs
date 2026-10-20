@@ -4,7 +4,7 @@ use crate::model::{
     carry_volume_fields, default_ptype, is_container, mount_letter, table_from_disk, Model,
 };
 use crate::operation::{table_name, CloneMode, Operation, Sizing};
-use crate::sizing::plan_disk_clone;
+use crate::sizing::{plan_disk_clone, LayoutSpec};
 use pm_core::units::{align_down, align_up, MIB};
 use pm_core::{
     format_size, gpt_types, DiskInfo, Error, FsKind, PartitionInfo, PartitionType, Result,
@@ -393,12 +393,13 @@ impl Planner {
                 *dst_len,
                 *mode,
             )?,
-            Operation::CloneDisk { src_disk, dst_disk, sizing, mode, .. } => {
-                clone_disk(&mut m, *src_disk, *dst_disk, *sizing, *mode, false)?
+            Operation::CloneDisk { src_disk, dst_disk, mode, .. } => {
+                let spec = op.layout_spec().unwrap_or(LayoutSpec::new(Sizing::Fit, false));
+                clone_disk(&mut m, *src_disk, *dst_disk, spec, *mode)?
             }
-            Operation::MigrateOs { src_disk, dst_disk, only_system_parts, sizing, .. } => {
-                let only = *only_system_parts;
-                clone_disk(&mut m, *src_disk, *dst_disk, *sizing, CloneMode::Smart, only)?
+            Operation::MigrateOs { src_disk, dst_disk, .. } => {
+                let spec = op.layout_spec().unwrap_or(LayoutSpec::new(Sizing::Fit, true));
+                clone_disk(&mut m, *src_disk, *dst_disk, spec, CloneMode::Smart)?
             }
             Operation::ImageDisk { disk, path, .. } => {
                 disk_ref(&m, *disk)?;
@@ -875,9 +876,8 @@ fn clone_disk(
     m: &mut Model,
     src_disk: u32,
     dst_disk: u32,
-    sizing: Sizing,
+    spec: LayoutSpec,
     mode: CloneMode,
-    only_system: bool,
 ) -> Result<()> {
     if src_disk == dst_disk {
         return invalid(format!("Cannot clone Disk {src_disk} onto itself"));
@@ -890,7 +890,7 @@ fn clone_disk(
         CloneMode::Sector => p.len,
     };
     let probe = m.windows_probe();
-    let planned = plan_disk_clone(src, dst.size, dst.sector_size, sizing, only_system, &used_of, Some(&probe));
+    let planned = plan_disk_clone(src, dst.size, dst.sector_size, spec, &used_of, Some(&probe));
     drop(probe);
     let layout = planned
         .map_err(|e| {
