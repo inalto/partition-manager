@@ -29,6 +29,9 @@ struct State {
     fail_prefixes: Vec<String>,
     system_disk: Option<u32>,
     smart: BTreeMap<u32, SmartData>,
+    /// Volumes with a handle from [`Platform::open_volume`] still open (shared with the
+    /// handles, which remove themselves when dropped).
+    open_volumes: Arc<Mutex<Vec<VolumeId>>>,
 }
 
 /// Test double for [`Platform`].
@@ -37,7 +40,10 @@ struct State {
 /// * `enumerate_disks` re-reads the partition table on every call;
 /// * `format`, `shrink_volume`, `extend_volume`, `set_offline`, `rescan` and `run_tool` are
 ///   recorded in [`MockPlatform::calls`] and succeed unless [`MockPlatform::fail_calls_matching`]
-///   was used.
+///   was used;
+/// * like Windows (`FSCTL_LOCK_VOLUME` fails while another handle on the volume is open),
+///   `begin_write` fails with `Error::Busy` while a device from `open_volume` on a volume of
+///   that disk is still alive ([`MockPlatform::open_volume_handles`]).
 #[derive(Default)]
 pub struct MockPlatform {
     state: Mutex<State>,
@@ -97,6 +103,14 @@ impl MockPlatform {
     /// Current `(volume, mount point)` pairs added through [`Platform::mount`].
     pub fn mounted(&self) -> Vec<(VolumeId, MountPoint)> {
         self.st().mounted.clone()
+    }
+
+    /// Volumes whose device from [`Platform::open_volume`] has not been dropped yet, in
+    /// opening order.
+    pub fn open_volume_handles(&self) -> Vec<VolumeId> {
+        let open = self.st().open_volumes.clone();
+        let log = open.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        log
     }
 
     /// Disk indexes passed to [`Platform::begin_write`], in order.
@@ -199,6 +213,44 @@ impl BlockDevice for MockDiskDevice {
     }
 }
 
+/// A device from [`Platform::open_volume`]: registered in the platform's open-handle list
+/// until it is dropped.
+struct MockVolumeHandle {
+    inner: Box<dyn BlockDevice>,
+    id: VolumeId,
+    open: Arc<Mutex<Vec<VolumeId>>>,
+}
+
+impl Drop for MockVolumeHandle {
+    fn drop(&mut self) {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = open.iter().position(|v| *v == self.id) {
+            open.remove(pos);
+        }
+    }
+}
+
+impl BlockDevice for MockVolumeHandle {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+}
+
 struct MockSession {
     disk: u32,
     dev: MockDiskDevice,
@@ -282,16 +334,26 @@ impl Platform for MockPlatform {
         };
         let dev = self.disk(disk)?;
         let slice = SliceDevice::new(MockDiskDevice(dev), start, len)?;
-        Ok(match mode {
+        let inner: Box<dyn BlockDevice> = match mode {
             OpenMode::ReadOnly => Box::new(ReadOnly(slice)),
             OpenMode::ReadWrite => Box::new(slice),
-        })
+        };
+        let open = self.st().open_volumes.clone();
+        open.lock().unwrap_or_else(|e| e.into_inner()).push(id.clone());
+        Ok(Box::new(MockVolumeHandle { inner, id: id.clone(), open }))
     }
 
     fn begin_write(&self, disk: u32) -> Result<Box<dyn WriteSession>> {
         let dev = self.disk(disk)?;
         let finished = {
             let mut st = self.st();
+            let open = st.open_volumes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(v) = open.iter().find(|id| st.volumes.iter().any(|v| &v.id == *id && v.disk == Some(disk))) {
+                return Err(Error::Busy(format!(
+                    "volume {} on Disk {disk} has another open handle; it cannot be locked",
+                    v.0
+                )));
+            }
             st.sessions.push(disk);
             st.finished.clone()
         };

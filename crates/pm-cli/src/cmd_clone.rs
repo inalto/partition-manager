@@ -3,7 +3,7 @@
 
 use crate::cli::{CliError, CopyMode};
 use crate::cli::arg_error;
-use crate::device_arg::{open_spec, parse_device, resolve_volume, volume_extent, DeviceArg, Opened};
+use crate::device_arg::{open_spec, parse_device, resolve_volume, volume_extent, DeviceArg, Identity, Opened};
 use crate::progress::StderrProgress;
 use pm_core::{format_size, BlockDevice, CancelToken, Error};
 use pm_fs::UsedMap;
@@ -210,15 +210,30 @@ fn unplaced_volume(spec: &str) -> CliError {
     ))
 }
 
+/// What a copy keeps of the read-only probe of its destination once the probe handle is
+/// closed: its identity, the range it covered and its place on a physical disk.
+pub struct Probed {
+    identity: Identity,
+    range: (u64, u64),
+    disk_extent: Option<(u32, u64, u64)>,
+}
+
+impl Probed {
+    pub fn of(probe: &Opened) -> Probed {
+        Probed { identity: probe.identity.clone(), range: probe.range, disk_extent: probe.disk_extent }
+    }
+}
+
 /// Open the destination `spec` for writing. Disks, their partitions and volumes are written
 /// through a write session on the disk (volumes locked and dismounted, the disk offline for
 /// the copy); a volume whose place on a physical disk is unknown (spanned, virtual) is
-/// refused. Image files are opened directly. `probe` is the same destination opened
-/// read-only; its identity is kept.
+/// refused. Image files are opened directly. `probe` is what the same destination, opened
+/// read-only, looked like; its identity is kept. The caller has dropped that read-only
+/// handle: a volume cannot be locked while another handle on it is open.
 fn open_destination(
     platform: &dyn Platform,
     spec: &str,
-    probe: &Opened,
+    probe: &Probed,
 ) -> Result<(Opened, Option<SessionGuard>), CliError> {
     let arg = parse_device(spec).map_err(arg_error)?;
     let (disk, part, volume) = match &arg {
@@ -305,7 +320,9 @@ pub fn probe_checked(
 }
 
 /// The writing half of [`open_checked`]: open the destination `probe` describes for writing
-/// and check it again (the device could have changed between the two opens).
+/// and check it again (the device could have changed between the two opens). The probe's
+/// handle is closed first — the write session locks the destination's volumes, which fails
+/// while any other handle on them (such as the probe of a volume destination) is open.
 pub fn open_writable(
     platform: &dyn Platform,
     src: &Opened,
@@ -313,8 +330,9 @@ pub fn open_writable(
     dst_spec: &str,
     dst_offset: u64,
 ) -> Result<(Opened, Option<SessionGuard>), CliError> {
-    let (dst, guard) = open_destination(platform, dst_spec, &probe)?;
+    let probed = Probed::of(&probe);
     drop(probe);
+    let (dst, guard) = open_destination(platform, dst_spec, &probed)?;
     check_copy(platform, src, &dst, dst_offset)?;
     Ok((dst, guard))
 }
@@ -524,12 +542,20 @@ mod tests {
         assert_refused(clone(&p, "D:", "disk:1:2"), "same device");
         assert_refused(clone(&p, "D:", "disk:1:1"), "same device");
         assert_refused(clone(&p, "disk:1:1", "D:"), "same device");
+        assert_refused(clone(&p, "F:", "disk:1"), "same device");
         assert_eq!(p.disk_bytes(1), before, "refused copies write nothing");
 
         // adjacent but not overlapping ranges of the same disk, and other disks, are fine
-        clone(&p, "F:", "disk:1:2").unwrap();
+        clone(&p, "disk:1:1", "disk:1:2").unwrap();
         let after = p.disk_bytes(1);
-        assert_eq!(after[3 * MIB as usize..(3 * MIB + 512 * 1024) as usize], before[5 * MIB as usize..(5 * MIB + 512 * 1024) as usize]);
+        assert_eq!(after[3 * MIB as usize..5 * MIB as usize], before[MIB as usize..3 * MIB as usize]);
+        // a volume source keeps its handle open for the copy: its own disk cannot be the
+        // destination (the session could not lock the volume), another disk can
+        match clone(&p, "F:", "disk:1:2") {
+            Err(CliError::Runtime(Error::Busy(_))) => {}
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        assert_eq!(p.disk_bytes(1), after);
         clone(&p, "D:", "disk:2").unwrap();
         assert_eq!(p.disk_bytes(2)[..2 * MIB as usize], after[2 * MIB as usize..4 * MIB as usize]);
     }
@@ -565,6 +591,36 @@ mod tests {
         assert!(run(&p, "disk:1", "disk:2", CopyMode::Sector, 0, &cancel, &mut Vec::new()).is_err());
         assert_eq!(p.write_sessions_log(), vec![2, 2, 2, 2]);
         assert_eq!(p.finished_sessions_log(), vec![2, 2, 2, 2]);
+    }
+
+    /// The destination is probed read-only before it is opened for writing. For a volume,
+    /// that probe handle must be gone before the write session locks the volume (Windows
+    /// refuses `FSCTL_LOCK_VOLUME` while another handle is open; the mock does the same).
+    #[test]
+    fn volume_destination_probe_is_closed_before_the_write_session() {
+        let p = MockPlatform::new();
+        p.add_disk(1, disk(2, &[(1, MIB, 2 * MIB)]), Default::default());
+        p.add_disk(2, disk(3, &[(1, MIB, 2 * MIB)]), Default::default());
+        p.set_system_disk(9);
+        p.add_volume(volume('G', "gggg"), 2, MIB, 2 * MIB);
+        let src = p.disk_bytes(1);
+
+        clone(&p, "disk:1:1", "G:").unwrap();
+        assert_eq!(p.write_sessions_log(), vec![2]);
+        assert_eq!(p.finished_sessions_log(), vec![2]);
+        assert!(p.open_volume_handles().is_empty(), "no handle left open");
+        assert_eq!(p.disk_bytes(2)[MIB as usize..3 * MIB as usize], src[MIB as usize..3 * MIB as usize]);
+
+        // the two-phase helpers (used by rescue) behave the same
+        let (s, probe) = probe_checked(&p, "disk:1:1", "G:", 0).unwrap();
+        assert_eq!(p.open_volume_handles().len(), 1, "the probe holds the volume");
+        let (dst, guard) = open_writable(&p, &s, probe, "G:", 0).unwrap();
+        assert!(p.open_volume_handles().is_empty(), "the probe is dropped before begin_write");
+        assert_eq!(dst.disk_extent, Some((2, MIB, 3 * MIB)));
+        assert_eq!(p.write_sessions_log(), vec![2, 2]);
+        drop(dst);
+        finish(guard).unwrap();
+        assert_eq!(p.finished_sessions_log(), vec![2, 2]);
     }
 
     #[test]

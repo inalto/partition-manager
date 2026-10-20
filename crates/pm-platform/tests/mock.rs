@@ -210,6 +210,32 @@ fn mock_open_disk_returns_device_with_len() {
 }
 
 #[test]
+fn mock_open_volume_handle_blocks_a_write_session_on_its_disk() {
+    let p = MockPlatform::new();
+    p.add_disk(3, MemDevice::new(4 * MIB), DiskInfo::default());
+    p.add_disk(4, MemDevice::new(4 * MIB), DiskInfo::default());
+    let id = VolumeId("v3".into());
+    p.add_volume(VolumeInfo { id: id.clone(), ..Default::default() }, 3, MIB, MIB);
+
+    let handle = p.open_volume(&id, OpenMode::ReadOnly).unwrap();
+    assert_eq!(p.open_volume_handles(), vec![id.clone()]);
+    // like FSCTL_LOCK_VOLUME: the volume cannot be locked while another handle is open
+    match p.begin_write(3) {
+        Err(pm_core::Error::Busy(m)) => assert!(m.contains("v3"), "{m}"),
+        Err(e) => panic!("expected Busy, got {e}"),
+        Ok(_) => panic!("the open volume handle must block the session"),
+    }
+    assert!(p.write_sessions_log().is_empty());
+    // other disks are not affected
+    p.begin_write(4).unwrap().finish().unwrap();
+
+    drop(handle);
+    assert!(p.open_volume_handles().is_empty());
+    p.begin_write(3).unwrap().finish().unwrap();
+    assert_eq!(p.write_sessions_log(), vec![4, 3]);
+}
+
+#[test]
 fn mock_smart_returns_configured_data_per_disk() {
     use pm_platform::SmartData;
     let p = MockPlatform::new();
