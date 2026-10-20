@@ -1,5 +1,6 @@
 //! Rescue Copy wizard (GNU ddrescue): Source (disk or partition) → Destination (disk,
-//! partition or image file, large enough) → Mapfile (default `<dest>.map`; an existing one is
+//! partition or image file, large enough; a missing image file is created in the chosen
+//! format) → Mapfile (default `<dest>.map`; an existing one is
 //! resumed) → Options (sector / cluster / skip size, retries, reverse, no-trim, no-scrape,
 //! filesystem-aware skipping of unused space) → Rescue (explicit start, a live ddrescue-style
 //! status panel, Cancel, final statistics and a bar of the mapfile).
@@ -16,7 +17,7 @@ use crate::tools::{
 };
 use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense};
 use pm_core::{align_up, format_size, parse_size, BlockDevice, CancelToken, Error, ProgressSink};
-use pm_image::{rescue, BlockStatus, MapFile, RescueOpts, RescueStats};
+use pm_image::{rescue, BlockStatus, ImageFormat, MapFile, RescueOpts, RescueStats};
 use pm_ops::{Model, Operation};
 use pm_platform::{OpenMode, Platform};
 use std::path::{Path, PathBuf};
@@ -48,7 +49,8 @@ pub fn format_rescue_status(stats: &RescueStats, elapsed: Duration, phase: &str)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dest {
     Device(Device),
-    /// An image file (created as a raw image of the source's size when missing).
+    /// An image file (created as an image of the source's size, in the wizard's
+    /// `dest_format`, when missing).
     File(String),
 }
 
@@ -241,7 +243,8 @@ struct Plan {
 enum DestPlan {
     /// Write to this disk / partition (confirmed at `range`) through a write session.
     Device { dev: Device, range: (u64, u64) },
-    File(PathBuf),
+    /// Write into this image file; a missing one is created in this format.
+    File(PathBuf, ImageFormat),
 }
 
 /// Why `path` cannot be the mapfile, if it cannot: it must be an absolute path (a relative one
@@ -283,7 +286,7 @@ fn recheck(fresh: &Model, plan: &Plan) -> Result<(u64, u64), String> {
             }
             Dest::Device(*dev)
         }
-        DestPlan::File(f) => Dest::File(f.display().to_string()),
+        DestPlan::File(f, _) => Dest::File(f.display().to_string()),
     };
     if let Dest::File(f) = &dest {
         if let Some(e) = rescue_path_problem(fresh, plan.src, &dest, f, "destination file") {
@@ -332,11 +335,11 @@ fn run_rescue(
             let rescan = p.rescan(disk);
             r.and_then(|s| fin.and(rescan).map(|_| s))
         }
-        DestPlan::File(path) => {
+        DestPlan::File(path, format) => {
             let mut out = if path.exists() {
                 pm_image::open(path, false)?
             } else {
-                let opts = pm_image::CreateOpts { format: pm_image::ImageFormat::Raw, capacity: align_up(len.max(512), 512), sparse: true };
+                let opts = pm_image::CreateOpts { format: *format, capacity: align_up(len.max(512), 512), sparse: true };
                 pm_image::create(path, &opts)?
             };
             let r = rescue(&mut src, &mut *out, 0, &plan.opts, progress, cancel);
@@ -352,6 +355,8 @@ pub struct RescueWizard {
     pub src: Option<Device>,
     pub dest: Dest,
     pub mapfile: String,
+    /// Format of a destination image file that does not exist yet.
+    pub dest_format: ImageFormat,
     /// The mapfile path follows the destination until the user edits it.
     mapfile_edited: bool,
     /// The destination the default mapfile was computed for.
@@ -381,6 +386,7 @@ impl RescueWizard {
             src,
             dest: Dest::File(String::new()),
             mapfile: String::new(),
+            dest_format: ImageFormat::Raw,
             mapfile_edited: false,
             mapfile_for: None,
             resume: None,
@@ -398,6 +404,14 @@ impl RescueWizard {
             outcome: None,
             error: None,
             wrote_disk: false,
+        }
+    }
+
+    /// Choose the format of a new destination image; the file name's extension follows it.
+    pub fn set_dest_format(&mut self, fmt: ImageFormat) {
+        self.dest_format = fmt;
+        if let Dest::File(f) = &mut self.dest {
+            *f = super::image_create::fix_extension(f, fmt);
         }
     }
 
@@ -476,7 +490,7 @@ impl RescueWizard {
                     return;
                 }
             },
-            Dest::File(f) => DestPlan::File(PathBuf::from(f.trim())),
+            Dest::File(f) => DestPlan::File(PathBuf::from(f.trim()), self.dest_format),
         };
         self.wrote_disk = matches!(dest, DestPlan::Device { .. });
         let plan = Plan {
@@ -536,10 +550,23 @@ impl RescueWizard {
         if to_file != matches!(self.dest, Dest::File(_)) {
             self.dest = if to_file { Dest::File(String::new()) } else { Dest::Device(Device::Disk(u32::MAX)) };
         }
+        let mut new_format = None;
         match &mut self.dest {
             Dest::File(f) => {
                 ui.add(egui::TextEdit::singleline(f).desired_width(420.0).hint_text("D:\\Rescue\\disk1.img"));
-                ui.weak("A missing file is created as a raw image of the source's size; an existing image is written into.");
+                ui.horizontal(|ui| {
+                    ui.label("Format of a new image:");
+                    let mut fmt = self.dest_format;
+                    egui::ComboBox::from_id_salt("rescue_dst_fmt").selected_text(fmt.display()).show_ui(ui, |ui| {
+                        for x in super::image_create::FORMATS {
+                            ui.selectable_value(&mut fmt, x, x.display());
+                        }
+                    });
+                    if fmt != self.dest_format {
+                        new_format = Some(fmt);
+                    }
+                });
+                ui.weak("A missing file is created as an image of the source's size in this format; an existing image is written into (its format is detected).");
             }
             Dest::Device(d) => {
                 let devices: Vec<Device> = Device::all(env.live).into_iter().filter(|x| Some(*x) != self.src).collect();
@@ -550,6 +577,9 @@ impl RescueWizard {
                     danger(ui, format!("Everything on {} will be overwritten.", c.describe(env.live)));
                 }
             }
+        }
+        if let Some(fmt) = new_format {
+            self.set_dest_format(fmt);
         }
         // the default follows the destination (computed when it changes, not every frame)
         if !self.mapfile_edited && self.mapfile_for.as_ref() != Some(&self.dest) {
@@ -670,7 +700,8 @@ impl RescueWizard {
         let src = self.src.map_or("-".into(), |s| s.describe(env.live));
         let dst = match &self.dest {
             Dest::Device(d) => d.describe(env.live),
-            Dest::File(f) => f.trim().to_string(),
+            Dest::File(f) if Path::new(f.trim()).exists() => f.trim().to_string(),
+            Dest::File(f) => format!("{} (new {} image)", f.trim(), self.dest_format.display()),
         };
         egui::Grid::new("rescue_summary").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
             for (k, v) in [("Source", src), ("Destination", dst.clone()), ("Mapfile", self.mapfile.trim().to_string())] {
@@ -994,6 +1025,43 @@ mod tests {
         let mut buf = [0u8; 4096];
         copy.read_at(MIB, &mut buf).unwrap();
         assert_eq!(buf, [0xAB; 4096]);
+    }
+
+    #[test]
+    fn rescue_creates_a_new_destination_image_in_the_chosen_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.img");
+        let mut dev = pm_image::create(&src_path, &pm_image::CreateOpts { format: ImageFormat::Raw, capacity: 4 * MIB, sparse: false }).unwrap();
+        dev.write_at(2 * MIB, &[0xCD; 4096]).unwrap();
+        dev.flush().unwrap();
+        drop(dev);
+        let p: Arc<dyn Platform> = Arc::new(pm_platform::FilePlatform::new(vec![src_path]).unwrap());
+        let live = Model::from_platform(&*p).unwrap();
+        let env = ToolEnv { platform: &p, live: &live, pending: &[] };
+        let mut w = RescueWizard::new(Some(Device::Disk(live.disks[0].index)));
+        w.dest = Dest::File(dir.path().join("out.img").display().to_string());
+        // the extension follows the chosen format
+        w.set_dest_format(ImageFormat::Qcow2);
+        let out = dir.path().join("out.qcow2");
+        assert_eq!(w.dest, Dest::File(out.display().to_string()));
+        w.mapfile = default_mapfile(&w.dest);
+        assert!(w.dest_problem(&env).is_none());
+        w.start(&env);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let o = loop {
+            if let Some(r) = w.task.as_mut().unwrap().poll() {
+                break r.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(o.stats.unwrap().rescued, 4 * MIB);
+        assert_eq!(pm_image::identify(&out).unwrap(), ImageFormat::Qcow2);
+        let mut copy = pm_image::open(&out, true).unwrap();
+        assert_eq!(copy.len(), 4 * MIB);
+        let mut buf = [0u8; 4096];
+        copy.read_at(2 * MIB, &mut buf).unwrap();
+        assert_eq!(buf, [0xCD; 4096]);
     }
 
     #[test]

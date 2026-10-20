@@ -94,7 +94,8 @@ fn image_in_rescue_mode_pads_bad_sectors_and_writes_mapfile() {
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("disk.vhd");
 
-    let r = run(&p, &image_disk(&img, ImageFormat::VhdDynamic, Some(RescueSettings::default())));
+    let op = image_disk(&img, ImageFormat::VhdDynamic, Some(RescueSettings::default()));
+    let r = run(&p, &op);
     assert_eq!(r.failed, None, "{:#?}", r.log);
     assert!(img.exists() && !with_suffix(&img, ".partial").exists(), "partial renamed");
 
@@ -116,6 +117,14 @@ fn image_in_rescue_mode_pads_bad_sectors_and_writes_mapfile() {
     assert_eq!((st.bad_bytes, st.bad_areas), (1024, 2));
     assert_eq!(st.mapfile.as_deref(), Some(map_path.as_path()));
     assert!(p.write_sessions_log().is_empty(), "imaging never writes a disk");
+
+    // the same export again: the kept mapfile of the finished image is not "resumed" into a
+    // new, empty image; the export starts over and produces the same image
+    let r = run(&p, &op);
+    assert_eq!(r.failed, None, "{:#?}", r.log);
+    assert!(r.log.iter().any(|l| l.contains("starts over")), "{:#?}", r.log);
+    assert!(image_bytes(&img) == expected);
+    assert_eq!(mapfile(&map_path).ranges(BlockStatus::Bad), vec![(bad[0], 512), (bad[1], 512)]);
 }
 
 #[test]

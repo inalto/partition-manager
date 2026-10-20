@@ -40,6 +40,34 @@ pub(crate) fn wizard_scroll_height(body: f32) -> f32 {
     (body - 60.0).max(120.0)
 }
 
+/// One line per image written by the run, from [`pm_ops::ExecReport::rescue_stats`]:
+/// `Image N: rescued X, errsize Y, errors E[, mapfile P]` (errors: the unrescued areas, as
+/// in the log), and whether it is a warning (unreadable areas, left as zeros in the image).
+pub fn rescue_lines(stats: &[pm_image::RescueStats]) -> Vec<(String, bool)> {
+    use pm_core::format_size;
+    stats
+        .iter()
+        .enumerate()
+        .map(|(i, st)| {
+            let mut line = format!(
+                "Image {}: rescued {}, errsize {}, errors {}",
+                i + 1,
+                format_size(st.rescued),
+                format_size(st.bad_bytes),
+                st.bad_areas
+            );
+            if let Some(m) = &st.mapfile {
+                line.push_str(&format!(", mapfile {}", m.display()));
+            }
+            let warn = st.bad_areas > 0;
+            if warn {
+                line.push_str(" (unreadable areas are zeros in the image; run the operation again to retry them)");
+            }
+            (line, warn)
+        })
+        .collect()
+}
+
 /// Draw `dlg`; returns `false` when it should close.
 pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<Cmd>) -> bool {
     match dlg {
@@ -61,6 +89,13 @@ pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<C
                 }
                 if let Some(n) = note {
                     ui.colored_label(DANGER, n);
+                }
+                for (line, warn) in rescue_lines(&report.rescue_stats) {
+                    if warn {
+                        ui.colored_label(crate::tools::WARN, format!("{} {line}", icons::WARNING));
+                    } else {
+                        ui.label(line);
+                    }
                 }
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
@@ -89,4 +124,35 @@ fn message(ctx: &egui::Context, title: &str, msg: &str, _out: &mut Vec<Cmd>) -> 
         }
     });
     keep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pm_image::RescueStats;
+    use std::path::PathBuf;
+
+    #[test]
+    fn report_rescue_lines_show_stats_mapfile_and_warn_on_errors() {
+        let clean = RescueStats { rescued: 4 << 20, ..Default::default() };
+        let damaged = RescueStats {
+            rescued: (4 << 20) - 1024,
+            bad_bytes: 1024,
+            bad_areas: 2,
+            read_errors: 7,
+            mapfile: Some(PathBuf::from(r"D:\img\disk.vhd.map")),
+            ..Default::default()
+        };
+        let lines = rescue_lines(&[clean, damaged]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], ("Image 1: rescued 4.00 MB, errsize 0 B, errors 0".to_string(), false));
+        let (text, warn) = &lines[1];
+        assert!(warn, "errors > 0 is shown as a warning");
+        assert!(
+            text.starts_with(r"Image 2: rescued 4.00 MB, errsize 1.00 KB, errors 2, mapfile D:\img\disk.vhd.map"),
+            "{text}"
+        );
+        assert!(text.contains("zeros in the image"), "{text}");
+        assert!(rescue_lines(&[]).is_empty());
+    }
 }

@@ -329,6 +329,11 @@ pub fn export_rescue_image(
         } else {
             if mapfile.exists() {
                 // nothing to resume into: what the mapfile calls finished is not in a new image
+                notes.push(format!(
+                    "no unfinished image {}: the mapfile {} starts over",
+                    partial.partial.display(),
+                    mapfile.display()
+                ));
                 MapFile::new(len).save(&mapfile)?;
             }
             pm_image::create(&partial.partial, &CreateOpts { format, capacity, sparse: true })?
