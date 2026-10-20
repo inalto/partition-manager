@@ -21,7 +21,9 @@ can be practised risk-free on image files with `--disk-file`.
 - **Clone.** Copy a partition, volume, disk or image file. Smart mode copies only the blocks
   the file system marks used (NTFS, FAT, exFAT, ext); sector mode copies everything.
 - **Migrate the OS.** Copy the Windows system partitions to another disk with fit or
-  proportional sizing and an optional boot fix (`bcdboot` / `bootsect`).
+  proportional sizing, as GPT or MBR (an MBR disk can be migrated to a GPT one on the way,
+  and the other way round), optionally keeping the source's disk and partition ids, and with
+  an optional boot fix (`bcdboot` / `bootsect`).
 - **Image and restore.** Save a disk or partition as raw, VHD (fixed or dynamic), VMDK
   (flat or sparse) or qcow2, convert between those formats, restore an image onto a disk.
   VHDX images can be opened read-only.
@@ -157,6 +159,8 @@ pm format 2 1 --fs fat32 --label USB --yes
 pm resize 2 1 --start 1M --len 200G --yes
 pm clone-disk 0 2 --sizing fit --boot-fix uefi --yes
 pm migrate-os 0 2 --boot-fix uefi --yes
+pm migrate-os 0 2 --table gpt --boot-fix uefi --yes   # an MBR system disk onto a GPT target
+pm migrate-os 0 2 --keep-ids --yes       # same ids as the source: detach the source before the first boot
 pm image-disk 1 D:\backup\disk1.vhd --yes       # the operation form of `image` (also image-partition, restore-image)
 pm create 2 --start 1M --len 10G --emit-json > op.json   # build an operations file
 pm apply ops.json --dry-run              # validate; add --yes to run
@@ -253,6 +257,8 @@ backup of the machine. In short:
   limitations).
 - Migrate OS copies a live C: without VSS: close applications, expect chkdsk on the first
   boot, and test the copy with the source detached.
+- A migrated copy gets new disk and partition ids unless you ask to keep them (see
+  "Drive letters of a migrated copy" under Known limitations).
 - Smart copies leave old data in unused areas of the destination (wipe it first if that
   matters); a move cannot be cancelled once copying starts (use a UPS or battery); any open
   handle on a target volume blocks the session (nothing is written).
@@ -288,6 +294,16 @@ backup of the machine. In short:
   create or format the partition.
 - **ext2/3/4** are read-only (browse, extract, smart clone). **APFS, btrfs, XFS, HFS+, LUKS**
   and others are detected and cloned sector by sector, nothing more.
+- **Drive letters of a migrated copy.** Windows remembers which volume is `C:` by disk and
+  partition id (`HKLM\SYSTEM\MountedDevices`). A copy made by Migrate OS or Copy Disk gets
+  new ids, so the first boot from it may map `C:` to the old disk (if it is still attached)
+  or assign the copied system volume another letter; Windows usually repairs the boot
+  volume's letter itself, but this has not been verified live. Two ways around it: boot the
+  copy with the source detached, or tick *Keep the disk and partition ids of the source* in
+  the Migrate OS wizard (`pm migrate-os --keep-ids`), which makes the copy identical to the
+  source for `MountedDevices` — then the source **must** be detached before the first boot,
+  because Windows takes a disk with a duplicate id offline. Keeping the ids needs the same
+  partition table kind as the source.
 - **No VSS snapshot** is taken for live system volumes. Imaging or cloning a mounted, in-use
   volume can capture an inconsistent file system; image the system disk from another OS or a
   disk that is not in use.

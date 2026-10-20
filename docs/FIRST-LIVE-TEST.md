@@ -72,6 +72,8 @@ In the steps below `N` is the disk number of the test disk.
   first boot of the copy, and test the copy with the source detached.
 - **The migrated copy gets new disk and partition ids (I6).** Windows may assign a different
   letter to the copied system volume through `MountedDevices`; verify the copy boots to C:.
+  Try it both ways: with new ids, and with *Keep the disk and partition ids of the source*
+  (`--keep-ids`), which requires the source to be detached before the copy's first boot.
 - **Smart copies leave old data in unused areas** of the destination. Wipe the destination
   first if that matters.
 - **A move cannot be cancelled once copying starts.** Use a UPS or a charged battery.
