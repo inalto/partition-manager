@@ -28,7 +28,8 @@ can be practised risk-free on image files with `--disk-file`.
   (flat or sparse) or qcow2, convert between those formats, restore an image onto a disk.
   VHDX images can be opened read-only.
 - **Rescue.** A ddrescue-style copier (copy, trim, scrape, retry) with a resumable mapfile in
-  GNU ddrescue's format, for failing drives.
+  GNU ddrescue's format, for failing drives; it can also export a failing disk or partition
+  straight into a VM image (raw, VHD, VMDK, qcow2), with unreadable blocks left as zeros.
 - **Recover.** Find lost partitions, list and restore deleted files from NTFS and FAT, carve
   files out of raw data by signature (images, documents, archives, audio, video, executables,
   databases), and save or reopen scan sessions.
@@ -150,7 +151,13 @@ pm image disk:1 D:\backup\disk1.vhd      # format from the extension, or --forma
 pm image disk:1:2 D:\backup\c.qcow2 --smart
 pm restore D:\backup\disk1.vhd disk:2    # image onto a disk (--dst-offset 1M to place it)
 pm convert disk1.vhd disk1.qcow2         # image to image
-pm rescue disk:3 D:\rescue\copy.img D:\rescue\copy.map -r 2 -K 64K   # copy.img must exist and be big enough
+pm rescue disk:3 D:\rescue\copy.img D:\rescue\copy.map -r 2 -K 64K   # onto an existing copy.img (big enough), or a new one
+
+# Rescue a failing disk into a VM image: unreadable blocks are retried, then left as zeros;
+# the ddrescue mapfile records them, and running the same command again resumes
+pm image disk:3 D:\vm\old-pc.vhd --rescue -r 2           # mapfile D:\vm\old-pc.vhd.map (or --mapfile)
+pm image-disk 3 D:\vm\old-pc.qcow2 --rescue --yes        # the operation form (also image-partition)
+pm rescue disk:3 D:\vm\old-pc.vmdk D:\vm\old-pc.map --format vmdk   # creates the image; refuses an existing one unless resuming
 
 # Operations (print and validate; write only with --yes; --dry-run validates only)
 pm init-disk 2 --gpt --yes

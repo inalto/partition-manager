@@ -1,13 +1,15 @@
 //! `pm rescue <src> <dst> <mapfile>`: ddrescue-style copy of a failing device with a resumable
 //! mapfile and a live status block on stderr.
 
-use crate::cli::{CliError, RescueArgs};
+use crate::cli::{arg_error, CliError, RescueArgs};
 use crate::cmd_clone::{existing_canonical, finish, fs_used_map, open_writable, probe_checked, SharedSource};
-use crate::device_arg::Identity;
-use pm_core::{format_size, BlockDevice, CancelToken, Error, ProgressReport, ProgressSink};
-use pm_image::{rescue, RescueOpts};
-use pm_platform::Platform;
+use crate::cmd_image::pick_format;
+use crate::device_arg::{open_spec, parse_device, DeviceArg, Identity};
+use pm_core::{align_up, format_size, BlockDevice, CancelToken, Error, ProgressReport, ProgressSink};
+use pm_image::{rescue, CreateOpts, ImageFormat, MapFile, RescueOpts};
+use pm_platform::{OpenMode, Platform};
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -225,7 +227,163 @@ fn opts_from_args(a: &RescueArgs, device_sector: u32) -> Result<RescueOpts, CliE
     Ok(opts)
 }
 
+/// A destination image `pm rescue` created for this run.
+struct Created {
+    path: PathBuf,
+    fmt: ImageFormat,
+    capacity: u64,
+}
+
+impl Created {
+    /// The files [`pm_image::create`] wrote for it (a flat VMDK's extent too).
+    fn files(path: &Path, fmt: ImageFormat) -> Vec<PathBuf> {
+        let mut v = vec![path.to_path_buf()];
+        if fmt == ImageFormat::VmdkFlat {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                v.push(path.with_file_name(format!("{stem}-flat.vmdk")));
+            }
+        }
+        v
+    }
+
+    /// Remove the new image again (best effort).
+    fn remove(&self) {
+        for f in Self::files(&self.path, self.fmt) {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
+fn usage(msg: String) -> CliError {
+    CliError::Usage(msg)
+}
+
+/// The image file a destination argument names when it is not an existing device: a bare
+/// path or `file:PATH` that does not exist yet.
+fn new_image_path(dst: &str) -> Option<PathBuf> {
+    let t = match dst.get(..5) {
+        Some(head) if head.eq_ignore_ascii_case("file:") => &dst[5..],
+        _ => dst,
+    };
+    let p = PathBuf::from(t);
+    (!t.is_empty() && !p.exists()).then_some(p)
+}
+
+/// Before the copy: create the destination image when `dst` is a path that does not exist
+/// yet, and with `--format` refuse an existing destination unless this is a resume (its
+/// mapfile exists and parses, and the image has that format). Device destinations and
+/// existing files without `--format` are left to the normal checks.
+fn prepare_destination(platform: &dyn Platform, a: &RescueArgs) -> Result<Option<Created>, CliError> {
+    match parse_device(&a.dst) {
+        Ok(DeviceArg::File(p)) => {
+            if let Some(fmt) = a.format {
+                check_resume(a, &p, fmt)?;
+            }
+            Ok(None)
+        }
+        Ok(_) if a.format.is_some() => Err(usage(format!(
+            "--format creates (or resumes) an image file; '{}' is a device, write to it without --format",
+            a.dst
+        ))),
+        Ok(_) => Ok(None),
+        Err(e) => match new_image_path(&a.dst) {
+            Some(p) => create_destination(platform, a, &p).map(Some),
+            None => Err(arg_error(e)),
+        },
+    }
+}
+
+/// An existing image destination with `--format`: only a resume may write to it.
+fn check_resume(a: &RescueArgs, dst: &Path, fmt: ImageFormat) -> Result<(), CliError> {
+    let refuse = |why: String| {
+        usage(format!(
+            "'{}' already exists; refusing to overwrite it ({why}). To resume an interrupted rescue \
+             into it pass its mapfile; to start over, delete it or choose another destination",
+            dst.display()
+        ))
+    };
+    if !a.mapfile.exists() {
+        return Err(refuse(format!("there is no mapfile at '{}'", a.mapfile.display())));
+    }
+    let text = std::fs::read_to_string(&a.mapfile).unwrap_or_default();
+    if MapFile::parse(&text).is_err() {
+        return Err(refuse(format!("'{}' is not a ddrescue mapfile", a.mapfile.display())));
+    }
+    let found = pm_image::identify(dst)?;
+    if found != fmt {
+        return Err(refuse(format!("it is a {} image, not {}", found.display(), fmt.display())));
+    }
+    Ok(())
+}
+
+/// Create the destination image `path`: the format from `--format` or the extension, the
+/// capacity the source's length rounded up to 512 bytes. Everything that can be refused is
+/// refused first, so a refused run creates nothing.
+fn create_destination(platform: &dyn Platform, a: &RescueArgs, path: &Path) -> Result<Created, CliError> {
+    let fmt = pick_format(a.format, path)?;
+    if a.dst_offset != 0 {
+        return Err(usage("--dst-offset cannot be used when the destination image is created".into()));
+    }
+    if a.mapfile.exists() {
+        return Err(usage(format!(
+            "the mapfile '{}' exists but the destination '{}' does not, so there is nothing to resume; \
+             delete or move the mapfile to start a new rescue",
+            a.mapfile.display(),
+            path.display()
+        )));
+    }
+    for (what, f) in [("destination", Some(path)), ("mapfile", Some(a.mapfile.as_path()))] {
+        if let Some(dir) = f.and_then(Path::parent).filter(|d| !d.as_os_str().is_empty()) {
+            if !dir.is_dir() {
+                return Err(usage(format!("the {what}'s directory '{}' does not exist", dir.display())));
+            }
+        }
+    }
+    let files = Created::files(path, fmt);
+    if let Some(f) = files.iter().skip(1).find(|f| f.exists()) {
+        return Err(usage(format!("'{}' already exists; refusing to overwrite it", f.display())));
+    }
+    if files.iter().any(|f| *f == a.mapfile) {
+        return Err(usage(format!(
+            "'{}' is the destination; it cannot also be the mapfile",
+            a.mapfile.display()
+        )));
+    }
+    let source = open_spec(platform, &a.src, OpenMode::ReadOnly)?;
+    let len = source.dev.len();
+    if len == 0 {
+        return Err(usage("the source is empty; nothing to rescue".into()));
+    }
+    // the flags are checked against the source before anything is created
+    opts_from_args(a, source.dev.sector_size())?;
+    drop(source);
+    let capacity = align_up(len, 512);
+    pm_image::create(path, &CreateOpts { format: fmt, capacity, sparse: true })?;
+    Ok(Created { path: path.to_path_buf(), fmt, capacity })
+}
+
 pub fn run(
+    platform: &dyn Platform,
+    a: &RescueArgs,
+    cancel: &CancelToken,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let created = prepare_destination(platform, a)?;
+    if let Some(c) = &created {
+        writeln!(out, "Created {} ({}, {})", c.path.display(), c.fmt.display(), format_size(c.capacity))
+            .map_err(|e| CliError::Runtime(Error::io(0, 0, e)))?;
+    }
+    let r = run_rescue(platform, a, cancel, out);
+    if let (Err(_), Some(c)) = (&r, &created) {
+        // nothing to resume without a mapfile: do not leave an empty image behind
+        if !a.mapfile.exists() {
+            c.remove();
+        }
+    }
+    r
+}
+
+fn run_rescue(
     platform: &dyn Platform,
     a: &RescueArgs,
     cancel: &CancelToken,
@@ -392,6 +550,7 @@ mod tests {
             no_trim: false,
             dst_offset: 0,
             used_map: false,
+            format: None,
             ansi: false,
         }
     }

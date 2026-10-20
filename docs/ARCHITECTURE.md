@@ -135,7 +135,11 @@ On top of these:
   source as destination, overlapping targets, the running system disk (failing closed when it
   cannot be determined), volumes whose place on a disk is unknown, and the extent file of a
   VMDK descriptor; they write disks, partitions and volumes through a `WriteSession` and
-  images to `FILE.partial` before renaming.
+  images to `FILE.partial` before renaming. In rescue mode (`pm image --rescue`, the
+  `ImageDisk` / `ImagePartition` operations with `RescueSettings`) a failed or cancelled
+  export keeps `FILE.partial` and its ddrescue mapfile so the same command resumes; `pm rescue`
+  writes a destination image it creates in place, and refuses an existing one with `--format`
+  unless its mapfile is there to resume.
 - **`--disk-file`** swaps the platform for `FilePlatform`, so practice runs touch only
   image files and need no elevation.
 - **Elevation.** Release builds of `partition-manager.exe` embed a `requireAdministrator`

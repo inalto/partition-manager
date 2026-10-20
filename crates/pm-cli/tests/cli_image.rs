@@ -701,3 +701,145 @@ fn cli_flat_vmdk_roundtrip_and_extent_protection() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert_eq!(read_all(&extent), before);
 }
+
+/// Every byte of image `path` (any format), as a VM would see it.
+fn image_bytes(path: &Path) -> Vec<u8> {
+    let mut img = pm_image::open(path, true).unwrap();
+    let mut buf = vec![0u8; img.len() as usize];
+    img.read_at(0, &mut buf).unwrap();
+    buf
+}
+
+fn with_suffix(p: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    s.into()
+}
+
+fn all_finished(map: &Path, len: u64) {
+    let m = MapFile::load(map).unwrap();
+    assert_eq!(m.len(), len);
+    assert!(m.blocks.iter().all(|b| b.2 == pm_image::BlockStatus::Finished), "{:?}", m.blocks);
+}
+
+#[test]
+fn cli_image_rescue_on_file_writes_mapfile_and_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.raw");
+    let img = dir.path().join("out.qcow2");
+    make_pattern_raw(&src, 4 * MIB);
+
+    // an image file as the source
+    let out = pm(&["image", s(&src), s(&img), "--rescue", "--format", "qcow2", "-r", "1", "-K", "128K", "-c", "64"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("errors 0") && text.contains("out.qcow2.map"), "{text}");
+    assert_eq!(identify(&img).unwrap(), ImageFormat::Qcow2);
+    assert_eq!(image_bytes(&img), read_all(&src));
+    all_finished(&with_suffix(&img, ".map"), 4 * MIB);
+    assert!(!with_suffix(&img, ".partial").exists());
+
+    // a disk as the source runs the image-disk operation, with an explicit mapfile
+    let vhd = dir.path().join("disk.vhd");
+    let map = dir.path().join("disk.map");
+    let out = pm(&["--disk-file", s(&src), "image", "disk:0", s(&vhd), "--rescue", "--mapfile", s(&map)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("rescue mode (0 retries)") && text.contains("Done: 1 of 1"), "{text}");
+    assert_eq!(identify(&vhd).unwrap(), ImageFormat::VhdDynamic);
+    assert_eq!(image_bytes(&vhd), read_all(&src));
+    all_finished(&map, 4 * MIB);
+    assert!(!with_suffix(&vhd, ".map").exists(), "the explicit mapfile is used");
+
+    // the rescue flags need --rescue
+    let other = dir.path().join("other.img");
+    let out = pm(&["image", s(&src), s(&other), "-r", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(!other.exists());
+
+    // the operation forms carry the settings
+    let out = pm(&["--disk-file", s(&src), "image-disk", "0", s(&other), "--rescue", "-r", "3", "--no-trim", "--emit-json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let r = &v["ImageDisk"]["rescue"];
+    assert_eq!((r["retries"].as_u64(), r["no_trim"].as_bool()), (Some(3), Some(true)), "{v}");
+    let out = pm(&["--disk-file", s(&src), "image-disk", "0", s(&other), "--emit-json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(v["ImageDisk"]["rescue"].is_null(), "{v}");
+}
+
+#[test]
+fn cli_rescue_creates_destination_image_with_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.raw");
+    let vhd = dir.path().join("out.vhd");
+    let map = dir.path().join("out.map");
+    make_pattern_raw(&src, 4 * MIB);
+
+    let out = pm(&["rescue", s(&src), s(&vhd), s(&map), "--format", "vhd"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Created"), "{}", stdout(&out));
+    assert_eq!(identify(&vhd).unwrap(), ImageFormat::VhdDynamic);
+    assert_eq!(pm_image::open(&vhd, true).unwrap().len(), 4 * MIB, "capacity equals the source");
+    assert_eq!(image_bytes(&vhd), read_all(&src));
+    all_finished(&map, 4 * MIB);
+
+    // without --format the extension decides
+    let q = dir.path().join("out.qcow2");
+    let qmap = dir.path().join("q.map");
+    let out = pm(&["rescue", s(&src), s(&q), s(&qmap)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(identify(&q).unwrap(), ImageFormat::Qcow2);
+    assert_eq!(image_bytes(&q), read_all(&src));
+
+    // --format creates image files only
+    let dmap = dir.path().join("d.map");
+    let out = pm(&["rescue", s(&src), "disk:7", s(&dmap), "--format", "vhd"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--format"), "{}", stderr(&out));
+    assert!(!dmap.exists());
+}
+
+#[test]
+fn cli_rescue_refuses_existing_image_without_mapfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.raw");
+    let vhd = dir.path().join("existing.vhd");
+    let map = dir.path().join("existing.map");
+    make_pattern_raw(&src, 4 * MIB);
+    let out = pm(&["image", s(&src), s(&vhd)]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let before = read_all(&vhd);
+
+    // no mapfile: refused, nothing touched
+    let out = pm(&["rescue", s(&src), s(&vhd), s(&map), "--format", "vhd"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
+    assert_eq!(read_all(&vhd), before);
+    assert!(!map.exists());
+    // a mapfile that does not parse does not count either
+    std::fs::write(&map, "not a mapfile").unwrap();
+    let out = pm(&["rescue", s(&src), s(&vhd), s(&map), "--format", "vhd"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(read_all(&vhd), before);
+    std::fs::remove_file(&map).unwrap();
+
+    // a rescue into a new image, then the same command again: resumes from its mapfile
+    let new = dir.path().join("new.vhd");
+    let nmap = dir.path().join("new.map");
+    let out = pm(&["rescue", s(&src), s(&new), s(&nmap), "--format", "vhd"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let out = pm(&["rescue", s(&src), s(&new), s(&nmap), "--format", "vhd", "-r", "1"]);
+    assert!(out.status.success(), "resume: {}", stderr(&out));
+    assert!(!stdout(&out).contains("Created"), "{}", stdout(&out));
+    assert_eq!(image_bytes(&new), read_all(&src));
+    // ... but not as another format
+    let out = pm(&["rescue", s(&src), s(&new), s(&nmap), "--format", "qcow2"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(identify(&new).unwrap(), ImageFormat::VhdDynamic);
+    // a mapfile left over without its image is not resumed into a new one
+    let gone = dir.path().join("gone.vhd");
+    let out = pm(&["rescue", s(&src), s(&gone), s(&nmap), "--format", "vhd"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(!gone.exists());
+}

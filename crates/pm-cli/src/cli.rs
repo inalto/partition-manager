@@ -84,6 +84,11 @@ pub enum Command {
     /// existing FILE untouched. Refuses to overwrite the source or a VMDK extent it is read
     /// from. Limitation: other ways of reaching the same storage (hard links, junctions, a
     /// differencing image's parent) are not detected.
+    ///
+    /// With --rescue a failing source is imaged anyway (GNU ddrescue's algorithm): unreadable
+    /// blocks are retried, then left as zeros in the image, and FILE.map (or --mapfile) records
+    /// them; an interrupted run resumes when the same command is run again. A `disk:N[:P]`
+    /// source runs the `image-disk` / `image-partition` operation.
     Image {
         /// Source device: `disk:N[:P]`, a drive letter, or an image file
         src: String,
@@ -94,6 +99,8 @@ pub enum Command {
         format: Option<ImageFormat>,
         #[command(flatten)]
         mode: CopyModeArgs,
+        #[command(flatten)]
+        rescue: RescueModeArgs,
     },
     /// Write an image (or any device) onto a device
     ///
@@ -202,15 +209,67 @@ impl CopyModeArgs {
     }
 }
 
+/// Rescue mode of an image export (`pm image`, `image-disk`, `image-partition`): the source is
+/// copied with GNU ddrescue's algorithm instead of failing on the first read error.
+#[derive(Args, Debug, Clone, Default)]
+pub struct RescueModeArgs {
+    /// Continue on read errors (ddrescue mode): unreadable blocks are retried, then written
+    /// as zeros; a mapfile records them so the export can be resumed
+    #[arg(long)]
+    pub rescue: bool,
+    /// Rescue mode: retry passes over the bad sectors
+    #[arg(short = 'r', long, requires = "rescue", value_name = "N")]
+    pub retries: Option<u32>,
+    /// Rescue mode: initial skip after a read error (doubles on further errors; default 64K)
+    #[arg(short = 'K', long, requires = "rescue", value_parser = size_arg, value_name = "SIZE")]
+    pub skip_size: Option<u64>,
+    /// Rescue mode: sectors per read in the copy phase (default: 128 KiB worth)
+    #[arg(short = 'c', long, requires = "rescue", value_parser = clap::value_parser!(u32).range(1..), value_name = "SECTORS")]
+    pub cluster_size: Option<u32>,
+    /// Rescue mode: skip the trimming phase
+    #[arg(long, requires = "rescue")]
+    pub no_trim: bool,
+    /// Rescue mode: skip the scraping phase
+    #[arg(long, requires = "rescue")]
+    pub no_scrape: bool,
+    /// Rescue mode: copy from the end of the source towards the start
+    #[arg(long, requires = "rescue")]
+    pub reverse: bool,
+    /// Rescue mode: the ddrescue mapfile (default: the image path plus `.map`)
+    #[arg(long, requires = "rescue", value_name = "PATH")]
+    pub mapfile: Option<PathBuf>,
+}
+
+impl RescueModeArgs {
+    /// The settings of the operation; `None` without `--rescue`.
+    pub fn settings(&self) -> Option<pm_ops::RescueSettings> {
+        self.rescue.then(|| pm_ops::RescueSettings {
+            retries: self.retries.unwrap_or(0),
+            skip_size: self.skip_size,
+            cluster_size: self.cluster_size,
+            no_trim: self.no_trim,
+            no_scrape: self.no_scrape,
+            reverse: self.reverse,
+            mapfile: self.mapfile.clone(),
+        })
+    }
+}
+
 /// Arguments of `pm rescue`; the short flags are GNU ddrescue's.
 #[derive(Args, Debug)]
 pub struct RescueArgs {
     /// Source device: `disk:N[:P]`, a drive letter, or an image file
     pub src: String,
-    /// Destination device; must be at least as large as the source
+    /// Destination device; must be at least as large as the source. A path that does not
+    /// exist yet is created as an image file of the source's size (format from --format or
+    /// the extension)
     pub dst: String,
     /// Mapfile (ddrescue format): resumes from it when it exists, kept up to date while copying
     pub mapfile: PathBuf,
+    /// Format of a new destination image (raw, vhd, vhd-fixed, vmdk, vmdk-flat, qcow2). With
+    /// --format an existing destination is only written to resume it: its mapfile must exist
+    #[arg(long, value_parser = parse_format)]
+    pub format: Option<ImageFormat>,
     /// Sector size in bytes: the unit of trimming, scraping and retrying (default: the source's)
     #[arg(short = 'b', long, value_parser = size_arg)]
     pub sector_size: Option<u64>,

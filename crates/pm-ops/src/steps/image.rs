@@ -5,7 +5,10 @@ use super::{entry_of, fs_facts, with_session, Ctx};
 use crate::model::is_container;
 use crate::operation::{CloneMode, RescueSettings};
 use pm_core::units::align_up;
-use pm_core::{format_size, BlockDevice, DiskInfo, Error, FileDevice, Result, SliceDevice};
+use pm_core::{
+    format_size, BlockDevice, CancelToken, DiskInfo, Error, FileDevice, ProgressSink, Result,
+    SliceDevice,
+};
 use pm_fs::UsedMap;
 use pm_image::{CreateOpts, ImageFormat, MapFile, RescueOpts, RescueStats};
 use pm_platform::{OpenMode, Platform};
@@ -39,7 +42,7 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
 
 /// The mapfile of a rescue-mode image at `path`: the configured one, else `<path>.map`
 /// (next to the image; for a flat VMDK, next to its descriptor).
-pub(crate) fn mapfile_path(path: &Path, r: &RescueSettings) -> PathBuf {
+pub fn mapfile_path(path: &Path, r: &RescueSettings) -> PathBuf {
     r.mapfile.clone().unwrap_or_else(|| with_suffix(path, ".map"))
 }
 
@@ -286,34 +289,39 @@ pub(crate) fn stats_line(st: &RescueStats, mapfile: &Path) -> String {
     )
 }
 
-/// Rescue-mode export of `[start, start + len)` of `disk` into `path`: GNU ddrescue's
-/// copy / trim / scrape / retry phases, unreadable sectors left as zeros, progress recorded
-/// in the mapfile ([`mapfile_path`]).
+/// Rescue-mode export of `src` into the image `path` (GNU ddrescue's copy / trim / scrape /
+/// retry phases): unreadable sectors are left unwritten, so the image reads them as zeros, and
+/// the progress is recorded in the mapfile ([`RescueSettings::mapfile`], by default
+/// `<path>.map`). `used` limits the reads to the used areas (the others are left unwritten
+/// too). Human-readable notes for the log are appended to `notes`.
 ///
 /// * When both `<path>.partial` and the mapfile exist, the partial image is reopened (same
 ///   format and capacity, or the run is refused) and the areas the mapfile marks finished are
 ///   not read again. A mapfile without a partial image (e.g. the one of an earlier, finished
 ///   export) is restarted from scratch.
 /// * On cancel or error the partial image and the mapfile are kept (when the mapfile exists)
-///   so that running the same operation again resumes.
-/// * On success the image is renamed into place; the mapfile stays next to it. Bad sectors
-///   are not a failure: the log gets the [`stats_line`].
-fn image_rescue(
-    ctx: &mut Ctx,
-    disk: u32,
-    (start, len): (u64, u64),
+///   so that running the same export again resumes.
+/// * On success the image is renamed into place and the mapfile stays next to it. Bad sectors
+///   are not an error: `notes` gets `rescued X, errsize Y, errors N, mapfile <path>`.
+#[allow(clippy::too_many_arguments)]
+pub fn export_rescue_image(
+    src: &mut dyn BlockDevice,
     used: Option<UsedMap>,
     path: &Path,
     format: ImageFormat,
     settings: &RescueSettings,
-) -> Result<()> {
-    let sink = ctx.step(&format!("write image {} (rescue mode)", path.display()));
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+    notes: &mut Vec<String>,
+) -> Result<RescueStats> {
+    check_rescue_settings(path, settings)?;
     let partial = Partial::new(path, format);
     let mapfile = mapfile_path(path, settings);
+    let len = src.len();
     let capacity = align_up(len, 512);
     let resume = partial.partial.exists() && mapfile.exists();
     if resume {
-        ctx.note(&format!("resuming from {} and {}", partial.partial.display(), mapfile.display()));
+        notes.push(format!("resuming from {} and {}", partial.partial.display(), mapfile.display()));
     }
     let r = (|| -> Result<RescueStats> {
         let mut img = if resume {
@@ -325,10 +333,8 @@ fn image_rescue(
             }
             pm_image::create(&partial.partial, &CreateOpts { format, capacity, sparse: true })?
         };
-        let dev = ctx.platform.open_disk(disk, OpenMode::ReadOnly)?;
-        let mut src = SliceDevice::new(dev, start, len)?;
         let ropts = rescue_opts(settings, src.sector_size(), used, mapfile.clone());
-        let stats = pm_image::rescue(&mut src, &mut *img, 0, &ropts, &sink, ctx.cancel)?;
+        let stats = pm_image::rescue(src, &mut *img, 0, &ropts, progress, cancel)?;
         img.flush()?;
         Ok(stats)
         // `img` is closed here, before the rename
@@ -336,13 +342,12 @@ fn image_rescue(
     match r {
         Ok(stats) => {
             partial.commit()?;
-            ctx.note(&stats_line(&stats, &mapfile));
-            ctx.rescue_stats.push(stats);
-            Ok(())
+            notes.push(stats_line(&stats, &mapfile));
+            Ok(stats)
         }
         Err(e) => {
             if mapfile.exists() {
-                ctx.note(&format!(
+                notes.push(format!(
                     "kept {} and {}; resume by running the same operation again",
                     partial.partial.display(),
                     mapfile.display()
@@ -353,6 +358,31 @@ fn image_rescue(
             Err(e)
         }
     }
+}
+
+/// [`export_rescue_image`] of `[start, start + len)` of `disk`, as a step of the executor.
+fn image_rescue(
+    ctx: &mut Ctx,
+    disk: u32,
+    (start, len): (u64, u64),
+    used: Option<UsedMap>,
+    path: &Path,
+    format: ImageFormat,
+    settings: &RescueSettings,
+) -> Result<()> {
+    let sink = ctx.step(&format!("write image {} (rescue mode)", path.display()));
+    let mut notes = Vec::new();
+    let (platform, cancel) = (ctx.platform, ctx.cancel);
+    let r = (|| {
+        let dev = platform.open_disk(disk, OpenMode::ReadOnly)?;
+        let mut src = SliceDevice::new(dev, start, len)?;
+        export_rescue_image(&mut src, used, path, format, settings, &sink, cancel, &mut notes)
+    })();
+    for n in &notes {
+        ctx.note(n);
+    }
+    ctx.rescue_stats.push(r?);
+    Ok(())
 }
 
 /// Restore image `path` over the whole of `dst_disk` (`dst_start == None`), into the

@@ -1,15 +1,17 @@
 //! `pm image`, `pm restore` and `pm convert`: save a device to an image file, write an image
 //! back to a device, and convert between image formats.
 
-use crate::cli::{CliError, CopyMode};
+use crate::cli::{arg_error, CliError, CopyMode, CopyModeArgs};
+use crate::cmd_apply::{run_ops, Env, RunFlags};
 use crate::cmd_clone::{
     copy_device, copy_planned, existing_canonical, finish, open_checked, plan_used_map, summary, SharedSource,
 };
-use crate::device_arg::{open_spec, vmdk_extent_files};
+use crate::device_arg::{open_spec, parse_device, vmdk_extent_files, DeviceArg};
 use crate::partial::Partial;
 use crate::progress::StderrProgress;
-use pm_core::{align_up, BlockDevice, CancelToken, Error};
+use pm_core::{align_up, format_size, BlockDevice, CancelToken, Error};
 use pm_image::{CreateOpts, ImageFormat};
+use pm_ops::{Operation, RescueSettings};
 use pm_platform::{OpenMode, Platform};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -93,6 +95,97 @@ pub fn run_image(
     writeln!(out, "{}", summary("Imaged", copied, start.elapsed(), used.is_some()))
         .and_then(|_| writeln!(out, "Wrote {} ({})", file.display(), fmt.display()))
         .map_err(write_err)
+}
+
+/// `pm image SRC FILE --rescue`: a `disk:N` / `disk:N:P` source runs the `image-disk` /
+/// `image-partition` operation (validated like every operation, and run right away as `pm
+/// image` always is); any other source (an image file, a volume) goes through the same export
+/// ([`pm_ops::export_rescue_image`]) directly.
+pub fn run_image_rescue(
+    env: &Env,
+    src: &str,
+    file: &Path,
+    format: Option<ImageFormat>,
+    mode: CopyModeArgs,
+    settings: RescueSettings,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let fmt = pick_format(format, file)?;
+    let clone_mode = crate::cmd_ops::clone_mode(mode);
+    let op = match parse_device(src).map_err(arg_error)? {
+        DeviceArg::Disk(disk) => Some(Operation::ImageDisk {
+            disk,
+            path: file.to_path_buf(),
+            format: fmt,
+            mode: clone_mode,
+            rescue: Some(settings.clone()),
+        }),
+        DeviceArg::Partition(parent, number) => match *parent {
+            DeviceArg::Disk(disk) => Some(Operation::ImagePartition {
+                disk,
+                number,
+                path: file.to_path_buf(),
+                format: fmt,
+                mode: clone_mode,
+                rescue: Some(settings.clone()),
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(op) = op {
+        let flags = RunFlags { dry_run: false, yes: true, allow_system_disk: false };
+        return run_ops(env, vec![op], &flags, out);
+    }
+
+    let source = open_spec(env.platform, src, OpenMode::ReadOnly)?;
+    if source.dev.len() == 0 {
+        return Err(CliError::Usage("the source is empty; nothing to image".into()));
+    }
+    let mut written = Partial::new(file, fmt).files_written();
+    written.push(pm_ops::mapfile_path(file, &settings));
+    refuse_source_overwrite(&source.source_files(), &written)?;
+    let mut shared = SharedSource::new(source.dev);
+    let used = plan_used_map(&shared, mode.mode())?;
+
+    let start = Instant::now();
+    let mut notes = Vec::new();
+    let r = pm_ops::export_rescue_image(
+        &mut shared,
+        used,
+        file,
+        fmt,
+        &settings,
+        &StderrProgress::new(),
+        env.cancel,
+        &mut notes,
+    );
+    for n in &notes {
+        writeln!(out, "{n}").map_err(write_err)?;
+    }
+    let stats = r.map_err(|e| match e {
+        Error::Invalid(m) => CliError::Usage(m),
+        other => CliError::Runtime(other),
+    })?;
+    writeln!(
+        out,
+        "Imaged {} in {:.1}s (rescue mode); wrote {} ({})",
+        format_size(stats.rescued),
+        start.elapsed().as_secs_f64(),
+        file.display(),
+        fmt.display()
+    )
+    .map_err(write_err)?;
+    if stats.bad_bytes > 0 {
+        writeln!(
+            out,
+            "Unreadable data: {} in {} area(s) is zero in the image; run the same command again (more retries with -r) to retry it",
+            format_size(stats.bad_bytes),
+            stats.bad_areas
+        )
+        .map_err(write_err)?;
+    }
+    Ok(())
 }
 
 pub fn run_restore(

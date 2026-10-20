@@ -44,9 +44,13 @@ fn dispatch(
         Command::Clone { src, dst, mode, dst_offset } => {
             cmd_clone::run(platform, &src, &dst, mode.mode(), dst_offset, cancel, out)
         }
-        Command::Image { src, file, format, mode } => {
-            cmd_image::run_image(platform, &src, &file, format, mode.mode(), cancel, out)
-        }
+        Command::Image { src, file, format, mode, rescue } => match rescue.settings() {
+            Some(settings) => {
+                let env = cmd_apply::Env { platform, on_images, cancel };
+                cmd_image::run_image_rescue(&env, &src, &file, format, mode, settings, out)
+            }
+            None => cmd_image::run_image(platform, &src, &file, format, mode.mode(), cancel, out),
+        },
         Command::Restore { file, dst, dst_offset } => {
             cmd_image::run_restore(platform, &file, &dst, dst_offset, cancel, out)
         }

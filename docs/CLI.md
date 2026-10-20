@@ -197,6 +197,8 @@ Save a device to an image file (raw, VHD, VMDK or qcow2)
 
 The image is written to FILE.partial and renamed when complete; a failed run leaves an existing FILE untouched. Refuses to overwrite the source or a VMDK extent it is read from. Limitation: other ways of reaching the same storage (hard links, junctions, a differencing image's parent) are not detected.
 
+With --rescue a failing source is imaged anyway (GNU ddrescue's algorithm): unreadable blocks are retried, then left as zeros in the image, and FILE.map (or --mapfile) records them; an interrupted run resumes when the same command is run again. A `disk:N[:P]` source runs the `image-disk` / `image-partition` operation.
+
 Usage: pm.exe image [OPTIONS] <SRC> <FILE>
 
 Arguments:
@@ -218,6 +220,30 @@ Options:
 
       --sector
           Copy every sector
+
+      --rescue
+          Continue on read errors (ddrescue mode): unreadable blocks are retried, then written as zeros; a mapfile records them so the export can be resumed
+
+  -r, --retries <N>
+          Rescue mode: retry passes over the bad sectors
+
+  -K, --skip-size <SIZE>
+          Rescue mode: initial skip after a read error (doubles on further errors; default 64K)
+
+  -c, --cluster-size <SECTORS>
+          Rescue mode: sectors per read in the copy phase (default: 128 KiB worth)
+
+      --no-trim
+          Rescue mode: skip the trimming phase
+
+      --no-scrape
+          Rescue mode: skip the scraping phase
+
+      --reverse
+          Rescue mode: copy from the end of the source towards the start
+
+      --mapfile <PATH>
+          Rescue mode: the ddrescue mapfile (default: the image path plus `.map`)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -302,17 +328,20 @@ Arguments:
           Source device: `disk:N[:P]`, a drive letter, or an image file
 
   <DST>
-          Destination device; must be at least as large as the source
+          Destination device; must be at least as large as the source. A path that does not exist yet is created as an image file of the source's size (format from --format or the extension)
 
   <MAPFILE>
           Mapfile (ddrescue format): resumes from it when it exists, kept up to date while copying
 
 Options:
-  -b, --sector-size <SECTOR_SIZE>
-          Sector size in bytes: the unit of trimming, scraping and retrying (default: the source's)
-
       --disk-file <PATH>
           Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+
+      --format <FORMAT>
+          Format of a new destination image (raw, vhd, vhd-fixed, vmdk, vmdk-flat, qcow2). With --format an existing destination is only written to resume it: its mapfile must exist
+
+  -b, --sector-size <SECTOR_SIZE>
+          Sector size in bytes: the unit of trimming, scraping and retrying (default: the source's)
 
   -c, --cluster-size <CLUSTER_SIZE>
           Sectors per read in the copy phase (default: 128 KiB worth)
@@ -820,23 +849,71 @@ Options:
 ```text
 Save a whole disk to an image file
 
+With --rescue read errors do not stop the copy: unreadable blocks become zeros and a resumable mapfile records them (see `pm image --help`).
+
 Usage: pm.exe image-disk [OPTIONS] <DISK> <PATH>
 
 Arguments:
-  <DISK>  
-  <PATH>  Image file to create
+  <DISK>
+          
+
+  <PATH>
+          Image file to create
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
-      --format <FORMAT>    raw, vhd, vhd-fixed, vmdk, vmdk-flat or qcow2 (default: from the file extension)
-      --smart              Copy only the blocks the filesystem marks used
-      --sector             Copy every sector
-      --dry-run            Validate and show what would be done; write nothing
-      --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
-      --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
-      --emit-json          Print the operation as JSON instead of running it (a file of such objects, in a JSON array, is what `pm apply` reads)
-  -h, --help               Print help
-  -V, --version            Print version
+      --disk-file <PATH>
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+
+      --format <FORMAT>
+          raw, vhd, vhd-fixed, vmdk, vmdk-flat or qcow2 (default: from the file extension)
+
+      --smart
+          Copy only the blocks the filesystem marks used
+
+      --sector
+          Copy every sector
+
+      --rescue
+          Continue on read errors (ddrescue mode): unreadable blocks are retried, then written as zeros; a mapfile records them so the export can be resumed
+
+  -r, --retries <N>
+          Rescue mode: retry passes over the bad sectors
+
+  -K, --skip-size <SIZE>
+          Rescue mode: initial skip after a read error (doubles on further errors; default 64K)
+
+  -c, --cluster-size <SECTORS>
+          Rescue mode: sectors per read in the copy phase (default: 128 KiB worth)
+
+      --no-trim
+          Rescue mode: skip the trimming phase
+
+      --no-scrape
+          Rescue mode: skip the scraping phase
+
+      --reverse
+          Rescue mode: copy from the end of the source towards the start
+
+      --mapfile <PATH>
+          Rescue mode: the ddrescue mapfile (default: the image path plus `.map`)
+
+      --dry-run
+          Validate and show what would be done; write nothing
+
+      --yes
+          Apply the operations (without it nothing is written; there is no interactive prompt)
+
+      --allow-system-disk
+          Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
+
+      --emit-json
+          Print the operation as JSON instead of running it (a file of such objects, in a JSON array, is what `pm apply` reads)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ## pm image-partition
@@ -844,24 +921,74 @@ Options:
 ```text
 Save one partition to an image file
 
+With --rescue read errors do not stop the copy: unreadable blocks become zeros and a resumable mapfile records them (see `pm image --help`).
+
 Usage: pm.exe image-partition [OPTIONS] <DISK> <PART> <PATH>
 
 Arguments:
-  <DISK>  
-  <PART>  
-  <PATH>  
+  <DISK>
+          
+
+  <PART>
+          
+
+  <PATH>
+          
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
-      --format <FORMAT>    
-      --smart              Copy only the blocks the filesystem marks used
-      --sector             Copy every sector
-      --dry-run            Validate and show what would be done; write nothing
-      --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
-      --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
-      --emit-json          Print the operation as JSON instead of running it (a file of such objects, in a JSON array, is what `pm apply` reads)
-  -h, --help               Print help
-  -V, --version            Print version
+      --disk-file <PATH>
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+
+      --format <FORMAT>
+          
+
+      --smart
+          Copy only the blocks the filesystem marks used
+
+      --sector
+          Copy every sector
+
+      --rescue
+          Continue on read errors (ddrescue mode): unreadable blocks are retried, then written as zeros; a mapfile records them so the export can be resumed
+
+  -r, --retries <N>
+          Rescue mode: retry passes over the bad sectors
+
+  -K, --skip-size <SIZE>
+          Rescue mode: initial skip after a read error (doubles on further errors; default 64K)
+
+  -c, --cluster-size <SECTORS>
+          Rescue mode: sectors per read in the copy phase (default: 128 KiB worth)
+
+      --no-trim
+          Rescue mode: skip the trimming phase
+
+      --no-scrape
+          Rescue mode: skip the scraping phase
+
+      --reverse
+          Rescue mode: copy from the end of the source towards the start
+
+      --mapfile <PATH>
+          Rescue mode: the ddrescue mapfile (default: the image path plus `.map`)
+
+      --dry-run
+          Validate and show what would be done; write nothing
+
+      --yes
+          Apply the operations (without it nothing is written; there is no interactive prompt)
+
+      --allow-system-disk
+          Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
+
+      --emit-json
+          Print the operation as JSON instead of running it (a file of such objects, in a JSON array, is what `pm apply` reads)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ## pm restore-image

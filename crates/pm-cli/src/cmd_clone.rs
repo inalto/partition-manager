@@ -507,6 +507,7 @@ mod tests {
             no_trim: false,
             dst_offset: 0,
             used_map: false,
+            format: None,
             ansi: false,
         };
         assert_refused(

@@ -3,7 +3,7 @@
 //! (`--dry-run` validates only; `--emit-json` prints the operation JSON instead of running it,
 //! to compose an operations file for `pm apply`).
 
-use crate::cli::{parse_format, parse_letter, size_arg, CliError, CopyMode, CopyModeArgs};
+use crate::cli::{parse_format, parse_letter, size_arg, CliError, CopyMode, CopyModeArgs, RescueModeArgs};
 use crate::cmd_apply::{run_ops, Env, RunFlags};
 use crate::cmd_image::pick_format;
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
@@ -145,7 +145,7 @@ impl BootFixArg {
     }
 }
 
-fn clone_mode(m: CopyModeArgs) -> CloneMode {
+pub(crate) fn clone_mode(m: CopyModeArgs) -> CloneMode {
     match m.mode() {
         CopyMode::Sector => CloneMode::Sector,
         CopyMode::Auto | CopyMode::Smart => CloneMode::Smart,
@@ -378,6 +378,9 @@ pub enum OpCommand {
         run: OpRun,
     },
     /// Save a whole disk to an image file
+    ///
+    /// With --rescue read errors do not stop the copy: unreadable blocks become zeros and a
+    /// resumable mapfile records them (see `pm image --help`).
     ImageDisk {
         #[arg(value_parser = disk_arg)]
         disk: u32,
@@ -389,9 +392,14 @@ pub enum OpCommand {
         #[command(flatten)]
         mode: CopyModeArgs,
         #[command(flatten)]
+        rescue: RescueModeArgs,
+        #[command(flatten)]
         run: OpRun,
     },
     /// Save one partition to an image file
+    ///
+    /// With --rescue read errors do not stop the copy: unreadable blocks become zeros and a
+    /// resumable mapfile records them (see `pm image --help`).
     ImagePartition {
         #[arg(value_parser = disk_arg)]
         disk: u32,
@@ -402,6 +410,8 @@ pub enum OpCommand {
         format: Option<ImageFormat>,
         #[command(flatten)]
         mode: CopyModeArgs,
+        #[command(flatten)]
+        rescue: RescueModeArgs,
         #[command(flatten)]
         run: OpRun,
     },
@@ -523,13 +533,14 @@ impl OpCommand {
                 },
                 run,
             ),
-            ImageDisk { disk, path, format, mode, run } => {
+            ImageDisk { disk, path, format, mode, rescue, run } => {
                 let format = pick_format(format, &path)?;
-                (Operation::ImageDisk { disk, path, format, mode: clone_mode(mode), rescue: None }, run)
+                (Operation::ImageDisk { disk, path, format, mode: clone_mode(mode), rescue: rescue.settings() }, run)
             }
-            ImagePartition { disk, part, path, format, mode, run } => {
+            ImagePartition { disk, part, path, format, mode, rescue, run } => {
                 let format = pick_format(format, &path)?;
-                (Operation::ImagePartition { disk, number: part, path, format, mode: clone_mode(mode), rescue: None }, run)
+                let rescue = rescue.settings();
+                (Operation::ImagePartition { disk, number: part, path, format, mode: clone_mode(mode), rescue }, run)
             }
             RestoreImage { path, disk, start, run } => {
                 (Operation::RestoreImage { path, dst_disk: disk, dst_start: start }, run)

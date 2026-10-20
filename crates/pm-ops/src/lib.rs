@@ -21,3 +21,4 @@ pub use sizing::{plan_disk_clone, windows_partition, LayoutSpec, TargetLayout};
 pub use executor::{execute, execute_queued, precheck, ExecOpts, ExecReport, StepEvent};
 pub use identity::{adopt_generated_ids, layout_matches};
 pub use queue::OpQueue;
+pub use steps::image::{export_rescue_image, mapfile_path};
