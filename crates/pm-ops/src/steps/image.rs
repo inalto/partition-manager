@@ -385,7 +385,7 @@ pub fn export_rescue_image(
             let img = reopen_image(path, format, capacity)?;
             match unrescued_areas(&map) {
                 0 => notes.push(format!(
-                    "nothing to retry: every area of {} is rescued (mapfile {})",
+                    "nothing to retry: every area of {} is rescued (mapfile {}); to export the source again from scratch, delete the mapfile first",
                     path.display(),
                     mapfile.display()
                 )),
