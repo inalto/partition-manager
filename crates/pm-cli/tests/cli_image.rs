@@ -738,6 +738,11 @@ fn cli_image_rescue_on_file_writes_mapfile_and_image() {
     assert_eq!(image_bytes(&img), read_all(&src));
     all_finished(&with_suffix(&img, ".map"), 4 * MIB);
     assert!(!with_suffix(&img, ".partial").exists());
+    // the same command again: everything is rescued, nothing to retry
+    let out = pm(&["image", s(&src), s(&img), "--rescue", "--format", "qcow2", "-r", "1"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("nothing to retry"), "{}", stdout(&out));
+    assert_eq!(image_bytes(&img), read_all(&src));
 
     // a disk as the source runs the image-disk operation, with an explicit mapfile
     let vhd = dir.path().join("disk.vhd");
@@ -791,6 +796,8 @@ fn cli_rescue_creates_destination_image_with_format() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(identify(&q).unwrap(), ImageFormat::Qcow2);
     assert_eq!(image_bytes(&q), read_all(&src));
+    let size = std::fs::metadata(&q).unwrap().len();
+    assert!(size < MIB, "the zero areas of a new sparse image stay unallocated ({size} bytes)");
 
     // --format creates image files only
     let dmap = dir.path().join("d.map");
@@ -842,4 +849,25 @@ fn cli_rescue_refuses_existing_image_without_mapfile() {
     let out = pm(&["rescue", s(&src), s(&gone), s(&nmap), "--format", "vhd"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(!gone.exists());
+}
+
+#[test]
+fn cli_image_rescue_refuses_to_overwrite_a_disk_file_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("d.img");
+    make_pattern_raw(&d, 4 * MIB);
+    let before = read_all(&d);
+    let out_img = dir.path().join("out.img");
+    // the disk of --disk-file is the file itself: no image, partial or mapfile may replace it
+    for args in [
+        vec!["--disk-file", s(&d), "image", "disk:0", s(&d), "--rescue"],
+        vec!["--disk-file", s(&d), "image", "disk:0", s(&d), "--sector"],
+        vec!["--disk-file", s(&d), "image", "disk:0", s(&out_img), "--rescue", "--mapfile", s(&d)],
+    ] {
+        let out = pm(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains("source itself"), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(read_all(&d), before);
+    assert_eq!(file_names(dir.path()), ["d.img"]);
 }

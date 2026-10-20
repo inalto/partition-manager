@@ -154,7 +154,8 @@ pm convert disk1.vhd disk1.qcow2         # image to image
 pm rescue disk:3 D:\rescue\copy.img D:\rescue\copy.map -r 2 -K 64K   # onto an existing copy.img (big enough), or a new one
 
 # Rescue a failing disk into a VM image: unreadable blocks are retried, then left as zeros;
-# the ddrescue mapfile records them, and running the same command again resumes
+# the ddrescue mapfile records them; running the same command again resumes an interrupted
+# export, or retries the unreadable areas of a finished image in place (more retries with -r)
 pm image disk:3 D:\vm\old-pc.vhd --rescue -r 2           # mapfile D:\vm\old-pc.vhd.map (or --mapfile)
 pm image-disk 3 D:\vm\old-pc.qcow2 --rescue --yes        # the operation form (also image-partition)
 pm rescue disk:3 D:\vm\old-pc.vmdk D:\vm\old-pc.map --format vmdk   # creates the image; refuses an existing one unless resuming

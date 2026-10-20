@@ -197,7 +197,7 @@ Save a device to an image file (raw, VHD, VMDK or qcow2)
 
 The image is written to FILE.partial and renamed when complete; a failed run leaves an existing FILE untouched. Refuses to overwrite the source or a VMDK extent it is read from. Limitation: other ways of reaching the same storage (hard links, junctions, a differencing image's parent) are not detected.
 
-With --rescue a failing source is imaged anyway (GNU ddrescue's algorithm): unreadable blocks are retried, then left as zeros in the image, and FILE.map (or --mapfile) records them; an interrupted run resumes when the same command is run again. A `disk:N[:P]` source runs the `image-disk` / `image-partition` operation.
+With --rescue a failing source is imaged anyway (GNU ddrescue's algorithm): unreadable blocks are retried, then left as zeros in the image, and FILE.map (or --mapfile) records them. Running the same command again resumes an interrupted run, or retries the unreadable areas of a finished image in place (give more retries with -r). New sparse images (vhd, vmdk, qcow2) allocate nothing for zero areas. A `disk:N[:P]` source runs the `image-disk` / `image-partition` operation.
 
 Usage: pm.exe image [OPTIONS] <SRC> <FILE>
 

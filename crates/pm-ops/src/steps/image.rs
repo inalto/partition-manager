@@ -10,7 +10,7 @@ use pm_core::{
     SliceDevice,
 };
 use pm_fs::UsedMap;
-use pm_image::{CreateOpts, ImageFormat, MapFile, RescueOpts, RescueStats};
+use pm_image::{BlockStatus, CreateOpts, ImageFormat, MapFile, RescueOpts, RescueStats};
 use pm_platform::{OpenMode, Platform};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ pub fn mapfile_path(path: &Path, r: &RescueSettings) -> PathBuf {
 }
 
 /// The executor's static checks of rescue settings (see [`crate::precheck`]).
-pub(crate) fn check_rescue_settings(path: &Path, r: &RescueSettings) -> Result<()> {
+pub(crate) fn check_rescue_settings(path: &Path, format: ImageFormat, r: &RescueSettings) -> Result<()> {
     if r.cluster_size == Some(0) {
         return Err(Error::Invalid("the rescue cluster size must be at least one sector".into()));
     }
@@ -64,7 +64,12 @@ pub(crate) fn check_rescue_settings(path: &Path, r: &RescueSettings) -> Result<(
         }
     }
     let partial = with_suffix(path, ".partial");
-    if [path, partial.as_path()].iter().any(|p| same_path(p, &map)) {
+    let mut files = vec![path.to_path_buf(), partial.clone()];
+    if format == ImageFormat::VmdkFlat {
+        files.extend(flat_extent(path));
+        files.extend(flat_extent(&partial));
+    }
+    if files.iter().any(|p| same_path(p, &map)) {
         return Err(Error::Invalid(format!(
             "the mapfile {} cannot be the image file itself",
             map.display()
@@ -206,6 +211,8 @@ pub(crate) fn image(
             block_size: IMAGE_BLOCK,
             used_map: used,
             abort_on_error: true,
+            // a new sparse image reads as zeros: zero blocks need no clusters
+            skip_zero_writes: format.is_sparse(),
             ..Default::default()
         };
         let stats = pm_image::rescue(&mut src, &mut *img, 0, &ropts, &sink, ctx.cancel)?;
@@ -225,30 +232,30 @@ pub(crate) fn image(
     }
 }
 
-/// Reopen the partial image of an interrupted rescue-mode export; it must have the format
-/// and capacity this run would create.
-fn reopen_partial(partial: &Partial, capacity: u64) -> Result<Box<dyn BlockDevice>> {
-    let p = &partial.partial;
+/// Reopen the image `p` of an earlier rescue-mode export (the partial image of an interrupted
+/// one, or a finished image whose unreadable areas are retried); it must have the format and
+/// capacity this run would create.
+fn reopen_image(p: &Path, format: ImageFormat, capacity: u64) -> Result<Box<dyn BlockDevice>> {
     let start_over =
         format!("delete {} and its mapfile to start over, or image to another file", p.display());
-    let img: Box<dyn BlockDevice> = if partial.format == ImageFormat::Raw {
+    let img: Box<dyn BlockDevice> = if format == ImageFormat::Raw {
         // any content is a valid raw image: never let a signature inside it pick a format
         Box::new(FileDevice::open(p, false)?)
     } else {
         let found = pm_image::identify(p)?;
-        if found != partial.format {
+        if found != format {
             return Err(Error::Invalid(format!(
-                "the unfinished image {} is a {} image, not {}; {start_over}",
+                "the existing image {} is a {} image, not {}; {start_over}",
                 p.display(),
                 found.display(),
-                partial.format.display()
+                format.display()
             )));
         }
         pm_image::open(p, false)?
     };
     if img.len() != capacity {
         return Err(Error::Invalid(format!(
-            "the unfinished image {} holds {} bytes but the source needs {capacity}; {start_over}",
+            "the existing image {} holds {} bytes but the source needs {capacity}; {start_over}",
             p.display(),
             img.len()
         )));
@@ -257,7 +264,15 @@ fn reopen_partial(partial: &Partial, capacity: u64) -> Result<Box<dyn BlockDevic
 }
 
 /// Engine options of a rescue-mode export reading a device of `sector`-byte sectors.
-fn rescue_opts(s: &RescueSettings, sector: u32, used: Option<UsedMap>, mapfile: PathBuf) -> RescueOpts {
+/// `fresh_sparse`: the destination is a sparse image created by this run (it reads as zeros,
+/// so zero blocks are not written and allocate nothing).
+fn rescue_opts(
+    s: &RescueSettings,
+    sector: u32,
+    used: Option<UsedMap>,
+    mapfile: PathBuf,
+    fresh_sparse: bool,
+) -> RescueOpts {
     let d = RescueOpts::default();
     let sector = sector.max(512) as usize;
     RescueOpts {
@@ -271,10 +286,25 @@ fn rescue_opts(s: &RescueSettings, sector: u32, used: Option<UsedMap>, mapfile: 
         // unused and unreadable areas are never written: every image format reads them as
         // zeros, and the sparse ones allocate nothing for them
         zero_unused: false,
+        skip_zero_writes: fresh_sparse,
         abort_on_error: false,
         mapfile: Some(mapfile),
         ..d
     }
+}
+
+/// Number of maximal areas `map` does not mark finished (adjacent ones counted once).
+fn unrescued_areas(map: &MapFile) -> u64 {
+    let mut areas = 0;
+    let mut prev = false;
+    for &(_, size, st) in &map.blocks {
+        let unrescued = st != BlockStatus::Finished && size > 0;
+        if unrescued && !prev {
+            areas += 1;
+        }
+        prev = unrescued;
+    }
+    areas
 }
 
 /// `rescued X, errsize Y, errors N, mapfile <path>`; `errors` counts the unrescued areas, as
@@ -297,12 +327,18 @@ pub(crate) fn stats_line(st: &RescueStats, mapfile: &Path) -> String {
 ///
 /// * When both `<path>.partial` and the mapfile exist, the partial image is reopened (same
 ///   format and capacity, or the run is refused) and the areas the mapfile marks finished are
-///   not read again. A mapfile without a partial image (e.g. the one of an earlier, finished
-///   export) is restarted from scratch.
-/// * On cancel or error the partial image and the mapfile are kept (when the mapfile exists)
-///   so that running the same export again resumes.
-/// * On success the image is renamed into place and the mapfile stays next to it. Bad sectors
-///   are not an error: `notes` gets `rescued X, errsize Y, errors N, mapfile <path>`.
+///   not read again.
+/// * When the finished image `path` and its mapfile exist (no partial), the unreadable areas
+///   are retried in place: the image is reopened (same checks) and only what the mapfile does
+///   not mark finished is read, with the requested retries; nothing is renamed. A mapfile
+///   with everything finished leaves nothing to do.
+/// * A mapfile with neither image is restarted from scratch; an existing image without a
+///   mapfile is replaced by a new one.
+/// * On cancel or error the image (partial or finished) and the mapfile are kept (when the
+///   mapfile exists) so that running the same export again resumes.
+/// * On success a new image is renamed into place and the mapfile stays next to it. Bad
+///   sectors are not an error: `notes` gets `rescued X, errsize Y, errors N, mapfile <path>`.
+/// * Only a newly created sparse image skips writing all-zero blocks.
 #[allow(clippy::too_many_arguments)]
 pub fn export_rescue_image(
     src: &mut dyn BlockDevice,
@@ -314,31 +350,62 @@ pub fn export_rescue_image(
     cancel: &CancelToken,
     notes: &mut Vec<String>,
 ) -> Result<RescueStats> {
-    check_rescue_settings(path, settings)?;
+    check_rescue_settings(path, format, settings)?;
     let partial = Partial::new(path, format);
     let mapfile = mapfile_path(path, settings);
     let len = src.len();
     let capacity = align_up(len, 512);
     let resume = partial.partial.exists() && mapfile.exists();
+    let in_place = !resume && path.exists() && mapfile.exists();
     if resume {
         notes.push(format!("resuming from {} and {}", partial.partial.display(), mapfile.display()));
     }
+    let mut fresh = false;
     let r = (|| -> Result<RescueStats> {
         let mut img = if resume {
-            reopen_partial(&partial, capacity)?
+            reopen_image(&partial.partial, format, capacity)?
+        } else if in_place {
+            let map = MapFile::load(&mapfile).map_err(|e| {
+                Error::Parse(format!(
+                    "mapfile {} of the existing image {} is unreadable ({e}); delete or move it to \
+                     replace the image with a new export",
+                    mapfile.display(),
+                    path.display()
+                ))
+            })?;
+            if map.len() != len {
+                return Err(Error::Invalid(format!(
+                    "mapfile {} covers {} bytes but the source has {len}; delete or move it to \
+                     replace the image {} with a new export",
+                    mapfile.display(),
+                    map.len(),
+                    path.display()
+                )));
+            }
+            let img = reopen_image(path, format, capacity)?;
+            match unrescued_areas(&map) {
+                0 => notes.push(format!(
+                    "nothing to retry: every area of {} is rescued (mapfile {})",
+                    path.display(),
+                    mapfile.display()
+                )),
+                n => notes.push(format!("retrying {n} unreadable areas in {}", path.display())),
+            }
+            img
         } else {
+            fresh = true;
             if mapfile.exists() {
                 // nothing to resume into: what the mapfile calls finished is not in a new image
                 notes.push(format!(
-                    "no unfinished image {}: the mapfile {} starts over",
-                    partial.partial.display(),
+                    "no image for the mapfile {1} ({0} is missing): the export starts over",
+                    path.display(),
                     mapfile.display()
                 ));
                 MapFile::new(len).save(&mapfile)?;
             }
             pm_image::create(&partial.partial, &CreateOpts { format, capacity, sparse: true })?
         };
-        let ropts = rescue_opts(settings, src.sector_size(), used, mapfile.clone());
+        let ropts = rescue_opts(settings, src.sector_size(), used, mapfile.clone(), fresh && format.is_sparse());
         let stats = pm_image::rescue(src, &mut *img, 0, &ropts, progress, cancel)?;
         img.flush()?;
         Ok(stats)
@@ -346,9 +413,19 @@ pub fn export_rescue_image(
     })();
     match r {
         Ok(stats) => {
-            partial.commit()?;
+            if !in_place {
+                partial.commit()?;
+            }
             notes.push(stats_line(&stats, &mapfile));
             Ok(stats)
+        }
+        Err(e) if in_place => {
+            notes.push(format!(
+                "kept {} and {}; run the operation again to retry the unreadable areas in place",
+                path.display(),
+                mapfile.display()
+            ));
+            Err(e)
         }
         Err(e) => {
             if mapfile.exists() {

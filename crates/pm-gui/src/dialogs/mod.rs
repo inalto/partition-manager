@@ -40,7 +40,8 @@ pub(crate) fn wizard_scroll_height(body: f32) -> f32 {
     (body - 60.0).max(120.0)
 }
 
-/// One line per image written by the run, from [`pm_ops::ExecReport::rescue_stats`]:
+/// One line per rescue-mode image (one with a mapfile) or image with unreadable areas, from
+/// [`pm_ops::ExecReport::rescue_stats`] (`N` counts every image of the run):
 /// `Image N: rescued X, errsize Y, errors E[, mapfile P]` (errors: the unrescued areas, as
 /// in the log), and whether it is a warning (unreadable areas, left as zeros in the image).
 pub fn rescue_lines(stats: &[pm_image::RescueStats]) -> Vec<(String, bool)> {
@@ -48,6 +49,7 @@ pub fn rescue_lines(stats: &[pm_image::RescueStats]) -> Vec<(String, bool)> {
     stats
         .iter()
         .enumerate()
+        .filter(|(_, st)| st.mapfile.is_some() || st.bad_areas > 0)
         .map(|(i, st)| {
             let mut line = format!(
                 "Image {}: rescued {}, errsize {}, errors {}",
@@ -61,7 +63,10 @@ pub fn rescue_lines(stats: &[pm_image::RescueStats]) -> Vec<(String, bool)> {
             }
             let warn = st.bad_areas > 0;
             if warn {
-                line.push_str(" (unreadable areas are zeros in the image; run the operation again to retry them)");
+                line.push_str(
+                    " (unreadable areas are zeros in the image; run the operation again with more retries to retry \
+                     the unreadable areas in place)",
+                );
             }
             (line, warn)
         })
@@ -143,16 +148,21 @@ mod tests {
             mapfile: Some(PathBuf::from(r"D:\img\disk.vhd.map")),
             ..Default::default()
         };
-        let lines = rescue_lines(&[clean, damaged]);
+        let rescued = RescueStats { mapfile: Some(PathBuf::from(r"D:\img\p.qcow2.map")), ..clean.clone() };
+        let lines = rescue_lines(&[clean, damaged, rescued]);
+        // an image without a mapfile and without errors (plain mode) gets no line
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], ("Image 1: rescued 4.00 MB, errsize 0 B, errors 0".to_string(), false));
-        let (text, warn) = &lines[1];
+        let (text, warn) = &lines[0];
         assert!(warn, "errors > 0 is shown as a warning");
         assert!(
             text.starts_with(r"Image 2: rescued 4.00 MB, errsize 1.00 KB, errors 2, mapfile D:\img\disk.vhd.map"),
             "{text}"
         );
-        assert!(text.contains("zeros in the image"), "{text}");
+        assert!(text.contains("zeros in the image") && text.contains("in place"), "{text}");
+        assert_eq!(
+            lines[1],
+            (r"Image 3: rescued 4.00 MB, errsize 0 B, errors 0, mapfile D:\img\p.qcow2.map".to_string(), false)
+        );
         assert!(rescue_lines(&[]).is_empty());
     }
 }

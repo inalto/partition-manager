@@ -31,6 +31,20 @@ pub(crate) fn pick_format(explicit: Option<ImageFormat>, file: &Path) -> Result<
     })
 }
 
+/// Canonical paths of the files a source device is read from: an image file and its extents,
+/// and the backing file of a disk of a file-backed platform (`--disk-file`), whose disk path
+/// is the file itself.
+fn source_backing_files(platform: &dyn Platform, files: Vec<PathBuf>, disk: Option<u32>) -> Vec<PathBuf> {
+    let mut v = files;
+    let disk_path = disk.and_then(|i| {
+        platform.enumerate_disks().ok()?.into_iter().find(|d| d.index == i).map(|d| PathBuf::from(d.path))
+    });
+    if let Some(c) = disk_path.filter(|p| p.is_file()).and_then(|p| existing_canonical(&p)) {
+        v.push(c);
+    }
+    v
+}
+
 /// Refuse when any file the output would create or replace is one of the files `read_from`
 /// is being read from (the output is written before the source is fully read).
 fn refuse_source_overwrite(read_from: &[PathBuf], written: &[PathBuf]) -> Result<(), CliError> {
@@ -63,7 +77,8 @@ pub fn run_image(
         return Err(CliError::Usage("the source is empty; nothing to image".into()));
     }
     let partial = Partial::new(file, fmt);
-    refuse_source_overwrite(&source.source_files(), &partial.files_written())?;
+    let read_from = source_backing_files(platform, source.source_files(), source.disk_index());
+    refuse_source_overwrite(&read_from, &partial.files_written())?;
 
     // Everything that can be refused is refused before any output file is touched.
     let mut shared = SharedSource::new(source.dev);
@@ -133,7 +148,15 @@ pub fn run_image_rescue(
         },
         _ => None,
     };
+    let mut written = Partial::new(file, fmt).files_written();
+    written.push(pm_ops::mapfile_path(file, &settings));
     if let Some(op) = op {
+        // the same guard as every other image export: a disk of `--disk-file` is a file
+        let disk = match &op {
+            Operation::ImageDisk { disk, .. } | Operation::ImagePartition { disk, .. } => Some(*disk),
+            _ => None,
+        };
+        refuse_source_overwrite(&source_backing_files(env.platform, Vec::new(), disk), &written)?;
         let flags = RunFlags { dry_run: false, yes: true, allow_system_disk: false };
         return run_ops(env, vec![op], &flags, out);
     }
@@ -142,9 +165,8 @@ pub fn run_image_rescue(
     if source.dev.len() == 0 {
         return Err(CliError::Usage("the source is empty; nothing to image".into()));
     }
-    let mut written = Partial::new(file, fmt).files_written();
-    written.push(pm_ops::mapfile_path(file, &settings));
-    refuse_source_overwrite(&source.source_files(), &written)?;
+    let read_from = source_backing_files(env.platform, source.source_files(), source.disk_index());
+    refuse_source_overwrite(&read_from, &written)?;
     let mut shared = SharedSource::new(source.dev);
     let used = plan_used_map(&shared, mode.mode())?;
 
@@ -179,7 +201,7 @@ pub fn run_image_rescue(
     if stats.bad_bytes > 0 {
         writeln!(
             out,
-            "Unreadable data: {} in {} area(s) is zero in the image; run the same command again (more retries with -r) to retry it",
+            "Unreadable data: {} in {} area(s) is zero in the image; run the operation again with more retries (-r) to retry the unreadable areas in place",
             format_size(stats.bad_bytes),
             stats.bad_areas
         )

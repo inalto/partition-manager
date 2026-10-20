@@ -2,7 +2,8 @@
 //! [`BlockDevice`]s, driven by a [`MapFile`].
 //!
 //! The source is only ever read (`read_at`); every byte written to the destination comes
-//! from a successful source read, except zero-filled unused areas (`zero_unused`).
+//! from a successful source read, except zero-filled unused areas (`zero_unused`). With
+//! `skip_zero_writes`, blocks read as all zeros are not written at all.
 
 use super::mapfile::{BlockStatus, MapFile};
 use pm_core::{format_size, BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result};
@@ -36,6 +37,11 @@ pub struct RescueOpts {
     pub used_map: Option<UsedMap>,
     /// Write zeros to the destination for unused areas instead of leaving them untouched.
     pub zero_unused: bool,
+    /// Do not write blocks that read as all zeros (they are still marked finished). Only for
+    /// a destination that already reads as zeros everywhere, i.e. a freshly created sparse
+    /// image (VHD dynamic, VMDK sparse, qcow2), which then allocates nothing for them; never
+    /// for an existing file or a device, whose stale data would remain.
+    pub skip_zero_writes: bool,
     /// Plain clone mode: the first read error aborts with that error.
     pub abort_on_error: bool,
     /// Mapfile to resume from (if it exists) and to keep up to date.
@@ -57,6 +63,7 @@ impl Default for RescueOpts {
             no_scrape: false,
             used_map: None,
             zero_unused: false,
+            skip_zero_writes: false,
             abort_on_error: false,
             mapfile: None,
             min_read_rate: None,
@@ -221,8 +228,9 @@ impl<'a> Engine<'a> {
             0
         };
         format!(
-            "errsize {}, errors {}, rate {}/s",
+            "errsize {}, errors {}, read errors {}, rate {}/s",
             format_size(st.non_trimmed + st.non_scraped + st.bad_bytes),
+            unrescued_areas(&self.map),
             self.read_errors,
             format_size(rate)
         )
@@ -254,7 +262,10 @@ impl<'a> Engine<'a> {
         let n = n as usize;
         match self.src.read_at(pos, &mut self.buf[..n]) {
             Ok(()) => {
-                self.dst.write_at(self.dst_offset + pos, &self.buf[..n])?;
+                let data = &self.buf[..n];
+                if !(self.opts.skip_zero_writes && data.iter().all(|&b| b == 0)) {
+                    self.dst.write_at(self.dst_offset + pos, data)?;
+                }
                 self.map.mark(pos, n as u64, BlockStatus::Finished);
                 self.rescued_this_run += n as u64;
                 self.progressed(n as u64, false);
@@ -496,23 +507,12 @@ impl<'a> Engine<'a> {
     }
 
     fn stats(&self) -> RescueStats {
-        let mut bad_bytes = 0;
-        let mut bad_areas = 0;
-        let mut prev_unrescued = false;
-        for &(_, s, st) in &self.map.blocks {
-            let unrescued = st != BlockStatus::Finished;
-            if unrescued {
-                bad_bytes += s;
-                if !prev_unrescued {
-                    bad_areas += 1;
-                }
-            }
-            prev_unrescued = unrescued;
-        }
+        let bad_bytes: u64 =
+            self.map.blocks.iter().filter(|b| b.2 != BlockStatus::Finished).map(|b| b.1).sum();
         RescueStats {
             rescued: self.done(),
             bad_bytes,
-            bad_areas,
+            bad_areas: unrescued_areas(&self.map),
             read_errors: self.read_errors,
             elapsed_secs: self.start.elapsed().as_secs_f64(),
             passes: self.passes,
@@ -646,11 +646,27 @@ pub fn rescue(
     Ok(eng.stats())
 }
 
-fn final_detail(map: &MapFile, errors: u64) -> String {
+/// Number of maximal areas that are not finished (bad, non-tried, non-trimmed or
+/// non-scraped, adjacent ones counted once): what ddrescue reports as "errors".
+pub(crate) fn unrescued_areas(map: &MapFile) -> u64 {
+    let mut areas = 0;
+    let mut prev_unrescued = false;
+    for &(_, size, st) in &map.blocks {
+        let unrescued = st != BlockStatus::Finished && size > 0;
+        if unrescued && !prev_unrescued {
+            areas += 1;
+        }
+        prev_unrescued = unrescued;
+    }
+    areas
+}
+
+fn final_detail(map: &MapFile, read_errors: u64) -> String {
     let st = map.stats();
     format!(
-        "errsize {}, errors {errors}, finished",
-        format_size(st.non_trimmed + st.non_scraped + st.bad_bytes)
+        "errsize {}, errors {}, read errors {read_errors}, finished",
+        format_size(st.non_trimmed + st.non_scraped + st.bad_bytes),
+        unrescued_areas(map)
     )
 }
 

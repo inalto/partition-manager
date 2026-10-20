@@ -109,9 +109,9 @@ pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
             }
             Ok(())
         }
-        Operation::ImageDisk { path, rescue: Some(r), .. }
-        | Operation::ImagePartition { path, rescue: Some(r), .. } => {
-            steps::image::check_rescue_settings(path, r)
+        Operation::ImageDisk { path, format, rescue: Some(r), .. }
+        | Operation::ImagePartition { path, format, rescue: Some(r), .. } => {
+            steps::image::check_rescue_settings(path, *format, r)
         }
         _ => {
             for (src_disk, p, _) in steps::clone::smaller_targets(model, op) {

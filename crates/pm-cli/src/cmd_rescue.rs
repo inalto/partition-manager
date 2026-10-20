@@ -81,6 +81,7 @@ fn render_block(p: &ProgressReport, ipos: u64) -> Vec<String> {
     };
     let errsize = detail_field(&p.detail, "errsize").unwrap_or("-");
     let errors = detail_field(&p.detail, "errors").unwrap_or("-");
+    let read_errors = detail_field(&p.detail, "read errors").unwrap_or("-");
     vec![
         format!("     ipos: {:<12}   phase: {}", format_size(ipos), p.phase),
         format!(
@@ -88,7 +89,7 @@ fn render_block(p: &ProgressReport, ipos: u64) -> Vec<String> {
             format_size(p.done),
             format_size(p.total)
         ),
-        format!("  errsize: {errsize:<12}   errors: {errors}"),
+        format!("  errsize: {errsize:<12}   errors: {errors:<6}   read errors: {read_errors}"),
         format!("     rate: {:<12}   ETA: {eta}", format!("{}/s", format_size(p.rate_bps.max(0.0) as u64))),
     ]
 }
@@ -373,7 +374,9 @@ pub fn run(
         writeln!(out, "Created {} ({}, {})", c.path.display(), c.fmt.display(), format_size(c.capacity))
             .map_err(|e| CliError::Runtime(Error::io(0, 0, e)))?;
     }
-    let r = run_rescue(platform, a, cancel, out);
+    // a new sparse image reads as zeros: its zero blocks need not be written (or allocated)
+    let fresh_sparse = created.as_ref().is_some_and(|c| c.fmt.is_sparse());
+    let r = run_rescue(platform, a, fresh_sparse, cancel, out);
     if let (Err(_), Some(c)) = (&r, &created) {
         // nothing to resume without a mapfile: do not leave an empty image behind
         if !a.mapfile.exists() {
@@ -386,6 +389,7 @@ pub fn run(
 fn run_rescue(
     platform: &dyn Platform,
     a: &RescueArgs,
+    fresh_sparse: bool,
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -410,6 +414,7 @@ fn run_rescue(
         }
     }
     let mut opts = opts_from_args(a, source.dev.sector_size())?;
+    opts.skip_zero_writes = fresh_sparse;
     let len = source.dev.len();
     let (mut target, session) = open_writable(platform, &source, probe, &a.dst, a.dst_offset)?;
     let shared = SharedSource::new(source.dev);

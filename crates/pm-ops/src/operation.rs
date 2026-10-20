@@ -51,7 +51,9 @@ pub enum BootFix {
 /// copy. A failed block is skipped, then trimmed, scraped and retried sector by sector;
 /// sectors that stay unreadable are left unwritten in the image, which reads them as zeros.
 /// A ddrescue mapfile records what was rescued, so an interrupted export resumes from
-/// `<image>.partial` when the same operation runs again.
+/// `<image>.partial` when the same operation runs again; once the image is finished, run the
+/// operation again with more retries to retry the unreadable areas in place (only they are
+/// read, into the existing image).
 ///
 /// The defaults are those of `pm rescue`: 128 KiB reads, a 64 KiB initial skip that doubles
 /// on further errors, trimming and scraping on, no retry passes.

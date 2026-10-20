@@ -118,13 +118,88 @@ fn image_in_rescue_mode_pads_bad_sectors_and_writes_mapfile() {
     assert_eq!(st.mapfile.as_deref(), Some(map_path.as_path()));
     assert!(p.write_sessions_log().is_empty(), "imaging never writes a disk");
 
-    // the same export again: the kept mapfile of the finished image is not "resumed" into a
-    // new, empty image; the export starts over and produces the same image
+    // a mapfile whose image is gone is not "resumed" into a new, empty image: the export
+    // starts over and produces the same image
+    std::fs::remove_file(&img).unwrap();
     let r = run(&p, &op);
     assert_eq!(r.failed, None, "{:#?}", r.log);
     assert!(r.log.iter().any(|l| l.contains("starts over")), "{:#?}", r.log);
     assert!(image_bytes(&img) == expected);
     assert_eq!(mapfile(&map_path).ranges(BlockStatus::Bad), vec![(bad[0], 512), (bad[1], 512)]);
+}
+
+#[test]
+fn image_rescue_retries_bad_areas_in_place() {
+    let len = 4 * MIB;
+    let src = gpt_source(len);
+    let bad = [MIB + 3 * 512, 2 * MIB + 64 * 1024 + 7 * 512];
+    let p = platform_with(Box::new(FaultyDevice::new(MemDevice::from_vec(src.clone()), bad.to_vec(), HashMap::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.vmdk");
+    let map_path = with_suffix(&img, ".map");
+    let op = image_disk(&img, ImageFormat::VmdkSparse, Some(RescueSettings { retries: 2, ..Default::default() }));
+
+    // run 1: the two sectors stay unreadable
+    let r = run(&p, &op);
+    assert_eq!(r.failed, None, "{:#?}", r.log);
+    assert_eq!(mapfile(&map_path).ranges(BlockStatus::Bad), vec![(bad[0], 512), (bad[1], 512)]);
+
+    // run 2: the drive now reads them after one more failure each; only they are read, into
+    // the finished image, which is not replaced
+    let armed = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let transient: HashMap<u64, u32> = bad.iter().map(|&b| (b, 1)).collect();
+    let dev = Watched {
+        inner: FaultyDevice::new(MemDevice::from_vec(src.clone()), vec![], transient),
+        armed: armed.clone(),
+        slow: Arc::new(AtomicBool::new(false)),
+        reads: reads.clone(),
+    };
+    p.add_device(1, Box::new(dev), meta(1));
+    let a = armed.clone();
+    let sink = FnProgress(move |_: &ProgressReport| a.store(true, Ordering::SeqCst));
+    let r = run_with(&p, &op, &sink, &CancelToken::new());
+    assert_eq!(r.failed, None, "{:#?}", r.log);
+    assert!(r.log.iter().any(|l| l.contains("retrying 2 unreadable areas in")), "{:#?}", r.log);
+    assert!(!with_suffix(&img, ".partial").exists(), "retried in place, no new image");
+    assert!(image_bytes(&img) == src, "the image is complete");
+    let map = mapfile(&map_path);
+    assert_eq!(map.ranges(BlockStatus::Finished), vec![(0, len)]);
+    let seen = reads.lock().unwrap().clone();
+    assert!(!seen.is_empty());
+    for r in &seen {
+        assert!(bad.iter().any(|&b| r.0 >= b && r.0 + r.1 <= b + 512), "read {r:?} outside the bad areas");
+    }
+    assert!(r.rescue_stats[0].bad_areas == 0);
+
+    // run 3: nothing left to retry, nothing read
+    reads.lock().unwrap().clear();
+    armed.store(false, Ordering::SeqCst);
+    let a = armed.clone();
+    let sink = FnProgress(move |_: &ProgressReport| a.store(true, Ordering::SeqCst));
+    let r = run_with(&p, &op, &sink, &CancelToken::new());
+    assert_eq!(r.failed, None, "{:#?}", r.log);
+    assert!(r.log.iter().any(|l| l.contains("nothing to retry")), "{:#?}", r.log);
+    assert!(reads.lock().unwrap().is_empty());
+    assert!(image_bytes(&img) == src);
+}
+
+#[test]
+fn image_rescue_qcow2_of_a_mostly_empty_disk_stays_small() {
+    let len = 64 * MIB;
+    let mut dev = MemDevice::new(len);
+    dev.write_at(10 * MIB, &pattern(MIB)).unwrap();
+    let p = platform_with(Box::new(dev));
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("sparse.qcow2");
+    let r = run(&p, &image_disk(&img, ImageFormat::Qcow2, Some(RescueSettings::default())));
+    assert_eq!(r.failed, None, "{:#?}", r.log);
+    let size = std::fs::metadata(&img).unwrap().len();
+    assert!(size < 4 * MIB, "zero blocks are not written into a new sparse image ({size} bytes)");
+    let bytes = image_bytes(&img);
+    assert!(bytes[10 * MIB as usize..11 * MIB as usize] == pattern(MIB)[..]);
+    assert!(bytes[..10 * MIB as usize].iter().chain(&bytes[11 * MIB as usize..]).all(|&b| b == 0));
+    assert_eq!(mapfile(&with_suffix(&img, ".map")).ranges(BlockStatus::Finished), vec![(0, len)]);
 }
 
 #[test]

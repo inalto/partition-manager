@@ -36,7 +36,7 @@ pub const MAX_RETRIES: u32 = 10;
 /// Why `map` cannot be the mapfile of the rescue-mode image `image`, if it cannot: the same
 /// rules as the Rescue wizard (a full path whose folder exists, not on a drive of the source),
 /// and not the image itself.
-pub fn mapfile_problem(map: &str, image: &str, source_letters: &[char]) -> Option<String> {
+pub fn mapfile_problem(map: &str, image: &str, format: ImageFormat, source_letters: &[char]) -> Option<String> {
     let t = map.trim();
     if t.is_empty() {
         return Some("Enter the mapfile path.".into());
@@ -57,8 +57,18 @@ pub fn mapfile_problem(map: &str, image: &str, source_letters: &[char]) -> Optio
         None => return Some("Enter a full path for the mapfile.".into()),
     }
     let image = image.trim();
-    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-    if same(t, image) || same(t, &format!("{image}.partial")) {
+    let partial = format!("{image}.partial");
+    let mut files = vec![image.to_string(), partial.clone()];
+    if format == ImageFormat::VmdkFlat {
+        // pm-image writes the data of a flat VMDK to `<stem>-flat.vmdk` next to the descriptor
+        for d in [image, partial.as_str()] {
+            let d = Path::new(d);
+            if let Some(stem) = d.file_stem().and_then(|s| s.to_str()) {
+                files.push(d.with_file_name(format!("{stem}-flat.vmdk")).display().to_string());
+            }
+        }
+    }
+    if files.iter().any(|f| t.eq_ignore_ascii_case(f)) {
         return Some("The mapfile cannot be the image file itself.".into());
     }
     None
@@ -167,7 +177,7 @@ impl ImageCreateState {
         if !self.rescue {
             return None;
         }
-        mapfile_problem(&self.mapfile_path(), &self.path, &self.source_letters)
+        mapfile_problem(&self.mapfile_path(), &self.path, self.format, &self.source_letters)
     }
 
     /// The rescue settings of the operation (`None` unless rescue mode is on).
@@ -503,6 +513,13 @@ mod tests {
         assert!(problem(&mut s, dir.path().join("missing").join("x.map").display().to_string()).contains("does not exist"));
         let image = s.path.clone();
         assert!(problem(&mut s, image).contains("cannot be the image"));
+        // a flat VMDK's extent is part of the image too
+        s.format = ImageFormat::VmdkFlat;
+        s.path = dir.path().join("data.vmdk").display().to_string();
+        assert!(problem(&mut s, dir.path().join("data-flat.vmdk").display().to_string()).contains("cannot be the image"));
+        assert!(problem(&mut s, dir.path().join("data.vmdk.partial").display().to_string()).contains("cannot be the image"));
+        s.format = ImageFormat::VhdDynamic;
+        s.path = dir.path().join("data.vhd").display().to_string();
         assert!(problem(&mut s, dir.path().join("ok.map").display().to_string()).is_empty());
 
         // rescue mode off: the mapfile is not used, so it is not checked

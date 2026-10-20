@@ -483,3 +483,45 @@ fn rescue_block_size_clamped() {
     assert_eq!(src.read_log(), vec![(0, LEN as usize)]);
     assert!(dst.as_slice() == &pattern()[..]);
 }
+
+#[test]
+fn rescue_skip_zero_writes_leaves_zero_blocks_unwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let mf = dir.path().join("zero.map");
+    let len = 1u64 << 20;
+    let mut src = MemDevice::new(len);
+    // the destination counts its writes
+    let mut dst = FaultyDevice::new(MemDevice::new(len), vec![], HashMap::new());
+    let opts = RescueOpts { mapfile: Some(mf.clone()), skip_zero_writes: true, ..RescueOpts::default() };
+    let st = rescue(&mut src, &mut dst, 0, &opts, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!((st.rescued, st.bad_bytes, st.bad_areas), (len, 0, 0));
+    assert_eq!(dst.write_count(), 0, "an all-zero source writes nothing");
+    let m = MapFile::load(&mf).unwrap();
+    assert_eq!(m.ranges(BlockStatus::Finished), vec![(0, len)], "zero blocks are still rescued");
+
+    // non-zero blocks are written; without the option every block is
+    src.write_at(300 << 10, &[7; 4096]).unwrap();
+    let mf2 = dir.path().join("some.map");
+    let mut dst = FaultyDevice::new(MemDevice::new(len), vec![], HashMap::new());
+    let opts = RescueOpts { mapfile: Some(mf2), skip_zero_writes: true, ..RescueOpts::default() };
+    rescue(&mut src, &mut dst, 0, &opts, &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(dst.write_count(), 1, "only the 128 KiB block holding data");
+    assert_eq!(dst.inner().as_slice(), src.as_slice());
+    let mut dst = FaultyDevice::new(MemDevice::new(len), vec![], HashMap::new());
+    rescue(&mut src, &mut dst, 0, &RescueOpts::default(), &NullProgress, &CancelToken::new()).unwrap();
+    assert_eq!(dst.write_count(), len / (128 << 10));
+}
+
+#[test]
+fn rescue_detail_counts_unrescued_areas_and_read_errors_separately() {
+    // two bad sectors far apart: 2 unrescued areas, more failed reads than that
+    let mut src = faulty(&[0x10000, 0x40000], &[]);
+    let mut dst = MemDevice::new(LEN);
+    let reports = Mutex::new(Vec::<ProgressReport>::new());
+    let sink = FnProgress(|p: &ProgressReport| reports.lock().unwrap().push(p.clone()));
+    let st = rescue(&mut src, &mut dst, 0, &RescueOpts::default(), &sink, &CancelToken::new()).unwrap();
+    assert_eq!(st.bad_areas, 2);
+    assert!(st.read_errors > 2, "{}", st.read_errors);
+    let last = reports.lock().unwrap().last().unwrap().detail.clone();
+    assert!(last.contains("errors 2,") && last.contains(&format!("read errors {}", st.read_errors)), "{last}");
+}

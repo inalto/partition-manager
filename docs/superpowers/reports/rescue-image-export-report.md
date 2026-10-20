@@ -217,3 +217,97 @@ doc-tests (9 crates)       ok. 0 passed; 0 failed; 0 ignored
 6. The GUI page exposes no cluster-size field (engine default 128 KiB); `RescueSettings`
    supports it for the CLI and JSON.
 7. Not verified in the running GUI app (unit tests and an offscreen egui render only).
+
+## Fix round 1
+
+Review findings 1-3, improvement 4 and the minors, in one commit.
+
+1. **Retry in place (Important).** `export_rescue_image` (so the executor step, `pm image
+   --rescue` on any source, and through the engine `pm rescue ... --format` on an existing
+   image) now has four cases: `.partial` + mapfile → resume the partial; finished image +
+   mapfile (no partial) → reopen the finished image read-write (same format/capacity checks,
+   shared `reopen_image`), load the mapfile (unreadable or wrong length → refused, nothing
+   touched), log `retrying N unreadable areas in <image>` (or `nothing to retry: ...` when all
+   `+`), run the engine with the requested retries, no rename, and on error keep both files;
+   mapfile only (image gone) → starts over (logged); no mapfile → new image (replaces an
+   existing one, as before). The messages now say to run the operation again with more
+   retries to retry the unreadable areas in place (`pm image --rescue` output, GUI
+   `rescue_lines`, `RescueSettings` doc, `pm image --help`/CLI.md, README).
+   Test `image_rescue_retries_bad_areas_in_place`: run 1 with 2 permanent bad sectors →
+   2 `-` areas; run 2 with the device replaced by one where those sectors are transient →
+   log `retrying 2 unreadable areas in`, no `.partial`, image complete, map all `+`, every
+   engine read inside a bad sector; run 3 → `nothing to retry`, no reads. The first test now
+   covers "starts over" only when the image itself is gone. CLI: running `pm image --rescue`
+   again on a finished export prints `nothing to retry`.
+2. **Source-overwrite guard on the `disk:` branch (Important).** `run_image_rescue` runs
+   `refuse_source_overwrite` before `run_ops`, over the image, its `.partial`, flat extents
+   and the mapfile, against the backing file of a file-backed disk (`--disk-file`: the disk
+   path is the file). The same backing-file check now also covers plain `pm image disk:N`
+   and the non-disk rescue branch. Test `cli_image_rescue_refuses_to_overwrite_a_disk_file_source`
+   (`--rescue`, plain `--sector`, and `--mapfile <source>`: exit 1, source unchanged, no files
+   created).
+3. **GUI leftover mapfile (Important).** `rescue::missing_image_problem`: a mapfile that exists
+   while the destination image file does not → "The mapfile ... was found but the image ...
+   is missing; delete the mapfile to start over." Checked on the Mapfile page, in `start`, and
+   in the worker's `recheck`. Test `a_leftover_mapfile_without_its_image_is_refused`.
+4. **Sparse destinations (Improvement).** `RescueOpts.skip_zero_writes`: an all-zero block is
+   not written (still marked `+`). Set only for a freshly created sparse image (VHD dynamic,
+   VMDK sparse, qcow2): plain and rescue image steps (fresh create only; never on resume or in
+   place), `pm rescue` when it creates the destination, and the GUI Rescue wizard when it
+   creates the destination file. Tests: engine `rescue_skip_zero_writes_leaves_zero_blocks_unwritten`
+   (all-zero source → 0 `write_at` on a counting destination, map all `+`; one data block → 1
+   write; without the option every block is written), executor
+   `image_rescue_qcow2_of_a_mostly_empty_disk_stays_small` (64 MiB source, 1 MiB data → qcow2
+   < 4 MiB, contents correct), CLI `pm rescue` into a new qcow2 stays < 1 MiB.
+5. **Minors.** Report lines only for images with a mapfile or `bad_areas > 0` (numbering keeps
+   the image's position in the run). The engine's live and final detail now say
+   `errors <unrescued areas>, read errors <failed reads>` (new engine test
+   `rescue_detail_counts_unrescued_areas_and_read_errors_separately`); the `pm rescue` status
+   block shows both, the GUI live status parses both. The flat VMDK `-flat.vmdk` of the image
+   and of its `.partial` count as "the image" in `check_rescue_settings` (now takes the format)
+   and in the GUI `mapfile_problem`.
+
+RED evidence: with `pm-ops/src/steps/image.rs` + `executor.rs` reverted, the new executor
+tests failed (`image_rescue_qcow2_of_a_mostly_empty_disk_stays_small`: 67436544-byte qcow2;
+`image_rescue_retries_bad_areas_in_place`: no `retrying` line, the export started over). With
+`pm-cli/src/cmd_image.rs` reverted, `cli_image_rescue_refuses_to_overwrite_a_disk_file_source`
+failed (the rescue export of `disk:0` onto its own backing file ran). The engine, GUI and
+`missing_image_problem` tests use items that did not exist before (no compile without the fix);
+they were not run red separately.
+
+Final `cargo test --workspace --no-fail-fast`: exit 0, 639 passed, 0 failed, 3 ignored; zero
+warnings in the test and normal builds. Changed counts: `pm-cli cli_image 18`, `pm-gui lib 128`,
+`pm-image rescue 20`, `pm-ops executor_rescue 8`; the others are as listed above.
+
+```text
+pm-analyze  lib/bench/smart/space/surface   ok. 0/6/3/5/3 passed; 0 failed
+pm-cli      bin pm                          ok. 51 passed; 0 failed; 0 ignored
+pm-cli      cli                             ok. 7 passed; 0 failed; 0 ignored
+pm-cli      cli_image                       ok. 18 passed; 0 failed; 0 ignored
+pm-cli      cli_ops                         ok. 19 passed; 0 failed; 0 ignored
+pm-core     lib                             ok. 25 passed; 0 failed; 0 ignored
+pm-fs       lib/bitmap/detect/exfat/ext/fat/fat_corrupt/fat_undelete/ntfs (+3 builders)
+                                            ok. 8/5/6/15/9/10/11/2/7 (0/0/0) passed; 0 failed
+pm-gui      lib                             ok. 128 passed; 0 failed; 0 ignored
+pm-gui      bin                             ok. 0 passed; 0 failed; 0 ignored
+pm-image    lib                             ok. 17 passed; 0 failed; 0 ignored
+pm-image    formats                         ok. 20 passed; 0 failed; 0 ignored
+pm-image    mapfile                         ok. 7 passed; 0 failed; 0 ignored
+pm-image    rescue                          ok. 20 passed; 0 failed; 0 ignored
+pm-ops      lib                             ok. 4 passed; 0 failed; 0 ignored
+pm-ops      executor                        ok. 31 passed; 0 failed; 0 ignored
+pm-ops      executor_rescue                 ok. 8 passed; 0 failed; 0 ignored
+pm-ops      planner                         ok. 20 passed; 0 failed; 0 ignored
+pm-parttable lib/convert/gpt/mbr/search     ok. 1/8/19/29/6 passed; 0 failed
+pm-platform lib                             ok. 54 passed; 0 failed; 0 ignored
+pm-platform file_platform                   ok. 4 passed; 0 failed; 0 ignored
+pm-platform mock                            ok. 7 passed; 0 failed; 0 ignored
+pm-platform windows_live                    ok. 0 passed; 0 failed; 3 ignored
+pm-recover  lib/carve/files/partitions/session  ok. 3/24/5/9/5 passed; 0 failed
+doc-tests (9 crates)                        ok. 0 passed; 0 failed; 0 ignored
+```
+
+Notes: the in-place retry relies on the kept mapfile matching the finished image. A user who
+edits the image in between is not detected (the format and capacity are checked, the content
+is not). The backing-file guard recognises file-backed disks by their `DiskInfo.path` being an
+existing file. Real `\.\PhysicalDriveN` paths are not files, so nothing changes for them.

@@ -129,6 +129,21 @@ pub struct Resume {
     pub bad: u64,
 }
 
+/// Why `mapfile` cannot be used with `dest`, if it cannot: it exists while the destination
+/// image file does not, so resuming would mark areas rescued that are not in the new image
+/// (they would silently stay zero).
+pub fn missing_image_problem(dest: &Dest, mapfile: &str) -> Option<String> {
+    let Dest::File(f) = dest else { return None };
+    let (img, map) = (Path::new(f.trim()), Path::new(mapfile.trim()));
+    (!f.trim().is_empty() && !mapfile.trim().is_empty() && !img.exists() && map.is_file()).then(|| {
+        format!(
+            "The mapfile {} was found but the image {} is missing; delete the mapfile to start over.",
+            map.display(),
+            img.display()
+        )
+    })
+}
+
 /// Read the mapfile at `path` (small text file) for the resume notice.
 pub fn probe_mapfile(path: &str) -> Result<Option<Resume>, String> {
     let p = Path::new(path.trim());
@@ -294,7 +309,10 @@ fn recheck(fresh: &Model, plan: &Plan) -> Result<(u64, u64), String> {
         }
     }
     let mapfile = plan.mapfile.display().to_string();
-    if let Some(e) = mapfile_path_problem(&mapfile).or_else(|| rescue_path_problem(fresh, plan.src, &dest, &mapfile, "mapfile")) {
+    if let Some(e) = mapfile_path_problem(&mapfile)
+        .or_else(|| rescue_path_problem(fresh, plan.src, &dest, &mapfile, "mapfile"))
+        .or_else(|| missing_image_problem(&dest, &mapfile))
+    {
         return Err(e);
     }
     Ok(src_now)
@@ -340,6 +358,8 @@ fn run_rescue(
                 pm_image::open(path, false)?
             } else {
                 let opts = pm_image::CreateOpts { format: *format, capacity: align_up(len.max(512), 512), sparse: true };
+                // a new sparse image reads as zeros: its zero blocks need no clusters
+                plan.opts.skip_zero_writes = format.is_sparse();
                 pm_image::create(path, &opts)?
             };
             let r = rescue(&mut src, &mut *out, 0, &plan.opts, progress, cancel);
@@ -459,6 +479,9 @@ impl RescueWizard {
                 return Err(e);
             }
         }
+        if let Some(e) = missing_image_problem(&self.dest, &self.mapfile) {
+            return Err(e);
+        }
         self.resume_info()
     }
 
@@ -477,6 +500,10 @@ impl RescueWizard {
 
     fn start(&mut self, env: &ToolEnv) {
         let (Some(src), Ok(opts)) = (self.src, self.opts()) else { return };
+        if let Some(e) = missing_image_problem(&self.dest, &self.mapfile) {
+            self.error = Some(e);
+            return;
+        }
         let gone = || "The source or destination no longer exists; set the rescue up again.".to_string();
         let Some(src_range) = src.range(env.live) else {
             self.error = Some(gone());
@@ -655,7 +682,8 @@ impl RescueWizard {
             let live = RescueStats {
                 rescued: p.done,
                 bad_bytes: detail("errsize").and_then(|v| parse_size(&v).ok()).unwrap_or(0),
-                read_errors: detail("errors").and_then(|v| v.parse().ok()).unwrap_or(0),
+                bad_areas: detail("errors").and_then(|v| v.parse().ok()).unwrap_or(0),
+                read_errors: detail("read errors").and_then(|v| v.parse().ok()).unwrap_or(0),
                 elapsed_secs: t.elapsed().as_secs_f64(),
                 ..Default::default()
             };
@@ -1025,6 +1053,37 @@ mod tests {
         let mut buf = [0u8; 4096];
         copy.read_at(MIB, &mut buf).unwrap();
         assert_eq!(buf, [0xAB; 4096]);
+    }
+
+    #[test]
+    fn a_leftover_mapfile_without_its_image_is_refused() {
+        use crate::tools::test_env::{model, platform};
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("gone.img");
+        let map = dir.path().join("gone.img.map");
+        std::fs::write(&map, MapFile::new(MIB).render(&[])).unwrap();
+        let dest = Dest::File(img.display().to_string());
+        let map_s = map.display().to_string();
+        let e = missing_image_problem(&dest, &map_s).unwrap();
+        assert!(e.contains("missing") && e.contains("delete the mapfile to start over"), "{e}");
+        // no mapfile: a new rescue; an existing image: a resume; a device: not a file
+        assert!(missing_image_problem(&dest, &dir.path().join("new.map").display().to_string()).is_none());
+        assert!(missing_image_problem(&Dest::Device(Device::Disk(0)), &map_s).is_none());
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        assert!(missing_image_problem(&dest, &map_s).is_none());
+        std::fs::remove_file(&img).unwrap();
+
+        // in the wizard: the mapfile page and the start both refuse, nothing is created
+        let (m, p) = (model(), platform());
+        let env = ToolEnv { platform: &p, live: &m, pending: &[] };
+        let mut w = RescueWizard::new(Some(Device::Partition(1, 3)));
+        w.dest = dest;
+        w.mapfile = map_s;
+        assert!(w.mapfile_problem(&env).unwrap_err().contains("missing"));
+        w.start(&env);
+        assert!(w.task.is_none(), "no rescue started");
+        assert!(w.error.as_deref().is_some_and(|e| e.contains("missing")), "{:?}", w.error);
+        assert!(!img.exists());
     }
 
     #[test]
