@@ -368,43 +368,54 @@ pub fn wizard_window(
     body: impl FnOnce(&mut egui::Ui) -> Footer,
 ) -> Nav {
     let mut nav = Nav::Stay;
-    let center = ctx.screen_rect().center();
+    let screen = ctx.screen_rect();
+    let center = screen.center();
+    // Keep the window inside the viewport: the body is height-bounded (a vertical separator
+    // in a horizontal layout would otherwise stretch to the bottom of the screen).
+    let body_h = crate::dialogs::wizard_body_height(ctx, 560.0);
+    let scroll_h = crate::dialogs::wizard_scroll_height(body_h);
+    let max_w = (screen.width() - 40.0).max(400.0);
+    let max_h = (screen.height() - 40.0).max(260.0);
     egui::Window::new(title)
         .id(egui::Id::new(("job_wizard", title)))
         .collapsible(false)
         .resizable(true)
         .pivot(Align2::CENTER_CENTER)
         .default_pos(center)
-        .default_size([880.0, 560.0])
+        .default_size([880.0_f32.min(max_w), 560.0_f32.min(max_h)])
+        .max_size([max_w, max_h])
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             let mut footer = Footer::default();
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(150.0);
-                    for (i, t) in pages.iter().enumerate() {
-                        let text = format!("{}. {t}", i + 1);
-                        ui.label(match i.cmp(&idx) {
-                            std::cmp::Ordering::Equal => RichText::new(text).strong(),
-                            std::cmp::Ordering::Less => RichText::new(text),
-                            std::cmp::Ordering::Greater => RichText::new(text).weak(),
-                        });
-                        ui.add_space(2.0);
-                    }
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.set_min_width(640.0);
-                    ui.set_min_height(380.0);
-                    ui.heading(pages.get(idx).copied().unwrap_or(""));
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(480.0).auto_shrink([false, true]).show(ui, |ui| {
-                        footer = body(ui);
+            ui.scope(|ui| {
+                ui.set_max_height(body_h);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        for (i, t) in pages.iter().enumerate() {
+                            let text = format!("{}. {t}", i + 1);
+                            ui.label(match i.cmp(&idx) {
+                                std::cmp::Ordering::Equal => RichText::new(text).strong(),
+                                std::cmp::Ordering::Less => RichText::new(text),
+                                std::cmp::Ordering::Greater => RichText::new(text).weak(),
+                            });
+                            ui.add_space(2.0);
+                        }
                     });
-                    if let Some(p) = footer.problem.as_ref().filter(|p| !p.is_empty()) {
-                        ui.add_space(4.0);
-                        danger(ui, p.as_str());
-                    }
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_min_width(640.0_f32.min(max_w - 200.0));
+                        ui.set_min_height(body_h.min(380.0));
+                        ui.heading(pages.get(idx).copied().unwrap_or(""));
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical().max_height(scroll_h).auto_shrink([false, true]).show(ui, |ui| {
+                            footer = body(ui);
+                        });
+                        if let Some(p) = footer.problem.as_ref().filter(|p| !p.is_empty()) {
+                            ui.add_space(4.0);
+                            danger(ui, p.as_str());
+                        }
+                    });
                 });
             });
             ui.separator();

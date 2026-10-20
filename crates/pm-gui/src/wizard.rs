@@ -286,44 +286,52 @@ impl Wizard {
             return WizardOutcome::Cancelled;
         }
         let titles = self.page_titles();
-        crate::dialogs::modal_window(self.title.clone()).min_width(660.0).show(ctx, |ui| {
-            ui.horizontal_top(|ui| {
-                // step list
-                ui.vertical(|ui| {
-                    ui.set_width(150.0);
-                    for (i, t) in titles.iter().enumerate() {
-                        let text = format!("{}. {t}", i + 1);
-                        let rt = if i == self.idx {
-                            RichText::new(text).strong()
-                        } else if i < self.idx {
-                            RichText::new(text)
-                        } else {
-                            RichText::new(text).weak()
-                        };
-                        ui.label(rt);
-                        ui.add_space(2.0);
-                    }
-                });
-                ui.separator();
-                // page
-                ui.vertical(|ui| {
-                    ui.set_width(500.0);
-                    ui.set_min_height(320.0);
-                    ui.heading(&titles[self.idx]);
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(440.0).auto_shrink([false, true]).show(ui, |ui| {
-                        if self.on_summary() {
-                            self.valid = self.summary_page(ui, wctx.model);
-                        } else {
-                            self.valid = self.steps[self.idx].ui(ui, wctx);
+        // Bound the body to the viewport: columns and vertical separators would otherwise
+        // stretch to the bottom of the screen and push the footer off it.
+        let body_h = crate::dialogs::wizard_body_height(ctx, 520.0);
+        let scroll_h = crate::dialogs::wizard_scroll_height(body_h);
+        let max_w = (ctx.screen_rect().width() - 40.0).max(400.0);
+        crate::dialogs::modal_window(self.title.clone()).min_width(660.0_f32.min(max_w)).max_width(max_w).show(ctx, |ui| {
+            ui.scope(|ui| {
+                ui.set_max_height(body_h);
+                ui.horizontal_top(|ui| {
+                    // step list
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        for (i, t) in titles.iter().enumerate() {
+                            let text = format!("{}. {t}", i + 1);
+                            let rt = if i == self.idx {
+                                RichText::new(text).strong()
+                            } else if i < self.idx {
+                                RichText::new(text)
+                            } else {
+                                RichText::new(text).weak()
+                            };
+                            ui.label(rt);
+                            ui.add_space(2.0);
                         }
                     });
-                    if let StepResult::Invalid(msg) = &self.valid {
-                        if !msg.is_empty() {
-                            ui.add_space(4.0);
-                            ui.colored_label(DANGER, format!("{} {msg}", icons::WARNING));
+                    ui.separator();
+                    // page
+                    ui.vertical(|ui| {
+                        ui.set_width(500.0_f32.min(max_w - 200.0));
+                        ui.set_min_height(body_h.min(320.0));
+                        ui.heading(&titles[self.idx]);
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical().max_height(scroll_h).auto_shrink([false, true]).show(ui, |ui| {
+                            if self.on_summary() {
+                                self.valid = self.summary_page(ui, wctx.model);
+                            } else {
+                                self.valid = self.steps[self.idx].ui(ui, wctx);
+                            }
+                        });
+                        if let StepResult::Invalid(msg) = &self.valid {
+                            if !msg.is_empty() {
+                                ui.add_space(4.0);
+                                ui.colored_label(DANGER, format!("{} {msg}", icons::WARNING));
+                            }
                         }
-                    }
+                    });
                 });
             });
             ui.separator();
@@ -422,6 +430,46 @@ mod tests {
         let wctx = WizardCtx::new(m, vec!['F', 'g', 'E'], Selected::Partition(1, 3));
         let _ = ctx.run(egui::RawInput::default(), |ctx| out = w.show(ctx, &wctx));
         out
+    }
+
+    /// A step whose page is much taller than any screen: the window must still fit.
+    struct Tall;
+    impl WizardStep for Tall {
+        fn title(&self) -> &str {
+            "Tall"
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
+            for i in 0..200 {
+                ui.label(format!("row {i}"));
+            }
+            ui.separator();
+            StepResult::Continue
+        }
+        fn summary(&self) -> Vec<(String, String)> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn wizard_window_fits_a_short_viewport() {
+        let m = model_of(vec![gpt_disk(1)]);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let mut w = Wizard::new("Tall wizard", vec![Box::new(Tall)], Box::new(|_| Ok(vec![])));
+        let wctx = WizardCtx::new(&m, vec!['E'], Selected::Disk(1));
+        // a few frames so the window settles on its final size
+        for _ in 0..3 {
+            let _ = ctx.run(input(), |ctx| {
+                w.show(ctx, &wctx);
+            });
+        }
+        let rect = ctx
+            .memory(|mem| mem.area_rect(egui::Id::new("Tall wizard")))
+            .expect("the wizard window was laid out");
+        assert!(rect.min.y >= 0.0 && rect.max.y <= screen.max.y, "window {rect:?} leaves the {screen:?} viewport vertically");
+        assert!(rect.min.x >= 0.0 && rect.max.x <= screen.max.x, "window {rect:?} leaves the viewport horizontally");
+        assert!(rect.height() < screen.height(), "window {rect:?} must leave room around it");
     }
 
     #[test]

@@ -21,6 +21,25 @@ pub(crate) fn modal_window(title: impl Into<egui::WidgetText>) -> egui::Window<'
         .order(egui::Order::Foreground)
 }
 
+/// Height budget for the body of a multi-page dialog (step list + page) so that the
+/// title bar, the page heading, the footer buttons and a margin always fit on screen.
+///
+/// Vertical separators and columns in a horizontal layout take the whole *available*
+/// height; inside an unbounded window that is the rest of the screen, which makes the
+/// window taller than the viewport. Every wizard frame therefore wraps its body in a scope
+/// whose max height is this value.
+pub(crate) fn wizard_body_height(ctx: &egui::Context, preferred: f32) -> f32 {
+    const CHROME: f32 = 150.0; // title bar + footer row + separators + window margin
+    const MIN: f32 = 200.0;
+    (ctx.screen_rect().height() - CHROME).clamp(MIN, preferred.max(MIN))
+}
+
+/// The scrollable part of a wizard page: the body height minus the heading and the
+/// validation line under the scroll area.
+pub(crate) fn wizard_scroll_height(body: f32) -> f32 {
+    (body - 60.0).max(120.0)
+}
+
 /// Draw `dlg`; returns `false` when it should close.
 pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<Cmd>) -> bool {
     match dlg {
