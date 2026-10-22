@@ -64,7 +64,6 @@ pub trait BenchTarget: Send {
     fn open_for_bench(&self, len: u64) -> Result<Box<dyn BlockDevice>>;
 }
 
-#[cfg(windows)]
 impl BenchTarget for pm_platform::FileBenchTarget {
     fn open_for_bench(&self, len: u64) -> Result<Box<dyn BlockDevice>> {
         pm_platform::FileBenchTarget::open_for_bench(self, len)

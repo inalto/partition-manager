@@ -1,5 +1,7 @@
 # Partition Manager
 
+![CI](https://github.com/inalto/partition-manager/actions/workflows/ci.yml/badge.svg)
+
 A Windows-first disk partition manager written in Rust. It shows every disk and partition,
 creates, formats, resizes and moves partitions, clones and migrates disks, images them to
 virtual-disk formats, rescues data from failing media, and recovers lost partitions and
@@ -69,9 +71,20 @@ can be practised risk-free on image files with `--disk-file`.
 
 More detail, including where each check lives: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Platform support
+
+| OS | Status |
+|---|---|
+| Windows | Full: disks, partitions, volumes, write sessions, mount, format, resize, SMART, boot repair. |
+| Linux | Builds and runs the CLI/GUI on image files (`--disk-file`) and in CI; the platform layer for physical disks is in progress. |
+| macOS | Builds and runs the CLI/GUI on image files (`--disk-file`) and in CI; the platform layer for physical disks is in progress. |
+
+Continuous integration builds and tests the workspace on all three OSes
+(`cargo test --workspace`; tests that touch real hardware are `#[ignore]`d).
+
 ## Build
 
-You need a Rust toolchain (https://rustup.rs). All builds run from PowerShell:
+You need a Rust toolchain (https://rustup.rs). On Windows, builds run from PowerShell:
 
 ```powershell
 cargo build --release
@@ -118,6 +131,25 @@ build installs the pinned toolchain through rustup if it is missing. (Rust's bun
 The elevation manifest is embedded with `embed-resource` under MSVC, and with `windres` from
 the MinGW directory under GNU; either way only in release builds (`PM_GUI_MANIFEST=1` forces
 it into a debug build, `PM_GUI_MANIFEST=0` leaves it out of a release build).
+
+### Linux and macOS
+
+```sh
+cargo build --release          # target/release/pm and target/release/partition-manager
+cargo test --workspace
+```
+
+On Debian/Ubuntu the GUI needs the usual windowing development packages:
+
+```sh
+sudo apt-get install -y pkg-config libgtk-3-dev libxkbcommon-dev libwayland-dev \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
+
+macOS needs only the Xcode command line tools. If a `rust-toolchain.toml` pinned to a
+Windows channel (Route B above) is present in your checkout, override it on other machines:
+`RUSTUP_TOOLCHAIN=stable cargo build --release`. Writing to disks requires root (`sudo`),
+like the elevated prompt on Windows.
 
 ## Run
 

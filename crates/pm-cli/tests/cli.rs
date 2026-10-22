@@ -94,7 +94,11 @@ fn cli_list_json_runs() {
         Some(2) => {
             let err = stderr(&out);
             assert!(err.starts_with("error:"), "{err}");
-            assert!(err.contains("elevated"), "{err}");
+            // access denied (with the elevation hint) or an OS without a platform layer yet
+            assert!(
+                err.contains("elevated") || err.contains("sudo") || err.contains("not supported"),
+                "{err}"
+            );
         }
         other => panic!("unexpected exit {other:?}: {}", stderr(&out)),
     }
@@ -139,10 +143,18 @@ fn unused_letter() -> Option<char> {
 fn cli_unknown_volume_exits_1() {
     // an unknown disk index is an argument error, not a platform failure
     let out = pm(&["table", "disk:99999"]);
+    if stderr(&out).contains("not supported by the platform layer") {
+        // an OS without a platform layer yet cannot tell a missing disk from a failure
+        return;
+    }
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
 
     // so is a drive letter nothing is mounted at, for every command that takes a volume
+    // (drive letters exist on Windows only)
+    if !cfg!(windows) {
+        return;
+    }
     let Some(c) = unused_letter() else { return };
     let letter = format!("{c}:");
     let out = pm(&["table", &letter]);

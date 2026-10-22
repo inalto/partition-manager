@@ -490,6 +490,9 @@ mod tests {
         assert_eq!(*r, RescueSettings { mapfile: Some(map), ..settings });
     }
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn damaged_page_requires_absolute_mapfile_off_source() {
         let dir = tempfile::tempdir().unwrap();
@@ -551,6 +554,9 @@ mod tests {
         assert!(!restore.page_titles().iter().any(|t| t.contains("Damaged")), "{:?}", restore.page_titles());
     }
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn image_file_on_the_source_is_refused() {
         let m = model_of(vec![gpt_disk(1)]);

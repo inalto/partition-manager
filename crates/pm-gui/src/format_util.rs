@@ -86,6 +86,25 @@ pub fn format_eta(secs: Option<u64>) -> String {
     }
 }
 
+/// Status bar text for the elevation state: "administrator" wording on Windows, "root" elsewhere.
+pub fn elevation_status(os: &str, elevated: bool) -> &'static str {
+    match (os == "windows", elevated) {
+        (true, true) => "Running as administrator",
+        (true, false) => "Not elevated: read-only",
+        (false, true) => "Running as root",
+        (false, false) => "Not root: read-only",
+    }
+}
+
+/// Banner advice when the disks cannot be read without the needed rights.
+pub fn elevation_advice(os: &str) -> &'static str {
+    if os == "windows" {
+        " Start Partition Manager as administrator, or open image files with --disk-file."
+    } else {
+        " Start Partition Manager with sudo, or open image files with --disk-file."
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +160,16 @@ mod tests {
             ["(Unallocated)", "2.00 MB", "0 B", "2.00 MB", "Unallocated", "", "None"].map(String::from)
         );
         assert_eq!(disk_header(&gpt_disk(1)), "Disk 1 (Test SSD, GPT, 1.00 GB)");
+    }
+
+    #[test]
+    fn elevation_wording_per_os() {
+        assert_eq!(elevation_status("windows", true), "Running as administrator");
+        assert_eq!(elevation_status("windows", false), "Not elevated: read-only");
+        assert_eq!(elevation_status("linux", true), "Running as root");
+        assert_eq!(elevation_status("macos", false), "Not root: read-only");
+        assert!(elevation_advice("windows").contains("as administrator"));
+        assert!(elevation_advice("linux").contains("with sudo"));
     }
 
     #[test]

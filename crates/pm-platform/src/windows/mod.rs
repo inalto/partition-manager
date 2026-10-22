@@ -168,6 +168,12 @@ impl Platform for WindowsPlatform {
     fn run_tool(&self, tool: ExternalTool, args: &[String]) -> Result<String> {
         run_tool(tool, args)
     }
+    fn os_name(&self) -> &'static str {
+        "windows"
+    }
+    fn elevation_hint(&self) -> &'static str {
+        crate::ELEVATION_HINT_WINDOWS
+    }
 }
 
 #[cfg(test)]

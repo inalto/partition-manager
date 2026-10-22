@@ -806,6 +806,9 @@ mod tests {
     use pm_recover::CarvedFile;
     use std::sync::Arc;
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn destination_must_not_be_on_the_source() {
         assert!(dest_problem("", &['E']).is_some());

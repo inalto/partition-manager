@@ -31,10 +31,7 @@ pub fn report(platform: &dyn Platform) -> String {
     let mut s = String::new();
     s.push_str(&format!("pm {}\n", env!("CARGO_PKG_VERSION")));
     s.push_str(&format!("Elevated:     {}\n", yes_no(platform.is_elevated())));
-    s.push_str(&format!(
-        "Platform:     {}\n",
-        if cfg!(windows) { "windows" } else { "other (unsupported)" }
-    ));
+    s.push_str(&format!("Platform:     {}\n", platform.os_name()));
     s.push_str(&format!(
         "Toolchain:    {} ({} {})\n",
         option_env!("RUSTUP_TOOLCHAIN").unwrap_or("unknown"),
@@ -99,6 +96,7 @@ mod tests {
     fn enumeration_error_does_not_abort() {
         let r = report(&NullPlatform);
         assert!(r.contains("enumeration failed"), "{r}");
+        assert!(r.contains("Platform:     none"), "{r}");
         assert!(r.contains("System disk:  unknown"), "{r}");
         assert!(r.contains("Free letters: none"), "{r}");
     }

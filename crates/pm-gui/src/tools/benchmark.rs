@@ -124,15 +124,8 @@ impl BenchmarkWindow {
     }
 }
 
-#[cfg(windows)]
 fn run_one(dir: &std::path::Path, o: &BenchOpts, p: &dyn pm_core::ProgressSink, c: &CancelToken) -> pm_core::Result<Vec<BenchPoint>> {
     benchmark(&pm_platform::FileBenchTarget::new(dir.to_path_buf()), o, p, c)
-}
-
-#[cfg(not(windows))]
-fn run_one(_dir: &std::path::Path, _o: &BenchOpts, _p: &dyn pm_core::ProgressSink, _c: &CancelToken) -> pm_core::Result<Vec<BenchPoint>> {
-    let _ = benchmark;
-    Err(Error::Unsupported("the disk benchmark needs Windows".into()))
 }
 
 /// Sleep `secs` seconds, checking for cancellation every 100 ms.

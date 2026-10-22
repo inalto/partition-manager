@@ -2764,6 +2764,7 @@ dependencies = [
 name = "pm-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "log",
  "pm-core",
  "pm-fs",

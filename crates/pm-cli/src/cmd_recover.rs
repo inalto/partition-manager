@@ -724,6 +724,9 @@ trailer << >>
         assert!(two.len() > images.len());
     }
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn destination_on_the_source_drive_is_refused() {
         use pm_core::{MemDevice, VolumeId, VolumeInfo};

@@ -1,7 +1,8 @@
 //! The application log: `env_logger` writing every record to stderr (debug builds have a
-//! console; release builds usually do not) and appending it to
-//! `%LOCALAPPDATA%\PartitionManager\partition-manager.log`. The level comes from `RUST_LOG`
-//! and defaults to `info`.
+//! console; release builds usually do not) and appending it to `partition-manager.log` in
+//! [`log_dir`]: `%LOCALAPPDATA%\PartitionManager` on Windows, `~/Library/Logs/PartitionManager` on
+//! macOS and `$XDG_STATE_HOME/partition-manager` (default `~/.local/state/partition-manager`)
+//! elsewhere. The level comes from `RUST_LOG` and defaults to `info`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -10,13 +11,51 @@ use std::path::PathBuf;
 /// File name of the log inside [`log_dir`].
 pub const LOG_FILE: &str = "partition-manager.log";
 
-/// `%LOCALAPPDATA%\PartitionManager` (`None` when `LOCALAPPDATA` is not set).
+/// The log folder of this OS (see the module docs); `None` when the environment variable it
+/// derives from is not set.
 pub fn log_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())?;
-    Some(PathBuf::from(base).join("PartitionManager"))
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    log_dir_for(
+        if cfg!(windows) {
+            LogOs::Windows
+        } else if cfg!(target_os = "macos") {
+            LogOs::MacOs
+        } else {
+            LogOs::Other
+        },
+        var("LOCALAPPDATA").as_deref(),
+        var("XDG_STATE_HOME").as_deref(),
+        var("HOME").as_deref(),
+    )
 }
 
-/// The log file: [`log_dir`]`\partition-manager.log`.
+/// The flavour of log location.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogOs {
+    Windows,
+    MacOs,
+    Other,
+}
+
+/// Pure resolution of the log folder from the relevant environment values.
+pub fn log_dir_for(
+    os: LogOs,
+    local_app_data: Option<&std::ffi::OsStr>,
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    match os {
+        LogOs::Windows => Some(PathBuf::from(local_app_data?).join("PartitionManager")),
+        LogOs::MacOs => Some(PathBuf::from(home?).join("Library").join("Logs").join("PartitionManager")),
+        LogOs::Other => match xdg_state_home {
+            // the XDG spec only accepts absolute paths here
+            Some(x) if std::path::Path::new(x).is_absolute() => Some(PathBuf::from(x).join("partition-manager")),
+            _ => Some(PathBuf::from(home?).join(".local").join("state").join("partition-manager")),
+        },
+    }
+}
+
+/// The log file: `partition-manager.log` inside [`log_dir`].
 pub fn log_file() -> Option<PathBuf> {
     log_dir().map(|d| d.join(LOG_FILE))
 }
@@ -91,12 +130,40 @@ mod tests {
     }
 
     #[test]
-    fn log_file_is_under_local_app_data() {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
-            assert_eq!(
-                log_file().unwrap(),
-                PathBuf::from(base).join("PartitionManager").join("partition-manager.log")
-            );
+    fn log_file_is_under_the_os_log_dir() {
+        if let Some(dir) = log_dir() {
+            assert_eq!(log_file().unwrap(), dir.join("partition-manager.log"));
         }
+    }
+
+    #[test]
+    fn log_dir_per_os() {
+        use std::ffi::OsStr;
+        let none: Option<&OsStr> = None;
+        // absolute on every host OS
+        let abs = std::env::temp_dir();
+        let a = Some(abs.as_os_str());
+        assert_eq!(
+            log_dir_for(LogOs::Windows, a, none, none),
+            Some(abs.join("PartitionManager"))
+        );
+        assert_eq!(log_dir_for(LogOs::Windows, none, a, a), None);
+        assert_eq!(
+            log_dir_for(LogOs::MacOs, none, none, a),
+            Some(abs.join("Library").join("Logs").join("PartitionManager"))
+        );
+        assert_eq!(log_dir_for(LogOs::MacOs, none, none, none), None);
+        assert_eq!(
+            log_dir_for(LogOs::Other, none, a, Some(OsStr::new("home"))),
+            Some(abs.join("partition-manager"))
+        );
+        let under_home = Some(PathBuf::from("home").join(".local").join("state").join("partition-manager"));
+        assert_eq!(log_dir_for(LogOs::Other, none, none, Some(OsStr::new("home"))), under_home);
+        // a relative XDG_STATE_HOME is ignored
+        assert_eq!(
+            log_dir_for(LogOs::Other, none, Some(OsStr::new("rel")), Some(OsStr::new("home"))),
+            under_home
+        );
+        assert_eq!(log_dir_for(LogOs::Other, none, none, none), None);
     }
 }

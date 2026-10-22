@@ -123,6 +123,15 @@ pub trait Platform: Send + Sync {
     fn free_letters(&self) -> Vec<char>;
     /// Run a system tool, returning its stdout+stderr; non-zero exit → `Error::Platform`.
     fn run_tool(&self, tool: ExternalTool, args: &[String]) -> Result<String>;
+    /// Lower-case name of the operating system this platform drives (`"windows"`, `"linux"`,
+    /// `"macos"`). Platforms that are not tied to an OS (images, mocks) report the host.
+    fn os_name(&self) -> &'static str {
+        host_os_name()
+    }
+    /// How to run a command with the rights this platform needs, for error hints.
+    fn elevation_hint(&self) -> &'static str {
+        host_elevation_hint()
+    }
 }
 
 /// Format name understood by `FormatEx` / `format.com` for `fs`.
@@ -134,5 +143,41 @@ pub fn fs_format_name(fs: FsKind) -> Option<&'static str> {
         FsKind::ExFat => Some("exFAT"),
         FsKind::ReFs => Some("ReFS"),
         _ => None,
+    }
+}
+
+/// Hint shown when an operation fails for lack of rights on Windows.
+pub const ELEVATION_HINT_WINDOWS: &str = "run this command from an elevated prompt";
+/// Hint shown when an operation fails for lack of rights on Linux and macOS.
+pub const ELEVATION_HINT_UNIX: &str = "run with sudo (root)";
+
+/// Name of the OS this binary was built for: `"windows"`, `"linux"` or `"macos"` (otherwise
+/// `std::env::consts::OS`).
+pub fn host_os_name() -> &'static str {
+    std::env::consts::OS
+}
+
+/// The elevation hint matching [`host_os_name`].
+pub fn host_elevation_hint() -> &'static str {
+    if cfg!(windows) {
+        ELEVATION_HINT_WINDOWS
+    } else {
+        ELEVATION_HINT_UNIX
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_match_the_host() {
+        assert_eq!(host_os_name(), std::env::consts::OS);
+        if cfg!(windows) {
+            assert!(host_elevation_hint().contains("elevated prompt"));
+        } else {
+            assert!(host_elevation_hint().contains("sudo"));
+        }
+        assert!(ELEVATION_HINT_UNIX.contains("sudo") && ELEVATION_HINT_WINDOWS.contains("elevated"));
     }
 }

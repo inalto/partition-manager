@@ -1,8 +1,8 @@
 //! `partition-manager`: the Partition Manager desktop application.
 
-// Release builds are GUI-subsystem executables (no console window); debug builds keep the
-// console for logs.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Windows release builds are GUI-subsystem executables (no console window); debug builds keep
+// the console for logs. Other OSes have no such subsystem.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 use pm_gui::args::{self, USAGE};

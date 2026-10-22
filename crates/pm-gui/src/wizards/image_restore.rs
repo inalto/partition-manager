@@ -247,6 +247,9 @@ mod tests {
         assert!(bad.capacity().is_none());
     }
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn image_on_the_target_disk_is_refused() {
         let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);

@@ -506,16 +506,15 @@ fn cli_analyze_bench_runs_on_a_temp_directory() {
         "analyze", "bench", s(dir.path()), "--sizes", "4K,8K", "--total", "1M", "--threads", "1",
         "--queue", "2", "--cooldown", "0",
     ]);
-    if cfg!(windows) {
-        assert!(out.status.success(), "stderr: {}", stderr(&out));
-        let text = stdout(&out);
-        assert!(text.contains("4.00 KB") && text.contains("8.00 KB"), "{text}");
-        assert!(text.contains("MB/s") && text.contains("IOPS"), "{text}");
-        // the scratch file is gone
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    } else {
-        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    }
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("4.00 KB") && text.contains("8.00 KB"), "{text}");
+    assert!(text.contains("MB/s") && text.contains("IOPS"), "{text}");
+    // the scratch file is gone
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    // anything that is not a directory is a usage error (drive letters exist on Windows only)
+    let out = pm(&["analyze", "bench", "no-such-folder-for-pm-bench"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
 }
 
 #[test]

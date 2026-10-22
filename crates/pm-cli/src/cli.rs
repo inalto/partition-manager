@@ -21,7 +21,7 @@ pub const EXIT_RUNTIME: i32 = 2;
 pub struct Cli {
     /// Use this raw image file as a disk instead of the physical disks (repeatable: the first
     /// is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`,
-    /// then works on the files; no administrator rights are needed. Mounting, formatting and
+    /// then works on the files; no administrator (root) rights are needed. Mounting, formatting and
     /// everything else that needs a volume layer is not available on image files.
     #[arg(long = "disk-file", global = true, value_name = "PATH")]
     pub disk_files: Vec<PathBuf>,
@@ -380,18 +380,22 @@ impl CliError {
     }
 }
 
+impl CliError {
+    /// The message, with `elevation_hint` (`Platform::elevation_hint`) appended to an
+    /// access-denied failure.
+    pub fn render(&self, elevation_hint: &str) -> String {
+        match self {
+            CliError::Usage(m) | CliError::Failed(m) => m.clone(),
+            CliError::Runtime(e) if self.is_access_denied() => format!("{e} (hint: {elevation_hint})"),
+            CliError::Runtime(e) => e.to_string(),
+        }
+    }
+}
+
+/// Uses the hint of the OS this binary was built for; `main` renders with the active platform's.
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CliError::Usage(m) | CliError::Failed(m) => f.write_str(m),
-            CliError::Runtime(e) => {
-                write!(f, "{e}")?;
-                if self.is_access_denied() {
-                    write!(f, " (hint: run this command from an elevated prompt)")?;
-                }
-                Ok(())
-            }
-        }
+        f.write_str(&self.render(pm_platform::host_elevation_hint()))
     }
 }
 
@@ -444,12 +448,15 @@ mod tests {
             msg: "open x: Access denied".into(),
         });
         assert_eq!(denied.exit_code(), 2);
-        assert!(denied.to_string().contains("elevated prompt"));
+        let expected = if cfg!(windows) { "elevated prompt" } else { "sudo" };
+        assert!(denied.to_string().contains(expected));
+        assert!(denied.render("run with sudo (root)").ends_with("(hint: run with sudo (root))"));
+        assert!(denied.render(pm_platform::ELEVATION_HINT_WINDOWS).contains("elevated prompt"));
         let other = CliError::Runtime(Error::Platform {
             code: 2,
             msg: "Device not found".into(),
         });
-        assert!(!other.to_string().contains("elevated"));
+        assert!(!other.to_string().contains("elevated") && !other.to_string().contains("sudo"));
         assert!(matches!(arg_error(Error::Invalid("x".into())), CliError::Usage(_)));
         assert!(matches!(arg_error(Error::Cancelled), CliError::Runtime(_)));
     }

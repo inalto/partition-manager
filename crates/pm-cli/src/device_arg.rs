@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub enum DeviceArg {
     /// Physical disk by index (`disk:1`).
     Disk(u32),
-    /// Drive letter (`D:`) or `\\?\Volume{..}\` path.
+    /// Drive letter (`D:`), `\\?\Volume{..}\` path or (Linux, macOS) a `/dev/...` node.
     Volume(String),
     /// Image file (`file:PATH`, or a bare path that exists); any format `pm-image` reads.
     File(PathBuf),
@@ -157,6 +157,11 @@ fn is_volume_path(s: &str) -> bool {
     strip_prefix_ci(s, r"\\?\Volume{").is_some()
 }
 
+/// A device node path (`/dev/sda1`, `/dev/rdisk3s2`) as used on Linux and macOS.
+fn is_dev_node(s: &str) -> bool {
+    s.strip_prefix("/dev/").is_some_and(|rest| !rest.is_empty() && !rest.ends_with('/'))
+}
+
 /// The volume path with exactly one trailing backslash, as the platform expects it.
 fn normalize_volume_path(s: &str) -> String {
     let mut v = s.to_string();
@@ -222,8 +227,11 @@ pub fn parse_device(s: &str) -> Result<DeviceArg> {
     if let Some(a) = file_or_partition(s) {
         return Ok(a);
     }
+    if is_dev_node(s) {
+        return Ok(DeviceArg::Volume(s.to_string()));
+    }
     Err(Error::Invalid(format!(
-        "'{s}' is not a device: use disk:N[:P], a drive letter (D:), a \\\\?\\Volume{{..}}\\ path, or an existing image file[:P]"
+        "'{s}' is not a device: use disk:N[:P], a drive letter (D:), a \\\\?\\Volume{{..}}\\ path, a /dev/... node, or an existing image file[:P]"
     )))
 }
 
@@ -231,6 +239,9 @@ pub fn parse_device(s: &str) -> Result<DeviceArg> {
 pub fn resolve_volume(platform: &dyn Platform, s: &str) -> Result<VolumeId> {
     if is_volume_path(s) {
         return Ok(VolumeId(normalize_volume_path(s)));
+    }
+    if is_dev_node(s) {
+        return Ok(VolumeId(s.to_string()));
     }
     let letter = drive_letter(s)
         .ok_or_else(|| Error::Invalid(format!("'{s}' is not a drive letter or volume path")))?;
@@ -369,6 +380,16 @@ mod tests {
         assert_eq!(parse_device(&format!("file:{s}")).unwrap(), DeviceArg::File(img.clone()));
         assert!(parse_device("").is_err());
         assert!(parse_device("C").is_err());
+    }
+
+    #[test]
+    fn dev_nodes_parse_as_volumes() {
+        assert_eq!(parse_device("/dev/sda1").unwrap(), DeviceArg::Volume("/dev/sda1".into()));
+        assert_eq!(parse_device("/dev/rdisk3s2").unwrap(), DeviceArg::Volume("/dev/rdisk3s2".into()));
+        assert!(parse_device("/dev/").is_err());
+        assert!(parse_device("/devices/sda").is_err());
+        let p = MockPlatform::new();
+        assert_eq!(resolve_volume(&p, "/dev/nvme0n1p2").unwrap(), VolumeId("/dev/nvme0n1p2".into()));
     }
 
     #[test]

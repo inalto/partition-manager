@@ -292,22 +292,10 @@ struct BenchArgs {
     cooldown: Option<u32>,
 }
 
-#[cfg(windows)]
 fn bench(target: &str, a: &BenchArgs, cancel: &CancelToken, out: &mut dyn Write) -> Result<(), CliError> {
-    use crate::cli::parse_letter;
     use pm_analyze::{benchmark, BenchMode, BenchOpts};
 
-    let dir = if Path::new(target).is_dir() {
-        PathBuf::from(target)
-    } else {
-        let letter = parse_letter(target)
-            .map_err(|_| CliError::Usage(format!("'{target}' is neither a directory nor a drive letter")))?;
-        let root = PathBuf::from(format!("{letter}:\\"));
-        if !root.is_dir() {
-            return Err(CliError::Usage(format!("drive {letter}: does not exist")));
-        }
-        root
-    };
+    let dir = bench_dir(target)?;
     let mut opts = BenchOpts::default();
     if !a.sizes.is_empty() {
         opts.transfer_sizes = a
@@ -349,11 +337,23 @@ fn bench(target: &str, a: &BenchArgs, cancel: &CancelToken, out: &mut dyn Write)
     out.write_all(s.as_bytes()).map_err(write_err)
 }
 
-#[cfg(not(windows))]
-fn bench(_target: &str, _a: &BenchArgs, _cancel: &CancelToken, _out: &mut dyn Write) -> Result<(), CliError> {
-    Err(CliError::Runtime(Error::Unsupported(
-        "the benchmark needs the Windows unbuffered file target".into(),
-    )))
+/// The folder to benchmark: an existing directory, or (Windows) a drive letter such as `D:`.
+fn bench_dir(target: &str) -> Result<PathBuf, CliError> {
+    if Path::new(target).is_dir() {
+        return Ok(PathBuf::from(target));
+    }
+    #[cfg(windows)]
+    {
+        let letter = crate::cli::parse_letter(target)
+            .map_err(|_| CliError::Usage(format!("'{target}' is neither a directory nor a drive letter")))?;
+        let root = PathBuf::from(format!("{letter}:\\"));
+        if !root.is_dir() {
+            return Err(CliError::Usage(format!("drive {letter}: does not exist")));
+        }
+        Ok(root)
+    }
+    #[cfg(not(windows))]
+    Err(CliError::Usage(format!("'{target}' is not a directory")))
 }
 
 // ------------------------------------------------------------------------------------------

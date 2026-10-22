@@ -891,6 +891,9 @@ mod tests {
         assert_eq!(bar[9], BlockStatus::NonTried);
     }
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn files_on_the_source_or_destination_disk_are_refused() {
         let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
@@ -972,6 +975,9 @@ mod tests {
         assert!(mock.write_sessions_log().is_empty(), "nothing was written");
     }
 
+    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
+    // macOS platform layers (multi-platform Task D)
+    #[cfg(windows)]
     #[test]
     fn mapfile_must_be_an_absolute_path() {
         use crate::tools::test_env::{model, platform};

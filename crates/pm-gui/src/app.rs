@@ -274,7 +274,7 @@ impl AppState {
                 let hint = if self.elevated {
                     ""
                 } else {
-                    " Start Partition Manager as administrator, or open image files with --disk-file."
+                    crate::format_util::elevation_advice(self.platform.os_name())
                 };
                 self.banner = Some(format!("Could not read the disks: {e}.{hint}"));
             }
@@ -477,7 +477,10 @@ impl AppState {
                     let _ = std::fs::create_dir_all(&dir);
                     explore(self, &dir.display().to_string());
                 }
-                None => self.toast("The log folder is unknown (LOCALAPPDATA is not set)"),
+                None => self.toast(format!(
+                    "The log folder is unknown ({} is not set)",
+                    if cfg!(windows) { "LOCALAPPDATA" } else { "HOME" }
+                )),
             },
             Cmd::DismissBanner => self.banner = None,
             Cmd::FinishWizard(ops) => match self.try_push_ops(ops) {

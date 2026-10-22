@@ -21,6 +21,7 @@ windows-sys = "0.59"
 eframe = "0.29"
 egui_extras = "0.29"
 embed-resource = "2"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

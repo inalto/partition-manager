@@ -23,10 +23,11 @@ pub fn show(ui: &mut egui::Ui, s: &AppState) {
             ui.add_space(8.0);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let text = crate::format_util::elevation_status(s.platform.os_name(), s.elevated);
             if s.elevated {
-                ui.label("Running as administrator");
+                ui.label(text);
             } else {
-                ui.label(RichText::new("Not elevated: read-only").color(DANGER));
+                ui.label(RichText::new(text).color(DANGER));
             }
             if let Some(job) = &s.job {
                 if job.kind == JobKind::Refresh {

@@ -1,12 +1,14 @@
 //! Partition Manager platform layer: the only crate that talks to the operating system.
 //!
 //! Engines, the GUI and the CLI consume the [`Platform`] trait. [`default_platform`] returns the
-//! real implementation (Windows) or [`NullPlatform`] elsewhere; [`MockPlatform`] backs the tests.
+//! real implementation (Windows; Linux and macOS follow) or [`NullPlatform`] elsewhere; [`MockPlatform`] backs the tests.
 
 pub mod aligned;
 pub mod console;
 pub mod file_platform;
 pub mod mock;
+#[cfg(unix)]
+pub mod posix;
 pub mod shell;
 pub mod traits;
 #[cfg(windows)]
@@ -15,6 +17,8 @@ pub mod windows;
 pub use file_platform::{FilePlatform, NO_SYSTEM_DISK};
 pub use mock::MockPlatform;
 pub use traits::*;
+#[cfg(unix)]
+pub use posix::{BenchFile, FileBenchTarget};
 #[cfg(windows)]
 pub use windows::{
     friendly_error, parse_ata_smart, parse_nvme_smart_log, BenchFile, FileBenchTarget, WinDevice, WindowsPlatform,
@@ -137,6 +141,9 @@ impl Platform for NullPlatform {
     }
     fn free_letters(&self) -> Vec<char> {
         Vec::new()
+    }
+    fn os_name(&self) -> &'static str {
+        "none"
     }
     fn run_tool(&self, _tool: ExternalTool, _args: &[String]) -> Result<String> {
         unsupported()

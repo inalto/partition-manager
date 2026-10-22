@@ -167,7 +167,6 @@ fn bench_defaults_match_brief() {
     assert_eq!(d.transfer_sizes.last(), Some(&(32 * 1024)));
 }
 
-#[cfg(windows)]
 #[test]
 fn benchmark_runs_on_unbuffered_temp_file() {
     let dir = tempfile::tempdir().unwrap();

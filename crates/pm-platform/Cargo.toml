@@ -3,7 +3,7 @@ name = "pm-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Partition Manager OS abstraction: Platform trait, mock and the Windows implementation"
+description = "Partition Manager OS abstraction: Platform trait, mock and the OS implementations"
 
 [dependencies]
 pm-core = { path = "../pm-core" }
@@ -29,3 +29,6 @@ windows-sys = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Console",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
