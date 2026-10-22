@@ -165,6 +165,20 @@ pub struct FileDevice {
     read_only: bool,
 }
 
+/// The error for a file that could not be opened or created: names the path, and keeps a
+/// missing path and a permission problem distinguishable (a bare `Io { offset: 0 }` told the
+/// user nothing when an image's directory did not exist).
+fn open_error(what: &str, path: &Path, e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => Error::NotFound(format!("cannot {what} {}: {e}", path.display())),
+        std::io::ErrorKind::PermissionDenied => Error::Platform {
+            code: e.raw_os_error().unwrap_or(0) as u32,
+            msg: format!("cannot {what} {}: access denied ({e})", path.display()),
+        },
+        kind => Error::io(0, 0, std::io::Error::new(kind, format!("cannot {what} {}: {e}", path.display()))),
+    }
+}
+
 impl FileDevice {
     /// Open an existing file. The length is taken from file metadata; for raw device
     /// handles (metadata length 0) use [`FileDevice::with_len`].
@@ -173,7 +187,7 @@ impl FileDevice {
             .read(true)
             .write(!read_only)
             .open(path.as_ref())
-            .map_err(|e| Error::io(0, 0, e))?;
+            .map_err(|e| open_error("open", path.as_ref(), e))?;
         let len = file.metadata().map_err(|e| Error::io(0, 0, e))?.len();
         Ok(FileDevice {
             file,
@@ -191,7 +205,7 @@ impl FileDevice {
             .create(true)
             .truncate(true)
             .open(path.as_ref())
-            .map_err(|e| Error::io(0, 0, e))?;
+            .map_err(|e| open_error("create", path.as_ref(), e))?;
         file.set_len(len).map_err(|e| Error::io(0, 0, e))?;
         Ok(FileDevice {
             file,
@@ -515,5 +529,21 @@ mod tests {
         r.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf, b"hi");
         assert_eq!(r.len(), 32);
+    }
+
+    #[test]
+    fn open_and_create_errors_name_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").join("x.img");
+        match FileDevice::create(&missing, 0) {
+            Err(Error::NotFound(m)) => assert!(m.contains("cannot create") && m.contains("x.img"), "{m}"),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("unexpectedly succeeded"),
+        }
+        match FileDevice::open(&missing, true) {
+            Err(Error::NotFound(m)) => assert!(m.contains("cannot open") && m.contains("x.img"), "{m}"),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("unexpectedly succeeded"),
+        }
     }
 }
