@@ -1,6 +1,6 @@
 //! Creating filesystems with the system's `mkfs.*` tools.
 
-use super::mount::node;
+use super::mount::ready_node;
 use super::mounts::{canonical_device, read_mounts};
 use crate::posix::cmd;
 use pm_core::{Error, FsKind, ProgressReport, ProgressSink, Result, VolumeId};
@@ -168,7 +168,7 @@ pub fn format(
     quick: bool,
     progress: &dyn ProgressSink,
 ) -> Result<()> {
-    let dev = node(id)?;
+    let dev = ready_node(id)?;
     ensure_unmounted(dev)?;
     let (tool, args) = mkfs_command(fs, label, cluster, quick, dev, placement(dev))?;
     report(progress, 0);

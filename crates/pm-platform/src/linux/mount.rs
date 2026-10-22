@@ -39,12 +39,27 @@ pub fn node(id: &VolumeId) -> Result<&str> {
     }
 }
 
+/// The device node of `id`, waiting up to 3 s for it to appear: right after a partition
+/// table was re-read the kernel and udev may still be (re)creating the partition nodes.
+pub fn ready_node(id: &VolumeId) -> Result<&str> {
+    let dev = node(id)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !Path::new(dev).exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::NotFound(format!("{dev} does not exist")));
+        }
+        super::session::udev_settle();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(dev)
+}
+
 /// Mount volume `id` at folder `at`: `mount(2)` with each kernel type that fits the detected
 /// filesystem, then the `mount` command with the same types (FUSE helpers), finally `mount`
 /// with automatic type detection.
 pub fn mount(id: &VolumeId, at: &MountPoint) -> Result<()> {
-    let dev = node(id)?;
     let dir = folder(at)?;
+    let dev = ready_node(id)?;
     let types = detect_fs(dev).map(mount_types).unwrap_or(&[]);
     let mut last: Option<Error> = None;
     for t in types {

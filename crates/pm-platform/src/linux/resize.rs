@@ -2,7 +2,7 @@
 //! The volume must be unmounted; other filesystems are `Unsupported`.
 
 use super::format::ensure_unmounted;
-use super::mount::{detect_fs, node};
+use super::mount::{detect_fs, ready_node};
 use crate::posix::cmd;
 use pm_core::{Error, FsKind, Result, VolumeId};
 
@@ -48,7 +48,7 @@ fn run_step(s: &Step) -> Result<()> {
 
 /// Resize the filesystem of volume `id` to `new_len` bytes (shrink or grow).
 pub fn resize(id: &VolumeId, new_len: u64) -> Result<()> {
-    let dev = node(id)?;
+    let dev = ready_node(id)?;
     ensure_unmounted(dev)?;
     let fs = detect_fs(dev).ok_or_else(|| Error::Unsupported(format!("no recognizable filesystem on {dev}")))?;
     for s in resize_steps(fs, dev, new_len)? {

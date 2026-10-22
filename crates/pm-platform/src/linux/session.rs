@@ -9,13 +9,15 @@
 //!    unmounted ([`unmount_all`]);
 //! 3. open the disk `O_RDWR | O_EXCL` (the kernel refuses while anything still mounts or
 //!    claims it, e.g. a mount in another namespace) and take `flock(LOCK_EX | LOCK_NB)` (the
-//!    lock udev and `systemd-repart` honour). Failure: re-mount, `Error::Busy`.
+//!    lock udev and `systemd-repart` honour), retrying for ~2 s because udev holds the lock
+//!    briefly while it probes. Failure: re-mount, `Error::Busy`.
 //!
 //! `commit_table` writes the table, `fsync`s and re-reads it with `BLKRRPART` (`EBUSY` retried
 //! 3 times 300 ms apart, then `partprobe`). `finish` (and `Drop`) `fsync`, unlock, close and
-//! re-read the table once more. Filesystems unmounted by the session are deliberately NOT
-//! mounted again after a successful session: the layout may have changed underneath them; a
-//! refresh shows them unmounted and the user mounts what they want.
+//! re-read the table once more (holding the lock, so udev does not re-read it a second time
+//! behind our back), then wait for udev (`udevadm settle`). Filesystems unmounted by the
+//! session are deliberately NOT mounted again after a successful session: the layout may have
+//! changed underneath them; a refresh shows them unmounted and the user mounts what they want.
 
 use super::ioctl;
 use super::mounts::MountEntry;
@@ -177,18 +179,53 @@ pub fn reread(fd: std::os::fd::BorrowedFd<'_>, path: &str) -> Result<()> {
     }
 }
 
+/// Take `flock(LOCK_EX)` on `dev`, retrying for about a second (udev holds the lock briefly
+/// while it probes a disk).
+fn lock_with_retry(dev: &FdDevice) -> bool {
+    for _ in 0..20 {
+        if dev.try_lock_exclusive().unwrap_or(false) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Wait (at most 10 s) until udev has processed the queued device events, so partition
+/// nodes and `/dev/disk/by-*` links are in place. No-op without `udevadm`.
+pub fn udev_settle() {
+    if cmd::has_tool("udevadm") {
+        if let Err(e) = cmd::run("udevadm", &["settle", "--timeout=10"]) {
+            log::debug!("udevadm settle: {e}");
+        }
+    }
+}
+
 /// Open `path` for the session: `O_RDWR | O_EXCL` plus a non-blocking exclusive `flock`.
+///
+/// Both can fail transiently while udev probes the disk (it takes the lock for a moment), so
+/// each attempt is repeated for about two seconds before the disk is reported busy.
 fn open_exclusive(path: &str) -> Result<FdDevice> {
-    let dev = FdDevice::open_with(Path::new(path), false, libc::O_EXCL, ioctl::geometry).map_err(|e| match e {
-        Error::Platform { code, .. } if code == libc::EBUSY as u32 => Error::Busy(format!(
-            "{path} is in use (mounted in another mount namespace, or claimed by LVM / RAID / another program)"
-        )),
-        other => other,
-    })?;
-    match dev.try_lock_exclusive() {
-        Ok(true) => Ok(dev),
-        Ok(false) => Err(Error::Busy(format!("{path} is locked by another program (flock)"))),
-        Err(e) => Err(os_error(&e, &format!("lock {path}"))),
+    const ATTEMPTS: u32 = 20;
+    const DELAY: Duration = Duration::from_millis(100);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let busy = match FdDevice::open_with(Path::new(path), false, libc::O_EXCL, ioctl::geometry) {
+            Ok(dev) => match dev.try_lock_exclusive() {
+                Ok(true) => return Ok(dev),
+                Ok(false) => format!("{path} is locked by another program (flock)"),
+                Err(e) => return Err(os_error(&e, &format!("lock {path}"))),
+            },
+            Err(Error::Platform { code, .. }) if code == libc::EBUSY as u32 => format!(
+                "{path} is in use (mounted in another mount namespace, or claimed by LVM / RAID / another program)"
+            ),
+            Err(e) => return Err(e),
+        };
+        if attempt >= ATTEMPTS {
+            return Err(Error::Busy(busy));
+        }
+        std::thread::sleep(DELAY);
     }
 }
 
@@ -210,6 +247,9 @@ pub fn begin_write(
     }
     let mine: Vec<MountEntry> = mounts.iter().filter(|e| nodes.contains(&e.device)).cloned().collect();
     let unmounted = unmount_all(mounter, &mine)?;
+    if !unmounted.is_empty() {
+        udev_settle(); // unmounting makes udev probe the partitions (and lock the disk)
+    }
     match open_exclusive(&d.path) {
         Ok(dev) => Ok(Box::new(LinuxWriteSession::new(index, dev))),
         Err(e) => {
@@ -237,21 +277,36 @@ impl LinuxWriteSession {
     }
 
     /// fsync, unlock, close, re-read the table. Every step runs; the first error is returned.
+    ///
+    /// The lock is handed over to a read-only descriptor before the writable one is closed:
+    /// closing a written disk makes udev re-read its partition table on its own (removing and
+    /// re-adding every partition node, racing with whoever looks at them next); udev skips
+    /// that while the disk is locked and only sends change events. The table is then re-read
+    /// once, here; after the lock is released udev's queue is drained (`udevadm settle`).
     fn restore(&mut self) -> Result<()> {
         let Some(dev) = self.device.take() else { return Ok(()) };
         let mut first: Option<Error> = None;
         if let Err(e) = dev.sync() {
             first.get_or_insert(os_error(&e, &format!("fsync {}", self.path)));
         }
+        let ro = FdDevice::open_with(Path::new(&self.path), true, 0, ioctl::geometry);
         if let Err(e) = dev.unlock() {
             log::debug!("{}: unlock: {e}", self.path);
         }
+        if let Ok(ro) = &ro {
+            if !lock_with_retry(ro) {
+                log::debug!("{}: could not re-lock for the final re-read", self.path);
+            }
+        }
         drop(dev);
-        match FdDevice::open_with(Path::new(&self.path), true, 0, ioctl::geometry) {
+        match ro {
             Ok(ro) => {
                 if let Err(e) = reread(ro.fd(), &self.path) {
                     first.get_or_insert(e);
                 }
+                // release the lock first: udev processes a locked disk's events only after it
+                drop(ro);
+                udev_settle();
             }
             Err(e) => {
                 first.get_or_insert(e);
@@ -274,6 +329,7 @@ impl WriteSession for LinuxWriteSession {
         let dev = self.device.as_mut().expect("write session is open until finish");
         write_table(dev, t)?;
         dev.flush()?;
+        // no udev_settle here: udev waits for the disk lock this session holds
         reread(dev.fd(), &self.path)
     }
 
