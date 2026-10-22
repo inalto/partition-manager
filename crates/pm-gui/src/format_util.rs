@@ -1,6 +1,6 @@
 //! Text shown in the disk table, the dialogs and the status bar.
 
-use pm_core::{format_size, DiskInfo, PartitionInfo, PartitionType};
+use pm_core::{format_size, DiskInfo, PartitionInfo, PartitionType, TableKind};
 
 /// Column titles of the disk table, in order.
 pub const COLUMNS: [&str; 7] = ["Partition", "Capacity", "Used", "Unused", "File system", "Type", "Status"];
@@ -63,9 +63,25 @@ pub fn free_row(len: u64) -> [String; 7] {
     ]
 }
 
-/// Header row of a disk group: `"Disk 1 (Model, GPT, 1.82 TB)"`.
-pub fn disk_header(d: &DiskInfo) -> String {
-    d.display_name()
+/// Header row of a disk group: `"Disk 1 (Model, GPT, 1.82 TB)  /dev/sdb"` (the device path
+/// names the disk unambiguously: on Linux and macOS `disk:N` is a position that can change
+/// when a disk is plugged in). A disk whose partition table could not be read says that its
+/// layout is approximate, with `elevation_hint` (`Platform::elevation_hint`).
+pub fn disk_header(d: &DiskInfo, elevation_hint: &str) -> String {
+    let mut s = d.display_name();
+    if !d.path.is_empty() {
+        s.push_str("  ");
+        s.push_str(&d.path);
+    }
+    if d.table == TableKind::Unknown {
+        s.push_str(&format!("  [{}]", unreadable_table_note(elevation_hint)));
+    }
+    s
+}
+
+/// What a disk with an unreadable partition table (`TableKind::Unknown`) shows.
+pub fn unreadable_table_note(elevation_hint: &str) -> String {
+    format!("partition table not readable, offsets approximate: {elevation_hint} for exact offsets")
 }
 
 /// An example absolute path for hints and messages: `rel` (with `/` separators) under `D:\`
@@ -169,7 +185,13 @@ mod tests {
             free_row(2 * MIB),
             ["(Unallocated)", "2.00 MB", "0 B", "2.00 MB", "Unallocated", "", "None"].map(String::from)
         );
-        assert_eq!(disk_header(&gpt_disk(1)), "Disk 1 (Test SSD, GPT, 1.00 GB)");
+        let d = gpt_disk(1);
+        assert_eq!(disk_header(&d, "HINT"), format!("Disk 1 (Test SSD, GPT, 1.00 GB)  {}", d.path));
+        let mut d = DiskInfo { path: "/dev/sdb".into(), ..gpt_disk(1) };
+        assert_eq!(disk_header(&d, "HINT"), "Disk 1 (Test SSD, GPT, 1.00 GB)  /dev/sdb");
+        d.table = TableKind::Unknown;
+        let h = disk_header(&d, "run with sudo (root)");
+        assert!(h.ends_with("[partition table not readable, offsets approximate: run with sudo (root) for exact offsets]"), "{h}");
     }
 
     #[test]

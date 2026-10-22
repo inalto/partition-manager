@@ -149,7 +149,7 @@ impl CopyDiskState {
     pub fn initial(ctx: &WizardCtx) -> Option<CopyDiskState> {
         let sources = source_disks(ctx.model);
         let src = ctx.selection.disk().filter(|d| sources.contains(d)).or_else(|| sources.first().copied())?;
-        let boot_fix = default_boot_fix(ctx.model.disk(src)?, BootFix::None);
+        let boot_fix = boot_fix_for(ctx.os_name, default_boot_fix(ctx.model.disk(src)?, BootFix::None));
         Some(CopyDiskState { src, dst: None, sizing: Sizing::Fit, mode: CloneMode::Smart, boot_fix, target_table: None })
     }
 
@@ -224,15 +224,37 @@ pub fn sizing_ui(ui: &mut egui::Ui, sizing: &mut Sizing) {
         .on_disabled_hover_text("Partitions are always laid out on 1 MB boundaries");
 }
 
-pub fn boot_fix_ui(ui: &mut egui::Ui, boot_fix: &mut BootFix) {
+/// Shown instead of the boot repair choice on Linux and macOS.
+pub const BOOT_REPAIR_WINDOWS_ONLY: &str =
+    "Boot repair is Windows-only; the clone will not be made bootable from this host.";
+
+/// `wanted` where boot repair can run (`os`, `Platform::os_name`: Windows), else none.
+pub fn boot_fix_for(os: &str, wanted: BootFix) -> BootFix {
+    if os == "windows" {
+        wanted
+    } else {
+        BootFix::None
+    }
+}
+
+pub fn boot_fix_ui(ui: &mut egui::Ui, boot_fix: &mut BootFix, os: &str) {
+    let available = os == "windows";
+    if !available {
+        *boot_fix = BootFix::None;
+    }
     ui.horizontal(|ui| {
         ui.label("Boot repair on the target:");
-        egui::ComboBox::from_id_salt("boot_fix").selected_text(boot_fix_name(*boot_fix)).show_ui(ui, |ui| {
-            for b in [BootFix::None, BootFix::Uefi, BootFix::Bios, BootFix::All] {
-                ui.selectable_value(boot_fix, b, boot_fix_name(b));
-            }
+        ui.add_enabled_ui(available, |ui| {
+            egui::ComboBox::from_id_salt("boot_fix").selected_text(boot_fix_name(*boot_fix)).show_ui(ui, |ui| {
+                for b in [BootFix::None, BootFix::Uefi, BootFix::Bios, BootFix::All] {
+                    ui.selectable_value(boot_fix, b, boot_fix_name(b));
+                }
+            });
         });
     });
+    if !available {
+        ui.weak(BOOT_REPAIR_WINDOWS_ONLY);
+    }
 }
 
 /// The source bar, the planned target bar and the shrink warnings of `op`; the planner's
@@ -276,7 +298,7 @@ fn source_ui(s: &mut CopyDiskState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepR
                 s.dst = None;
             }
             if let Some(d) = ctx.model.disk(src) {
-                s.boot_fix = default_boot_fix(d, BootFix::None);
+                s.boot_fix = boot_fix_for(ctx.os_name, default_boot_fix(d, BootFix::None));
             }
         }
     }
@@ -307,7 +329,7 @@ fn options_ui(s: &mut CopyDiskState, ui: &mut egui::Ui, ctx: &WizardCtx) -> Step
     ui.add_space(8.0);
     table_ui(ui, ctx.model, s.src, s.dst, &mut s.target_table);
     ui.add_space(8.0);
-    boot_fix_ui(ui, &mut s.boot_fix);
+    boot_fix_ui(ui, &mut s.boot_fix, ctx.os_name);
     StepResult::Continue
 }
 
@@ -378,7 +400,11 @@ mod tests {
     #[test]
     fn build_clone_disk_op_from_filled_state() {
         let m = model();
-        let ctx = WizardCtx::new(&m, vec![], Selected::Disk(1));
+        let mut ctx = WizardCtx::new(&m, vec![], Selected::Disk(1));
+        // boot repair runs on Windows only
+        ctx.os_name = "linux";
+        assert_eq!(CopyDiskState::initial(&ctx).unwrap().boot_fix, BootFix::None);
+        ctx.os_name = "windows";
         let mut s = CopyDiskState::initial(&ctx).unwrap();
         assert_eq!((s.src, s.dst, s.boot_fix), (1, None, BootFix::Uefi), "EFI source: UEFI repair");
         assert!(s.build().unwrap_err().contains("target"));
@@ -452,6 +478,8 @@ mod tests {
         let m = model();
         assert_eq!(source_disks(&m), [1, 0], "the empty disk cannot be copied");
         assert_eq!(default_boot_fix(m.disk(0).unwrap(), BootFix::None), BootFix::Bios);
+        assert_eq!(boot_fix_for("windows", BootFix::Bios), BootFix::Bios);
+        assert_eq!(boot_fix_for("macos", BootFix::Bios), BootFix::None);
         let ctx = WizardCtx::new(&m, vec![], Selected::Disk(2));
         assert_eq!(CopyDiskState::initial(&ctx).unwrap().src, 1, "falls back to the first copyable disk");
     }

@@ -43,6 +43,10 @@ impl LabelLetterState {
         letters.extend(current);
         letters.sort_unstable();
         letters.dedup();
+        // no drive letters at all (Linux, macOS): only the label can change
+        if letters.is_empty() && (mode == Mode::Letter || p.fs.is_none()) {
+            return None;
+        }
         Some(LabelLetterState {
             disk,
             number,
@@ -95,7 +99,9 @@ fn step_ui(s: &mut LabelLetterState, ui: &mut egui::Ui, ctx: &WizardCtx) -> Step
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_enabled_ui(s.fs.is_some(), |ui| ui.radio_value(&mut s.mode, Mode::Label, "Change label"));
-        ui.radio_value(&mut s.mode, Mode::Letter, "Change drive letter");
+        if !s.letters.is_empty() {
+            ui.radio_value(&mut s.mode, Mode::Letter, "Change drive letter");
+        }
     });
     ui.add_space(6.0);
     match s.mode {
@@ -177,7 +183,12 @@ mod tests {
         s.label = "TWELVE_CHARS".into();
         assert!(s.build().unwrap_err().contains("11"));
         // MSR: no filesystem, so letter mode only
-        let s = LabelLetterState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 2)), Mode::Label).unwrap();
+        let s = LabelLetterState::initial(&WizardCtx::new(&m, vec!['G'], Selected::Partition(1, 2)), Mode::Label).unwrap();
         assert_eq!(s.mode, Mode::Letter);
+        // no drive letters at all (Linux, macOS): letter mode is not offered
+        assert!(LabelLetterState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 2)), Mode::Label).is_none());
+        assert!(LabelLetterState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 1)), Mode::Letter).is_none());
+        let s = LabelLetterState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 1)), Mode::Label).unwrap();
+        assert!(s.letters.is_empty() && s.mode == Mode::Label);
     }
 }

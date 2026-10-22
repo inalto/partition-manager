@@ -177,7 +177,7 @@ pub enum OpCommand {
     /// Write an empty partition table to a disk that has no partitions
     #[command(group(ArgGroup::new("table").required(true).multiple(false)))]
     InitDisk {
-        /// Disk index (`1` or `disk:1`)
+        /// Disk index (`1` or `disk:1`) or, on Linux and macOS, its node (`/dev/sdb`)
         #[arg(value_parser = disk_arg)]
         disk: u32,
         #[arg(long, group = "table")]

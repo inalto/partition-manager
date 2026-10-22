@@ -58,7 +58,8 @@ pub struct MigrateState {
 impl MigrateState {
     pub fn initial(ctx: &WizardCtx) -> Option<MigrateState> {
         let src = source_disk(ctx.model, ctx.selection.disk())?;
-        let boot_fix = default_boot_fix(ctx.model.disk(src)?);
+        // boot repair (bcdboot / bootsect) runs on Windows only
+        let boot_fix = super::copy_disk::boot_fix_for(ctx.os_name, default_boot_fix(ctx.model.disk(src)?));
         Some(MigrateState {
             src,
             only_system: false,
@@ -129,7 +130,7 @@ fn options_ui(s: &mut MigrateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepR
         .on_hover_text(KEEP_IDS_HELP)
         .on_disabled_hover_text("A copy with another partition table kind gets new ids.");
     ui.add_space(8.0);
-    boot_fix_ui(ui, &mut s.boot_fix);
+    boot_fix_ui(ui, &mut s.boot_fix, ctx.os_name);
     StepResult::Continue
 }
 
@@ -205,7 +206,11 @@ mod tests {
         new_ssd.partitions.clear();
         new_ssd.size = 4096 * MIB;
         let m = model_of(vec![sys, new_ssd, mbr_disk(0)]);
-        let ctx = WizardCtx::new(&m, vec![], Selected::None);
+        let mut ctx = WizardCtx::new(&m, vec![], Selected::None);
+        // from Linux / macOS the clone is not made bootable
+        ctx.os_name = "macos";
+        assert_eq!(MigrateState::initial(&ctx).unwrap().boot_fix, BootFix::None);
+        ctx.os_name = "windows";
         let mut s = MigrateState::initial(&ctx).unwrap();
         assert_eq!(s.src, 1, "the disk holding C:");
         assert_eq!(s.boot_fix, BootFix::Uefi);

@@ -33,13 +33,15 @@ pub fn cluster_name(c: Option<u32>) -> String {
     }
 }
 
-/// Filesystems offered for a partition of `len` bytes, each with why it is not available.
-pub fn fs_choices(len: u64) -> Vec<(FsKind, Option<&'static str>)> {
+/// Filesystems offered for a partition of `len` bytes on `os` (`Platform::os_name`), each
+/// with why it is not available.
+pub fn fs_choices(len: u64, os: &str) -> Vec<(FsKind, Option<&'static str>)> {
+    let os_why = |f| super::fs_unavailable(os, f);
     vec![
-        (FsKind::Ntfs, None),
+        (FsKind::Ntfs, os_why(FsKind::Ntfs)),
         (FsKind::Fat32, (len > FAT32_MAX).then_some("FAT32 volumes are limited to 32 GB")),
         (FsKind::ExFat, None),
-        (FsKind::ReFs, (len < REFS_MIN).then_some("ReFS needs at least 2 GB")),
+        (FsKind::ReFs, os_why(FsKind::ReFs).or((len < REFS_MIN).then_some("ReFS needs at least 2 GB"))),
     ]
 }
 
@@ -52,6 +54,8 @@ pub struct FormatState {
     pub label: String,
     pub cluster: Option<u32>,
     pub quick: bool,
+    /// `Platform::os_name`: which filesystems can be created.
+    pub os: &'static str,
 }
 
 impl FormatState {
@@ -59,8 +63,9 @@ impl FormatState {
         let Selected::Partition(disk, number) = ctx.selection else { return None };
         let d = ctx.model.disk(disk)?;
         let p = ctx.model.partition(disk, number).filter(|p| !is_container(d, p))?;
-        let offered = |f: FsKind| fs_choices(p.len).iter().any(|(c, why)| *c == f && why.is_none());
-        let fs = p.fs.filter(|f| offered(*f)).unwrap_or(FsKind::Ntfs);
+        let offered = |f: FsKind| fs_choices(p.len, ctx.os_name).iter().any(|(c, why)| *c == f && why.is_none());
+        let fallback = if offered(FsKind::Ntfs) { FsKind::Ntfs } else { FsKind::ExFat };
+        let fs = p.fs.filter(|f| offered(*f)).unwrap_or(fallback);
         Some(FormatState {
             disk,
             number,
@@ -70,11 +75,12 @@ impl FormatState {
             label: p.label.clone(),
             cluster: None,
             quick: true,
+            os: ctx.os_name,
         })
     }
 
     pub fn problem(&self) -> Option<String> {
-        if let Some((_, Some(why))) = fs_choices(self.len).into_iter().find(|(f, _)| *f == self.fs) {
+        if let Some((_, Some(why))) = fs_choices(self.len, self.os).into_iter().find(|(f, _)| *f == self.fs) {
             return Some(format!("{why}."));
         }
         label_problem(Some(self.fs), &self.label)
@@ -103,7 +109,7 @@ fn options_ui(s: &mut FormatState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepR
     egui::Grid::new("format_opts").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label("File system:");
         egui::ComboBox::from_id_salt("format_fs").width(180.0).selected_text(s.fs.display_name()).show_ui(ui, |ui| {
-            for (f, why) in fs_choices(s.len) {
+            for (f, why) in fs_choices(s.len, s.os) {
                 let r = ui.add_enabled_ui(why.is_none(), |ui| ui.selectable_value(&mut s.fs, f, f.display_name()));
                 if let Some(why) = why {
                     r.response.on_disabled_hover_text(why);

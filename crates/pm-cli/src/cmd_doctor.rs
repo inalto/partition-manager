@@ -4,18 +4,11 @@ use crate::cli::CliError;
 use pm_core::DiskInfo;
 use pm_platform::Platform;
 use std::io::Write;
+use std::path::PathBuf;
 
 pub fn run(platform: &dyn Platform, out: &mut dyn Write) -> Result<(), CliError> {
     out.write_all(report(platform).as_bytes())
         .map_err(|e| CliError::Runtime(pm_core::Error::io(0, 0, e)))
-}
-
-fn yes_no(b: bool) -> &'static str {
-    if b {
-        "yes"
-    } else {
-        "no"
-    }
 }
 
 fn disk_summary(d: &DiskInfo) -> String {
@@ -27,10 +20,72 @@ fn disk_summary(d: &DiskInfo) -> String {
     )
 }
 
+/// The external tools the platform layer of `os` (`Platform::os_name`) runs: mkfs / resize /
+/// udev tools on Linux, `diskutil` on macOS, the boot and format tools on Windows; `smartctl`
+/// (smartmontools) for SMART data on Linux and macOS.
+pub fn tool_names(os: &str) -> &'static [&'static str] {
+    match os {
+        "linux" => &[
+            "mkfs.vfat",
+            "mkfs.exfat",
+            "mkfs.ntfs",
+            "mkfs.ext4",
+            "ntfsresize",
+            "resize2fs",
+            "e2fsck",
+            "partprobe",
+            "udevadm",
+            "smartctl",
+        ],
+        "macos" => &["/usr/sbin/diskutil", "smartctl"],
+        "windows" => &["bcdboot.exe", "bootsect.exe", "mbr2gpt.exe", "format.com", "diskpart.exe"],
+        _ => &[],
+    }
+}
+
+/// Where `name` is found the way the platform layer looks for it (display only).
+#[cfg(unix)]
+fn locate_tool(name: &str) -> Option<PathBuf> {
+    pm_platform::posix::cmd::find_tool(name)
+}
+
+/// Where `name` is found the way the platform layer looks for it (display only).
+#[cfg(windows)]
+fn locate_tool(name: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var_os("SystemRoot")?).join("System32").join(name);
+    p.is_file().then_some(p)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn locate_tool(_name: &str) -> Option<PathBuf> {
+    None
+}
+
+/// The `Tools:` block: each tool of `os` with where it was found.
+fn tools_report(os: &str, locate: impl Fn(&str) -> Option<PathBuf>) -> String {
+    let names = tool_names(os);
+    if names.is_empty() {
+        return String::new();
+    }
+    let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
+    let mut s = String::from("Tools:\n");
+    for n in names {
+        let at = locate(n).map_or("not found".to_string(), |p| p.display().to_string());
+        s.push_str(&format!("  {n:<width$}  {at}\n"));
+    }
+    s
+}
+
 pub fn report(platform: &dyn Platform) -> String {
     let mut s = String::new();
     s.push_str(&format!("pm {}\n", env!("CARGO_PKG_VERSION")));
-    s.push_str(&format!("Elevated:     {}\n", yes_no(platform.is_elevated())));
+    let elevated = platform.is_elevated();
+    let rights = if elevated {
+        "yes".to_string()
+    } else {
+        format!("no (read-only; {} to write)", platform.elevation_hint())
+    };
+    s.push_str(&format!("Elevated:     {rights}\n"));
     s.push_str(&format!("Platform:     {}\n", platform.os_name()));
     s.push_str(&format!(
         "Toolchain:    {} ({} {})\n",
@@ -63,6 +118,7 @@ pub fn report(platform: &dyn Platform) -> String {
         let l: Vec<String> = letters.iter().map(|c| format!("{c}:")).collect();
         s.push_str(&format!("Free letters: {}\n", l.join(" ")));
     }
+    s.push_str(&tools_report(platform.os_name(), locate_tool));
     s
 }
 
@@ -99,5 +155,20 @@ mod tests {
         assert!(r.contains("Platform:     none"), "{r}");
         assert!(r.contains("System disk:  unknown"), "{r}");
         assert!(r.contains("Free letters: none"), "{r}");
+        assert!(r.contains("Elevated:     no (read-only;"), "{r}");
+    }
+
+    #[test]
+    fn tools_per_os() {
+        assert!(tool_names("linux").contains(&"mkfs.vfat") && tool_names("linux").contains(&"smartctl"));
+        assert_eq!(tool_names("macos"), ["/usr/sbin/diskutil", "smartctl"]);
+        assert!(tool_names("windows").contains(&"bcdboot.exe"));
+        assert!(tool_names("none").is_empty());
+        let r = tools_report("macos", |n| (n == "smartctl").then(|| PathBuf::from("/opt/homebrew/bin/smartctl")));
+        assert_eq!(r, "Tools:\n  /usr/sbin/diskutil  not found\n  smartctl            /opt/homebrew/bin/smartctl\n");
+        assert_eq!(tools_report("none", |_| None), "");
+        // the platform's OS decides the list
+        let mock = report(&MockPlatform::new());
+        assert!(mock.contains("Tools:") && mock.contains(tool_names(std::env::consts::OS)[0]), "{mock}");
     }
 }

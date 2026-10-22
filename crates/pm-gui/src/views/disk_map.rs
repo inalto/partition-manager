@@ -144,7 +144,8 @@ fn table_name(d: &DiskInfo) -> &'static str {
     match d.table {
         TableKind::Gpt => "GPT",
         TableKind::Mbr => "MBR",
-        TableKind::None | TableKind::Unknown => "Uninitialized",
+        TableKind::None => "Uninitialized",
+        TableKind::Unknown => "Unreadable",
     }
 }
 
@@ -179,7 +180,7 @@ fn disk_bar(ui: &mut egui::Ui, s: &AppState, d: &DiskInfo, c: &MapColors, out: &
     if resp.clicked() || resp.secondary_clicked() {
         out.push(Cmd::Select(disk_sel));
     }
-    resp.on_hover_text(d.display_name()).context_menu(|ui| context_menu::show(ui, s, disk_sel, out));
+    resp.on_hover_text(crate::format_util::disk_header(d, s.platform.elevation_hint())).context_menu(|ui| context_menu::show(ui, s, disk_sel, out));
 
     // segments
     let bar = Rect::from_min_max(pos2(rect.min.x + LABEL_WIDTH + 4.0, rect.min.y), rect.max);

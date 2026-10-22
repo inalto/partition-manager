@@ -78,8 +78,11 @@ pub struct CreateState {
     pub label: String,
     pub letter: Option<char>,
     pub name: String,
-    /// Letters offered (free on the system and in the preview).
+    /// Letters offered (free on the system and in the preview). Empty on Linux and macOS,
+    /// which have no drive letters: the letter chooser is hidden.
     pub letters: Vec<char>,
+    /// `Platform::os_name`: which filesystems can be created.
+    pub os: &'static str,
 }
 
 impl CreateState {
@@ -101,11 +104,12 @@ impl CreateState {
             range: 0,
             bar: BarState::new(range_extent((MIB, MIB)), MIB, MIB, None),
             ptype: type_choices(d.table)[0].0,
-            fs: Some(FsKind::Ntfs),
+            fs: Some(if super::fs_unavailable(ctx.os_name, FsKind::Ntfs).is_none() { FsKind::Ntfs } else { FsKind::ExFat }),
             label: String::new(),
             letter: ctx.platform_free_letters.first().copied(),
             name: String::new(),
             letters: ctx.platform_free_letters.clone(),
+            os: ctx.os_name,
         };
         st.set_disk(d);
         st.set_range(range);
@@ -148,6 +152,9 @@ impl CreateState {
     pub fn props_problem(&self) -> Option<String> {
         if self.fs == Some(FsKind::Fat32) && self.bar.len > FAT32_MAX {
             return Some("FAT32 is limited to 32 GB here; choose NTFS or exFAT.".into());
+        }
+        if let Some(why) = self.fs.and_then(|f| super::fs_unavailable(self.os, f)) {
+            return Some(format!("{why}; choose another file system."));
         }
         if self.fs.is_none() {
             // no volume: no letter or label to check (they are not used)
@@ -263,10 +270,14 @@ fn props_ui(s: &mut CreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResu
         let mut fs = s.fs;
         egui::ComboBox::from_id_salt("create_fs").width(220.0).selected_text(fs_name(fs)).show_ui(ui, |ui| {
             for f in FS_CHOICES {
-                let too_big = f == Some(FsKind::Fat32) && s.bar.len > FAT32_MAX;
-                ui.add_enabled_ui(!too_big, |ui| ui.selectable_value(&mut fs, f, fs_name(f)))
+                let why = match f {
+                    Some(FsKind::Fat32) if s.bar.len > FAT32_MAX => Some("FAT32 volumes are limited to 32 GB"),
+                    Some(k) => super::fs_unavailable(s.os, k),
+                    None => None,
+                };
+                ui.add_enabled_ui(why.is_none(), |ui| ui.selectable_value(&mut fs, f, fs_name(f)))
                     .response
-                    .on_disabled_hover_text("FAT32 volumes are limited to 32 GB");
+                    .on_disabled_hover_text(why.unwrap_or_default());
             }
         });
         if fs != s.fs {
@@ -278,9 +289,12 @@ fn props_ui(s: &mut CreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResu
         ui.add_enabled(s.fs.is_some(), egui::TextEdit::singleline(&mut s.label).desired_width(220.0));
         ui.end_row();
 
-        ui.label("Drive letter:");
-        ui.add_enabled_ui(s.fs.is_some(), |ui| letter_combo(ui, "create_letter", &mut s.letter, &s.letters));
-        ui.end_row();
+        // no drive letters on Linux / macOS: the volume is mounted later, at a folder
+        if !s.letters.is_empty() {
+            ui.label("Drive letter:");
+            ui.add_enabled_ui(s.fs.is_some(), |ui| letter_combo(ui, "create_letter", &mut s.letter, &s.letters));
+            ui.end_row();
+        }
 
         if s.table == TableKind::Gpt {
             ui.label("Partition name:");
@@ -290,7 +304,11 @@ fn props_ui(s: &mut CreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResu
     });
     if s.fs.is_none() {
         ui.add_space(4.0);
-        ui.weak("Without a file system the partition gets no label and no drive letter.");
+        ui.weak(if s.letters.is_empty() {
+            "Without a file system the partition gets no label."
+        } else {
+            "Without a file system the partition gets no label and no drive letter."
+        });
     }
     if s.bar.len > FAT32_MAX {
         ui.add_space(4.0);
@@ -313,8 +331,10 @@ fn props_summary(s: &CreateState) -> Vec<(String, String)> {
         row("Type", s.ptype.name()),
         row("File system", fs_name(s.fs)),
         row("Label", if label.is_empty() { "(none)".to_string() } else { label }),
-        row("Drive letter", letter.map_or("None".to_string(), |c| format!("{c}:"))),
     ];
+    if !s.letters.is_empty() {
+        rows.push(row("Drive letter", letter.map_or("None".to_string(), |c| format!("{c}:"))));
+    }
     if s.table == TableKind::Gpt && !s.name.trim().is_empty() {
         rows.push(row("Name", s.name.trim()));
     }
@@ -348,6 +368,26 @@ mod tests {
     fn gpt_free_ctx(m: &Model) -> WizardCtx<'_> {
         let free = disk_items(m.disk(1).unwrap()).last().unwrap().sel;
         WizardCtx::new(m, vec!['G', 'H'], free)
+    }
+
+    #[test]
+    fn no_letters_and_no_ntfs_where_the_os_has_none() {
+        let m = model_of(vec![gpt_disk(1)]);
+        let free = disk_items(m.disk(1).unwrap()).last().unwrap().sel;
+        let mut ctx = WizardCtx::new(&m, vec![], free);
+        ctx.os_name = "macos";
+        let mut s = CreateState::initial(&ctx).unwrap();
+        assert!(s.letters.is_empty() && s.letter.is_none(), "no drive letters to offer");
+        assert_eq!(s.fs, Some(FsKind::ExFat), "NTFS cannot be created on macOS");
+        assert!(!props_summary(&s).iter().any(|(k, _)| k == "Drive letter"), "{:?}", props_summary(&s));
+        s.set_fs(Some(FsKind::Ntfs));
+        assert!(s.props_problem().unwrap().contains("third-party"));
+        s.set_fs(Some(FsKind::Fat32));
+        let Operation::CreatePartition { letter, fs, .. } = &s.build().unwrap()[0] else { panic!() };
+        assert_eq!((*letter, *fs), (None, Some(FsKind::Fat32)));
+        // Linux keeps NTFS (mkfs.ntfs)
+        ctx.os_name = "linux";
+        assert_eq!(CreateState::initial(&ctx).unwrap().fs, Some(FsKind::Ntfs));
     }
 
     #[test]

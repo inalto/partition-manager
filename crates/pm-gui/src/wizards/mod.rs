@@ -169,6 +169,16 @@ pub fn size_edit(ui: &mut egui::Ui, st: &mut SizeText, value: u64) -> Option<u64
     st.update(resp.gained_focus(), resp.lost_focus(), resp.has_focus(), value)
 }
 
+/// Why `fs` cannot be created on `os` (`Platform::os_name`), if it cannot: NTFS needs
+/// third-party tools on macOS, ReFS exists on Windows only.
+pub fn fs_unavailable(os: &str, fs: FsKind) -> Option<&'static str> {
+    match (os, fs) {
+        ("macos", FsKind::Ntfs) => Some("NTFS formatting needs third-party tools on macOS"),
+        (os, FsKind::ReFs) if os != "windows" => Some("ReFS volumes can only be created on Windows"),
+        _ => None,
+    }
+}
+
 /// Combo box of `letters` plus "None".
 pub fn letter_combo(ui: &mut egui::Ui, id: &str, choice: &mut Option<char>, letters: &[char]) {
     let text = choice.map_or("None".to_string(), |c| format!("{c}:"));
@@ -269,6 +279,10 @@ mod tests {
     #[test]
     fn label_limits() {
         assert_eq!(max_label_len(Some(FsKind::Fat32)), 11);
+        assert!(fs_unavailable("macos", FsKind::Ntfs).is_some());
+        assert!(fs_unavailable("linux", FsKind::Ntfs).is_none() && fs_unavailable("windows", FsKind::Ntfs).is_none());
+        assert!(fs_unavailable("linux", FsKind::ReFs).is_some() && fs_unavailable("windows", FsKind::ReFs).is_none());
+        assert!(fs_unavailable("macos", FsKind::ExFat).is_none());
         assert_eq!(max_label_len(Some(FsKind::ExFat)), 11);
         assert_eq!(max_label_len(Some(FsKind::Ntfs)), 32);
         assert!(label_problem(Some(FsKind::Fat32), "TWELVE_CHARS").is_some());

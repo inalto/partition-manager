@@ -27,25 +27,43 @@ pub fn sizes_between(from: usize, to: usize) -> Vec<u32> {
     SIZES[a.min(b)..=b].to_vec()
 }
 
-/// Drive roots (`"E:\"`) of the live model, with a description.
+/// Folders of the live model a benchmark or analysis can run in (drives, mount points), with a
+/// description.
 pub fn drive_roots(env: &ToolEnv) -> Vec<(String, String)> {
+    mount_roots(env.live)
+}
+
+/// A mount point as a folder to offer: a drive (`e:` / `E:\`) as `E:\`, anything else (a
+/// folder mount point, a Linux / macOS mount point) as reported.
+fn mount_root(m: &str) -> (String, String) {
+    let b = m.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && m.len() <= 3 {
+        let c = (b[0] as char).to_ascii_uppercase();
+        return (format!("{c}:\\"), format!("{c}:"));
+    }
+    (m.to_string(), m.to_string())
+}
+
+/// `(folder, description)` of every mounted filesystem of `m` (drives, folder mount points,
+/// Linux / macOS mount points), sorted.
+pub fn mount_roots(m: &pm_ops::Model) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for d in &env.live.disks {
+    for d in &m.disks {
         for p in &d.partitions {
-            if let Some(c) = p.letter() {
-                let fs = p.fs.map_or("", |f| f.display_name());
-                out.push((format!("{c}:\\"), format!("{c}: {} {fs} ({})", p.label, format_size(p.len))));
+            let fs = p.fs.map_or("", |f| f.display_name());
+            for mp in &p.mount_points {
+                let (root, shown) = mount_root(mp);
+                if !out.iter().any(|o| o.0 == root) {
+                    out.push((root, format!("{shown} {} {fs} ({})", p.label, format_size(p.len))));
+                }
             }
         }
     }
-    for v in &env.live.volumes {
-        for m in &v.mount_points {
-            let b = m.as_bytes();
-            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-                let root = format!("{}:\\", (b[0] as char).to_ascii_uppercase());
-                if !out.iter().any(|o| o.0 == root) {
-                    out.push((root.clone(), format!("{} {}", &root[..2], v.label)));
-                }
+    for v in &m.volumes {
+        for mp in &v.mount_points {
+            let (root, shown) = mount_root(mp);
+            if !out.iter().any(|o| o.0 == root) {
+                out.push((root, format!("{shown} {}", v.label)));
             }
         }
     }
@@ -337,5 +355,16 @@ mod tests {
         assert_eq!(o.mode, BenchMode::Random);
         assert_eq!(size_text(4096), "4 KB");
         assert_eq!(size_text(1 << 20), "1 MB");
+    }
+
+    #[test]
+    fn mount_roots_cover_letters_and_folders() {
+        let mut m = crate::test_util::model_of(vec![crate::test_util::gpt_disk(1)]);
+        m.disks[0].partitions[0].mount_points = vec!["/boot/efi".into()];
+        m.volumes.push(pm_core::VolumeInfo { mount_points: vec!["/".into(), r"E:\".into()], label: "root".into(), ..Default::default() });
+        let roots = mount_roots(&m);
+        let folders: Vec<&str> = roots.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(folders, ["/", "/boot/efi", r"E:\"], "{roots:?}");
+        assert!(roots[2].1.starts_with("E: Data"), "{roots:?}");
     }
 }

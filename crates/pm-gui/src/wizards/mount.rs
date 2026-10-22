@@ -33,7 +33,7 @@ pub fn folder_problem(path: &str) -> Option<String> {
     }
     let p = Path::new(path);
     if !p.is_absolute() {
-        return Some("Enter the full path of the folder, e.g. C:\\Mount\\Data.".into());
+        return Some(format!("Enter the full path of the folder, e.g. {}.", folder_example()));
     }
     if !p.is_dir() {
         return Some("The folder does not exist.".into());
@@ -41,6 +41,15 @@ pub fn folder_problem(path: &str) -> Option<String> {
     match std::fs::read_dir(p) {
         Err(e) => Some(format!("Cannot read the folder: {e}.")),
         Ok(mut entries) => entries.next().is_some().then(|| "The folder is not empty.".into()),
+    }
+}
+
+/// An example folder mount point for hints.
+fn folder_example() -> &'static str {
+    if cfg!(windows) {
+        "C:\\Mount\\Data"
+    } else {
+        "/mnt/data"
     }
 }
 
@@ -57,6 +66,8 @@ pub struct MountState {
     pub letter: Option<char>,
     pub letters: Vec<char>,
     pub folder: String,
+    /// `Platform::os_name` (the folder note differs per OS).
+    pub os: &'static str,
     /// `folder` as last checked and the result (the check touches the filesystem, so it only
     /// runs when the text changes, not on every frame).
     checked: Option<(String, Option<String>)>,
@@ -69,10 +80,12 @@ impl MountState {
         Some(MountState {
             volume: p.volume.clone()?,
             desc: partition_desc(disk, p),
-            target: Target::Letter,
+            // no drive letters on Linux / macOS: a folder is the only kind of mount point
+            target: if ctx.platform_free_letters.is_empty() { Target::Folder } else { Target::Letter },
             letter: ctx.platform_free_letters.first().copied(),
             letters: ctx.platform_free_letters.clone(),
             folder: String::new(),
+            os: ctx.os_name,
             checked: None,
         })
     }
@@ -109,18 +122,31 @@ impl MountState {
 fn mount_ui(s: &mut MountState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
     ui.label(&s.desc);
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut s.target, Target::Letter, "Drive letter:");
-        ui.add_enabled_ui(s.target == Target::Letter, |ui| letter_combo(ui, "mount_letter", &mut s.letter, &s.letters));
+    if s.letters.is_empty() {
+        // Linux / macOS: no drive letters, the volume is mounted at a folder
+        s.target = Target::Folder;
+        ui.horizontal(|ui| {
+            ui.label("Empty folder:");
+            ui.add(egui::TextEdit::singleline(&mut s.folder).desired_width(260.0).hint_text(folder_example()));
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut s.target, Target::Letter, "Drive letter:");
+            ui.add_enabled_ui(s.target == Target::Letter, |ui| letter_combo(ui, "mount_letter", &mut s.letter, &s.letters));
+        });
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut s.target, Target::Folder, "Empty folder:");
+            ui.add_enabled(
+                s.target == Target::Folder,
+                egui::TextEdit::singleline(&mut s.folder).desired_width(260.0).hint_text(folder_example()),
+            );
+        });
+    }
+    ui.weak(if s.os == "windows" {
+        "A folder mount point must be an empty folder on an NTFS volume."
+    } else {
+        "The folder must exist and be empty."
     });
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut s.target, Target::Folder, "Empty folder:");
-        ui.add_enabled(
-            s.target == Target::Folder,
-            egui::TextEdit::singleline(&mut s.folder).desired_width(260.0).hint_text("C:\\Mount\\Data"),
-        );
-    });
-    ui.weak("A folder mount point must be an empty folder on an NTFS volume.");
     let problem = match s.target {
         Target::Letter => s.letter.is_none().then(|| "Choose a drive letter.".to_string()),
         Target::Folder => s.folder_check(),
@@ -243,6 +269,10 @@ mod tests {
         assert!(s.build().unwrap_err().contains("full path"));
         // no volume: no mount wizard
         assert!(MountState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 2))).is_none());
+        // no drive letters (Linux, macOS): a folder from the start
+        let s = MountState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 3))).unwrap();
+        assert_eq!((s.target, s.letter), (Target::Folder, None));
+        assert!(s.build().unwrap_err().contains("Enter the folder"));
     }
 
     #[test]

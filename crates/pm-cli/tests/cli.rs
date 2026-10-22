@@ -109,7 +109,7 @@ fn cli_doctor_runs_and_reports() {
     let out = pm(&["doctor"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = stdout(&out);
-    for key in ["Elevated", "Platform", "Toolchain", "Disks", "System disk", "Free letters"] {
+    for key in ["Elevated", "Platform", "Toolchain", "Disks", "System disk", "Free letters", "Tools:"] {
         assert!(text.contains(key), "missing {key}: {text}");
     }
 }
@@ -143,11 +143,11 @@ fn unused_letter() -> Option<char> {
 fn cli_unknown_volume_exits_1() {
     // an unknown disk index is an argument error, not a platform failure
     let out = pm(&["table", "disk:99999"]);
-    if stderr(&out).contains("not supported by the platform layer") {
-        // an OS without a platform layer yet cannot tell a missing disk from a failure
-        // TODO(Task B/C): remove once Linux/macOS platforms land
-        return;
-    }
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
+
+    // so is a device node that does not exist (Linux, macOS syntax; parsed on every OS)
+    let out = pm(&["table", "/dev/pm-no-such-node"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
 

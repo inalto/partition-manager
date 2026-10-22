@@ -1450,3 +1450,23 @@ fn whole_disk_volume_without_a_table_can_be_wiped_imaged_and_cloned() {
     // the Windows superfloppy (an MBR disk) keeps every operation it had
     Planner::simulate(&m, &Operation::DeletePartition { disk: 6, number: 1 }).unwrap();
 }
+
+#[test]
+fn disk_indexes_need_not_be_contiguous() {
+    // Linux keeps a removed disk's index for the life of the process: disks 0, 2 and 5
+    let p = pm_platform::MockPlatform::new();
+    for i in [5, 0, 2] {
+        p.add_disk(i, pm_core::MemDevice::new(64 * MIB), DiskInfo::default());
+    }
+    p.set_system_disk(0);
+    let m = Model::from_platform(&p).unwrap();
+    assert_eq!(m.disks.iter().map(|d| d.index).collect::<Vec<_>>(), [0, 2, 5]);
+    assert_eq!(m.disk(5).map(|d| d.index), Some(5));
+    assert!(m.disk(1).is_none() && m.disk(3).is_none());
+    // operations address disks by index, never by position
+    let m = Planner::simulate(&m, &Operation::InitializeDisk { disk: 5, kind: TableKind::Gpt }).unwrap();
+    assert_eq!(m.disk(5).unwrap().table, TableKind::Gpt);
+    assert_eq!(m.disk(2).unwrap().table, TableKind::None);
+    let msg = invalid_msg(Planner::simulate(&m, &Operation::InitializeDisk { disk: 1, kind: TableKind::Gpt }));
+    assert!(msg.contains("Disk 1 does not exist"), "{msg}");
+}

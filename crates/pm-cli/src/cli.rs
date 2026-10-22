@@ -39,7 +39,9 @@ pub enum Command {
     },
     /// Show the partition table of a disk, volume or image file
     Table {
-        /// `disk:N`, a drive letter (`D:`), a `\\?\Volume{..}\` path, or an image file (`file:PATH` or PATH)
+        /// `disk:N`, a `/dev/...` node (Linux, macOS: `/dev/sdb`, `/dev/disk2`; prefer it to `disk:N`,
+        /// a position that can change when a disk is plugged in), a drive letter (`D:`), a
+        /// `\\?\Volume{..}\` path, or an image file (`file:PATH` or PATH)
         device: String,
         /// Print the table as JSON
         #[arg(long)]
@@ -47,14 +49,14 @@ pub enum Command {
     },
     /// Mount a volume at a drive letter or an empty folder
     Mount {
-        /// Drive letter (`D:`) or `\\?\Volume{..}\` path
+        /// Drive letter (`D:`), `\\?\Volume{..}\` path, or (Linux, macOS) a `/dev/...` partition node
         volume: String,
         #[command(flatten)]
         at: MountTarget,
     },
     /// Remove a drive letter or folder mount point from a volume
     Unmount {
-        /// Drive letter (`D:`) or `\\?\Volume{..}\` path
+        /// Drive letter (`D:`), `\\?\Volume{..}\` path, or (Linux, macOS) a `/dev/...` partition node
         volume: String,
         #[command(flatten)]
         at: MountTarget,
@@ -68,7 +70,7 @@ pub enum Command {
     /// of reaching the same storage (hard links, junctions, a file stored on the disk being
     /// copied, a differencing image's parent) are not detected.
     Clone {
-        /// Source device: `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+        /// Source device: `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
         src: String,
         /// Destination device; must be at least as large as the source
         dst: String,
@@ -92,7 +94,7 @@ pub enum Command {
     /// images (vhd, vmdk, qcow2) allocate nothing for zero areas. A `disk:N[:P]` source runs
     /// the `image-disk` / `image-partition` operation.
     Image {
-        /// Source device: `disk:N[:P]`, a drive letter, or an image file
+        /// Source device: `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file
         src: String,
         /// Image file to create (an existing file is overwritten)
         file: PathBuf,
@@ -139,7 +141,7 @@ pub enum Command {
     Rescue(RescueArgs),
     /// Identify the filesystem on a device
     Probe {
-        /// `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+        /// `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
         device: String,
         /// Look for the filesystem at this byte offset of the device
         #[arg(long, default_value = "0", value_parser = size_arg)]
@@ -147,21 +149,21 @@ pub enum Command {
     },
     /// List a directory of the filesystem on a device
     Ls {
-        /// `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+        /// `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
         device: String,
         /// Directory or file, `/`-separated (default: the root)
         path: Option<String>,
     },
     /// Write a file of the filesystem on a device to standard output
     Cat {
-        /// `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+        /// `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
         device: String,
         /// File path, `/`-separated
         path: String,
     },
     /// Copy a file or directory tree out of the filesystem on a device
     Extract {
-        /// `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+        /// `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
         device: String,
         /// File or directory path, `/`-separated (`/` extracts everything)
         path: String,
@@ -260,7 +262,7 @@ impl RescueModeArgs {
 /// Arguments of `pm rescue`; the short flags are GNU ddrescue's.
 #[derive(Args, Debug)]
 pub struct RescueArgs {
-    /// Source device: `disk:N[:P]`, a drive letter, or an image file
+    /// Source device: `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file
     pub src: String,
     /// Destination device; must be at least as large as the source. A path that does not
     /// exist yet is created as an image file of the source's size (format from --format or
@@ -328,10 +330,10 @@ pub fn parse_format(s: &str) -> Result<ImageFormat, String> {
 #[derive(Args, Debug)]
 #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
 pub struct MountTarget {
-    /// Drive letter, e.g. `E` or `E:`
+    /// Drive letter, e.g. `E` or `E:` (Windows only) (Windows only)
     #[arg(long, group = "target", value_parser = parse_letter)]
     pub letter: Option<char>,
-    /// Empty NTFS folder to use as the mount point
+    /// Empty folder to use as the mount point (on Windows, on an NTFS volume; the only kind on Linux and macOS)
     #[arg(long, group = "target")]
     pub folder: Option<PathBuf>,
 }

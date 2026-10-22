@@ -67,7 +67,7 @@ pub enum AnalyzeCommand {
     },
     /// Show the SMART health of a disk
     Smart {
-        /// Disk index (`1` or `disk:1`)
+        /// Disk index (`1` or `disk:1`) or, on Linux and macOS, its node (`/dev/sdb`)
         #[arg(value_parser = disk_arg)]
         disk: u32,
         /// Print the data as JSON

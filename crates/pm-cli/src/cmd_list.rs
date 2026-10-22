@@ -23,7 +23,7 @@ pub fn run(platform: &dyn Platform, json: bool, out: &mut dyn Write) -> Result<(
         s.push('\n');
         s
     } else {
-        render_disks(&disks)
+        render_disks(&disks, platform.elevation_hint())
     };
     out.write_all(text.as_bytes())
         .map_err(|e| CliError::Runtime(pm_core::Error::io(0, 0, e)))
@@ -71,13 +71,20 @@ fn disk_rows(d: &DiskInfo) -> Vec<[String; 7]> {
     items.into_iter().map(|(_, r)| r).collect()
 }
 
-/// Header line of a disk (`Disk 1 (Model, GPT, 1.82 TB)`).
+/// Header line of a disk: `Disk 1 (Model, GPT, 1.82 TB)  /dev/sdb`. The device path names the
+/// disk for good: on Linux and macOS `disk:N` is a position that can change when a disk is
+/// plugged in, so commands also take the path (`pm table /dev/sdb`).
 fn disk_header(d: &DiskInfo) -> String {
-    d.display_name()
+    if d.path.is_empty() {
+        d.display_name()
+    } else {
+        format!("{}  {}", d.display_name(), d.path)
+    }
 }
 
-/// The full text output for `disks`, columns aligned across all disks.
-pub fn render_disks(disks: &[DiskInfo]) -> String {
+/// The full text output for `disks`, columns aligned across all disks; a disk whose table
+/// could not be read advises `elevation_hint` (`Platform::elevation_hint`).
+pub fn render_disks(disks: &[DiskInfo], elevation_hint: &str) -> String {
     if disks.is_empty() {
         return "No disks found.\n".to_string();
     }
@@ -109,7 +116,9 @@ pub fn render_disks(disks: &[DiskInfo]) -> String {
         }
         out.push_str(&disk_header(d));
         if d.table == TableKind::Unknown {
-            out.push_str("  [partition table not readable]");
+            out.push_str(&format!(
+                "  [partition table not readable, offsets approximate: {elevation_hint} for exact offsets]"
+            ));
         }
         out.push('\n');
         out.push_str(&line(&header_cells));
@@ -169,7 +178,7 @@ mod tests {
 
     #[test]
     fn renders_header_rows_and_gaps() {
-        let text = render_disks(&[sample()]);
+        let text = render_disks(&[sample()], "HINT");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "Disk 1 (Test Disk, GPT, 10.00 GB)");
         for h in HEADERS {
@@ -193,7 +202,7 @@ mod tests {
 
     #[test]
     fn empty_and_unknown_cases() {
-        assert_eq!(render_disks(&[]), "No disks found.\n");
+        assert_eq!(render_disks(&[], "HINT"), "No disks found.\n");
         let blank = DiskInfo {
             index: 0,
             model: "Blank".into(),
@@ -201,7 +210,7 @@ mod tests {
             table: TableKind::None,
             ..Default::default()
         };
-        let text = render_disks(&[blank]);
+        let text = render_disks(&[blank], "HINT");
         assert!(text.starts_with("Disk 0 (Blank, Uninitialized, 2.00 GB)"));
         assert!(text.contains("(Unallocated)"));
     }
@@ -217,5 +226,28 @@ mod tests {
         let s = serde_json::to_string_pretty(&disks).unwrap();
         let back: Vec<DiskInfo> = serde_json::from_str(&s).unwrap();
         assert_eq!(back, disks);
+    }
+
+    #[test]
+    fn disks_listed_by_index_with_their_paths() {
+        use pm_core::MemDevice;
+        use pm_platform::MockPlatform;
+        // Linux keeps a removed disk's index: 0, 2 and 5 are listed, in index order
+        let p = MockPlatform::new();
+        for (i, path) in [(5, "/dev/sdf"), (0, "/dev/sda"), (2, "/dev/sdc")] {
+            p.add_disk(i, MemDevice::new(4 * MIB), DiskInfo { model: "M".into(), path: path.into(), ..Default::default() });
+        }
+        let mut out = Vec::new();
+        run(&p, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("Disk ")).collect();
+        assert_eq!(headers.len(), 3, "{text}");
+        assert!(headers[0].starts_with("Disk 0 (M,") && headers[0].ends_with("  /dev/sda"), "{text}");
+        assert!(headers[1].starts_with("Disk 2 (") && headers[1].ends_with("/dev/sdc"), "{text}");
+        assert!(headers[2].starts_with("Disk 5 (") && headers[2].ends_with("/dev/sdf"), "{text}");
+        // an unreadable table names the remedy
+        let unknown = DiskInfo { index: 3, table: TableKind::Unknown, path: "/dev/rdisk3".into(), ..Default::default() };
+        let t = render_disks(&[unknown], "run with sudo (root)");
+        assert!(t.lines().next().unwrap().ends_with("/dev/rdisk3  [partition table not readable, offsets approximate: run with sudo (root) for exact offsets]"), "{t}");
     }
 }
