@@ -12,12 +12,18 @@ use super::diskutil::{parse_identifier, parse_info, DeviceInfo, DiskutilRunner};
 use std::path::Path;
 
 /// `(disk, slice)` of the device behind `info`: the APFS physical store when there is one,
-/// else the device itself.
+/// else the device itself. `None` when the stores span several disks (Fusion).
 fn physical_location(info: &DeviceInfo) -> Option<(u32, Option<u32>)> {
-    match info.apfs_physical_stores.first() {
-        Some(store) => parse_identifier(store),
-        None => parse_identifier(&info.identifier).or_else(|| parse_identifier(&info.parent_whole_disk)),
+    if info.apfs_physical_stores.is_empty() {
+        return parse_identifier(&info.identifier).or_else(|| parse_identifier(&info.parent_whole_disk));
     }
+    let stores: Vec<(u32, Option<u32>)> = info.apfs_physical_stores.iter().filter_map(|s| parse_identifier(s)).collect();
+    let first = *stores.first()?;
+    if stores.iter().any(|(d, _)| *d != first.0) {
+        log::info!("{} is on APFS stores {:?} (several disks)", info.identifier, info.apfs_physical_stores);
+        return None;
+    }
+    Some(first)
 }
 
 /// Index of the disk holding `/`; `None` when `diskutil` cannot tell or `/` is not on exactly
@@ -25,17 +31,7 @@ fn physical_location(info: &DeviceInfo) -> Option<(u32, Option<u32>)> {
 pub fn system_disk(runner: &dyn DiskutilRunner) -> Option<u32> {
     let bytes = runner.run(&["info", "-plist", "/"]).map_err(|e| log::warn!("diskutil info /: {e}")).ok()?;
     let info = parse_info(&bytes).map_err(|e| log::warn!("diskutil info /: {e}")).ok()?;
-    if !info.apfs_physical_stores.is_empty() {
-        let mut disks: Vec<u32> = info.apfs_physical_stores.iter().filter_map(|s| parse_identifier(s)).map(|(d, _)| d).collect();
-        disks.sort_unstable();
-        disks.dedup();
-        if disks.len() != 1 {
-            log::info!("/ is on APFS stores {:?} (several disks): system disk unknown", info.apfs_physical_stores);
-            return None;
-        }
-        return disks.first().copied();
-    }
-    if info.virtual_or_physical.eq_ignore_ascii_case("Virtual") {
+    if info.apfs_physical_stores.is_empty() && info.virtual_or_physical.eq_ignore_ascii_case("Virtual") {
         log::info!("/ is on the virtual volume {} (CoreStorage?): system disk unknown", info.identifier);
         return None;
     }
@@ -46,10 +42,10 @@ pub fn system_disk(runner: &dyn DiskutilRunner) -> Option<u32> {
 /// each ancestor is tried until one answers (`/` always does). `path` should be absolute and
 /// resolved (symlinks); the caller does that on a real system.
 pub fn disk_of_path(runner: &dyn DiskutilRunner, path: &Path) -> Option<(u32, Option<u32>)> {
-    path.ancestors().filter(|a| !a.as_os_str().is_empty()).find_map(|a| {
-        let s = a.to_str()?;
-        let bytes = runner.run(&["info", "-plist", s]).ok()?;
-        let info = parse_info(&bytes).ok()?;
-        physical_location(&info)
-    })
+    // the first ancestor diskutil knows decides, even when it resolves to nothing (Fusion)
+    let info = path.ancestors().filter(|a| !a.as_os_str().is_empty()).find_map(|a| {
+        let bytes = runner.run(&["info", "-plist", a.to_str()?]).ok()?;
+        parse_info(&bytes).ok()
+    })?;
+    physical_location(&info)
 }

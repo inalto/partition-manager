@@ -10,13 +10,15 @@
 //!
 //! Three layouts result:
 //! * **exact**: the raw node opened and the table was read;
-//! * **approximate**: the raw node cannot be opened (not root). Slices are laid end to end,
+//! * **approximate**: the raw node cannot be opened and this process is not root. Slices are
+//!   laid end to end,
 //!   the table is reported [`TableKind::Unknown`]. Nothing in this process can write such a
 //!   disk (opening it fails the same way), and a queue planned from it and run as root fails
 //!   the identity check against the exact layout. No filesystem probing happens at the
 //!   approximate offsets;
 //! * **unplaced**: the raw node opened but the table is unusable (damaged, Apple Partition
-//!   Map): no partitions at all (table `Unknown`), and the slices are reported only as volumes
+//!   Map), or the node cannot be opened although this process is root (so it could open it
+//!   read-write later): no partitions at all (table `Unknown`), and the slices are reported only as volumes
 //!   without a disk or extent (`disk: None`, `len: 0`), which every same-disk / extent lookup
 //!   refuses.
 
@@ -156,19 +158,24 @@ fn match_slices(d: &DiskInfo, slices: &[Slice]) -> Vec<Option<usize>> {
         found[si] = Some(pi);
         taken[pi] = true;
     };
+    // a slice whose GUID names a partition of another size is left unmatched for good
+    let mut conflicting = vec![false; slices.len()];
     if d.table == TableKind::Gpt {
         for (si, s) in slices.iter().enumerate() {
             let Some(g) = s.guid() else { continue };
             let hit = d.partitions.iter().enumerate().find(|(i, p)| !taken[*i] && p.guid == Some(g));
             match hit {
                 Some((pi, p)) if p.len == s.listed.size => assign(&mut found, &mut taken, si, pi),
-                Some(_) => log::warn!("{}: partition GUID matches but the size differs", s.listed.identifier),
+                Some(_) => {
+                    log::warn!("{}: partition GUID matches but the size differs", s.listed.identifier);
+                    conflicting[si] = true;
+                }
                 None => {}
             }
         }
     }
     for (si, s) in slices.iter().enumerate() {
-        if found[si].is_some() {
+        if found[si].is_some() || conflicting[si] {
             continue;
         }
         let hit = d
@@ -181,11 +188,13 @@ fn match_slices(d: &DiskInfo, slices: &[Slice]) -> Vec<Option<usize>> {
         }
     }
     for si in 0..slices.len() {
-        if found[si].is_some() {
+        if found[si].is_some() || conflicting[si] {
             continue;
         }
         let size = slices[si].listed.size;
-        let same_slices = (0..slices.len()).filter(|&j| found[j].is_none() && slices[j].listed.size == size).count();
+        let same_slices = (0..slices.len())
+            .filter(|&j| found[j].is_none() && !conflicting[j] && slices[j].listed.size == size)
+            .count();
         let same_parts: Vec<usize> =
             (0..d.partitions.len()).filter(|&i| !taken[i] && d.partitions[i].len == size).collect();
         if same_slices == 1 && same_parts.len() == 1 {
@@ -255,6 +264,7 @@ fn disk_info(
     listed: ListedDisk,
     containers: &[ApfsContainer],
     system_disk: Option<u32>,
+    elevated: bool,
 ) -> Option<(DiskInfo, Vec<VolumeInfo>)> {
     let di = info(runner, &listed.identifier)?;
     let sector = di.device_block_size;
@@ -295,7 +305,15 @@ fn disk_info(
     slices.sort_by_key(|s| s.number);
 
     let Some(mut dev) = open(&d.path) else {
-        // not readable: approximate offsets, no probing at them
+        if elevated {
+            // root and still not readable: this process may open it read-write later, so
+            // no offsets at all
+            log::warn!("{}: cannot be opened although running as root; slices left unplaced", d.path);
+            d.table = TableKind::Unknown;
+            let volumes = apply_slices(&mut d, &slices, &vec![None; slices.len()]);
+            return Some((d, volumes));
+        }
+        // not readable (not root): approximate offsets, no probing at them
         let matches = approximate(&mut d, scheme, &slices);
         let volumes = apply_slices(&mut d, &slices, &matches);
         return Some((d, volumes));
@@ -329,15 +347,21 @@ fn disk_info(
 
 /// Every physical whole disk in `diskutil list` order (synthesized APFS disks skipped), with
 /// its slices merged in, and the slices as volumes. `open` reads the table from `/dev/rdiskN`
-/// when it can; `system_disk` sets [`DiskFlags::system`].
-pub fn enumerate(runner: &dyn DiskutilRunner, open: DeviceOpener<'_>, system_disk: Option<u32>) -> Result<Enumerated> {
+/// when it can; `system_disk` sets [`DiskFlags::system`]; `elevated` (running as root) turns
+/// an unopenable disk into the unplaced layout instead of the approximate one.
+pub fn enumerate(
+    runner: &dyn DiskutilRunner,
+    open: DeviceOpener<'_>,
+    system_disk: Option<u32>,
+    elevated: bool,
+) -> Result<Enumerated> {
     let list = runner.run(&["list", "-plist"])?;
     let listed = parse_list(&list)?;
     let containers = parse_apfs_containers(&list)?;
     let mut out = Enumerated::default();
     for l in listed {
         let Some((index, None)) = parse_identifier(&l.identifier) else { continue };
-        if let Some((d, v)) = disk_info(runner, open, index, l, &containers, system_disk) {
+        if let Some((d, v)) = disk_info(runner, open, index, l, &containers, system_disk, elevated) {
             out.disks.push(d);
             out.volumes.extend(v);
         }

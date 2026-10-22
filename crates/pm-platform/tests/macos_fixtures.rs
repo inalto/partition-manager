@@ -4,10 +4,10 @@
 
 use pm_core::{gpt_types, BlockDevice, DiskBus, Error, FsKind, PartitionType, Result, TableKind, VolumeId};
 use pm_parttable::{read_table, write_table, Entry, Table};
-use pm_platform::macos::diskutil::{parse_info, parse_list};
-use pm_platform::macos::write::{mounted_slices, prepare_write};
+use pm_platform::macos::diskutil::{canonical_volume_id, parse_info, parse_list};
+use pm_platform::macos::write::{mounted_slices, prepare_write, remount_args};
 use pm_platform::macos::{enumerate, format, mount, system_disk, AlignedDevice, DiskutilRunner};
-use pm_platform::MountPoint;
+use pm_platform::{MountPoint, NullPlatform, Platform};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -149,7 +149,7 @@ fn info_field_mapping() {
 #[test]
 fn enumeration_without_device_access_is_approximate() {
     let r = FixtureRunner::default();
-    let e = enumerate(&r, &no_device, Some(0)).unwrap();
+    let e = enumerate(&r, &no_device, Some(0), false).unwrap();
     let idx: Vec<u32> = e.disks.iter().map(|d| d.index).collect();
     assert_eq!(idx, [0, 2, 3], "disk1 is a synthesized APFS container");
 
@@ -285,7 +285,7 @@ fn enumeration_reads_the_table_when_the_disk_is_readable() {
     let open = move |path: &str| -> Option<Box<dyn BlockDevice>> {
         (path == "/dev/rdisk3").then(|| Box::new(disk3.clone()) as Box<dyn BlockDevice>)
     };
-    let e = enumerate(&FixtureRunner::default(), &open, Some(0)).unwrap();
+    let e = enumerate(&FixtureRunner::default(), &open, Some(0), false).unwrap();
     let d3 = e.disks.iter().find(|d| d.index == 3).unwrap();
     assert_eq!(d3.table, TableKind::Gpt);
     let p: Vec<(u32, u64, u64)> = d3.partitions.iter().map(|p| (p.number, p.start, p.len)).collect();
@@ -301,7 +301,7 @@ fn enumeration_reads_the_table_when_the_disk_is_readable() {
 #[test]
 fn failures_skip_disks_or_fail_the_listing() {
     let r = FixtureRunner { broken: vec!["disk2"], ..Default::default() };
-    let e = enumerate(&r, &no_device, None).unwrap();
+    let e = enumerate(&r, &no_device, None, false).unwrap();
     assert_eq!(e.disks.iter().map(|d| d.index).collect::<Vec<_>>(), [0, 3]);
     assert!(e.disks.iter().all(|d| !d.flags.system), "no system disk known");
 
@@ -311,7 +311,7 @@ fn failures_skip_disks_or_fail_the_listing() {
             Err(Error::Unsupported("diskutil is not installed".into()))
         }
     }
-    assert!(matches!(enumerate(&NoDiskutil, &no_device, None), Err(Error::Unsupported(_))));
+    assert!(matches!(enumerate(&NoDiskutil, &no_device, None, false), Err(Error::Unsupported(_))));
     assert_eq!(system_disk::system_disk(&NoDiskutil), None);
     assert_eq!(system_disk::disk_of_path(&NoDiskutil, Path::new("/Volumes/STICK")), None);
 }
@@ -480,7 +480,7 @@ fn readable_disk_without_a_usable_table_has_no_partitions() {
     let open = |path: &str| -> Option<Box<dyn BlockDevice>> {
         (path == "/dev/rdisk3").then(|| Box::new(Sparse { len: D3, sectors: BTreeMap::new() }) as Box<dyn BlockDevice>)
     };
-    let e = enumerate(&FixtureRunner::default(), &open, Some(0)).unwrap();
+    let e = enumerate(&FixtureRunner::default(), &open, Some(0), false).unwrap();
     let d3 = e.disks.iter().find(|d| d.index == 3).unwrap();
     assert_eq!(d3.table, TableKind::Unknown);
     assert!(d3.partitions.is_empty(), "no approximate offsets on a disk this process can write");
@@ -502,7 +502,7 @@ fn slices_match_partitions_by_guid_then_unambiguously() {
         let open = move |path: &str| -> Option<Box<dyn BlockDevice>> {
             (path == "/dev/rdisk3").then(|| Box::new(dev.clone()) as Box<dyn BlockDevice>)
         };
-        let e = enumerate(&runner(), &open, None).unwrap();
+        let e = enumerate(&runner(), &open, None, false).unwrap();
         let d = e.disks.into_iter().find(|d| d.index == 3).unwrap();
         (d, e.volumes)
     };
@@ -537,7 +537,7 @@ fn slices_match_partitions_by_guid_then_unambiguously() {
     let open = move |path: &str| -> Option<Box<dyn BlockDevice>> {
         (path == "/dev/rdisk3").then(|| Box::new(dev.clone()) as Box<dyn BlockDevice>)
     };
-    let e = enumerate(&FixtureRunner::default(), &open, None).unwrap();
+    let e = enumerate(&FixtureRunner::default(), &open, None, false).unwrap();
     let d = e.disks.iter().find(|d| d.index == 3).unwrap();
     assert_eq!(vol(d, 5).as_deref(), Some("/dev/disk3s1"));
     assert_eq!(vol(d, 6).as_deref(), Some("/dev/disk3s2"));
@@ -652,8 +652,9 @@ fn begin_write_unmounts_and_remounts_on_failure() {
 #[test]
 fn mounted_slices_include_apfs_container_volumes() {
     let list = fixture("list.plist");
-    assert_eq!(mounted_slices(&list, 0).unwrap(), ["disk1s1", "disk1s5"]);
-    assert_eq!(mounted_slices(&list, 2).unwrap(), ["disk2s1"]);
+    let pairs = |v: Vec<(String, String)>| v.iter().map(|(a, b)| format!("{a}@{b}")).collect::<Vec<_>>();
+    assert_eq!(pairs(mounted_slices(&list, 0).unwrap()), ["disk1s1@/System/Volumes/Data", "disk1s5@/"]);
+    assert_eq!(pairs(mounted_slices(&list, 2).unwrap()), ["disk2s1@/Volumes/STICK"]);
     assert!(mounted_slices(&list, 3).unwrap().is_empty());
 }
 
@@ -667,4 +668,107 @@ fn system_disk_fails_closed_on_fusion_and_virtual_roots() {
         .replace("<key>APFSPhysicalStores</key>", "<key>NotAPFSPhysicalStores</key>");
     let r = FixtureRunner { overrides: vec![("info -plist /", corestorage.into_bytes())], ..Default::default() };
     assert_eq!(system_disk::system_disk(&r), None);
+}
+
+#[test]
+fn unopenable_disk_as_root_is_unplaced_not_approximate() {
+    let e = enumerate(&FixtureRunner::default(), &no_device, Some(0), true).unwrap();
+    for d in &e.disks {
+        assert!(d.partitions.is_empty(), "disk {}: no offsets a root process could act on", d.index);
+        assert_eq!(d.table, TableKind::Unknown);
+    }
+    assert_eq!(e.volumes.len(), 5);
+    assert!(e.volumes.iter().all(|v| v.disk.is_none() && v.len == 0));
+    let stick = e.volumes.iter().find(|v| v.id.0 == "/dev/disk2s1").unwrap();
+    assert_eq!(stick.mount_points, ["/Volumes/STICK"], "diskutil's facts are kept");
+}
+
+#[test]
+fn guid_with_another_size_is_never_matched_later() {
+    // slices disk3s1 / disk3s2 are 100 MiB each with GUIDs ..01 / ..02. Entry 1 carries ..01
+    // but is 200 MiB: disk3s1 must stay unmatched instead of falling through to entry 3
+    // (the only other unmatched 100 MiB partition)
+    let dev = gpt_disk3(&[
+        (1, 40 * 512, 2 * MIB100, gpt_types::BASIC_DATA, "B1B2C3D4-0000-4000-8000-000000000001", "a"),
+        (2, 409_640 * 512, MIB100, gpt_types::BASIC_DATA, "B1B2C3D4-0000-4000-8000-000000000002", "b"),
+        (3, 614_440 * 512, MIB100, gpt_types::BASIC_DATA, "D0000000-0000-4000-8000-000000000003", "c"),
+    ]);
+    let open = move |path: &str| -> Option<Box<dyn BlockDevice>> {
+        (path == "/dev/rdisk3").then(|| Box::new(dev.clone()) as Box<dyn BlockDevice>)
+    };
+    let r = FixtureRunner { overrides: vec![("list -plist", list_with_equal_disk3_slices())], ..Default::default() };
+    let e = enumerate(&r, &open, None, false).unwrap();
+    let d = e.disks.iter().find(|d| d.index == 3).unwrap();
+    let vol = |n: u32| d.partitions.iter().find(|p| p.number == n).unwrap().volume.as_ref().map(|v| v.0.clone());
+    assert_eq!((vol(1), vol(2).as_deref(), vol(3)), (None, Some("/dev/disk3s2"), None));
+    let s1 = e.volumes.iter().find(|v| v.id.0 == "/dev/disk3s1").unwrap();
+    assert_eq!((s1.disk, s1.len), (None, 0));
+}
+
+#[test]
+fn disk_of_path_fails_closed_on_fusion() {
+    let r = FixtureRunner { overrides: vec![("info -plist /", fixture("info-root-fusion.plist"))], ..Default::default() };
+    assert_eq!(system_disk::disk_of_path(&r, Path::new("/Users/me/out.img")), None);
+    // other volumes are unaffected
+    assert_eq!(system_disk::disk_of_path(&r, Path::new("/Volumes/STICK/a")), Some((2, Some(1))));
+}
+
+#[test]
+fn volume_ids_are_canonicalised() {
+    assert_eq!(canonical_volume_id("/dev/rdisk2s1").as_deref(), Some("/dev/disk2s1"));
+    assert_eq!(canonical_volume_id("/dev/disk2"), None);
+    // the trait default leaves ids alone (Windows, mock, null)
+    let id = VolumeId("/dev/rdisk2s1".into());
+    assert_eq!(NullPlatform.canonical_volume_id(&id), id);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_platform_canonicalises_volume_ids() {
+    let p = pm_platform::MacPlatform::with_runner(Box::new(FixtureRunner::default()));
+    assert_eq!(p.canonical_volume_id(&VolumeId("/dev/rdisk2s1".into())), VolumeId("/dev/disk2s1".into()));
+    assert_eq!(p.canonical_volume_id(&VolumeId("disk2s1".into())), VolumeId("/dev/disk2s1".into()));
+    assert_eq!(p.canonical_volume_id(&VolumeId("/dev/disk2".into())), VolumeId("/dev/disk2".into()));
+}
+
+#[test]
+fn slices_are_mounted_again_where_they_were() {
+    assert_eq!(remount_args("disk2s1", "/Volumes/STICK"), ["mount", "disk2s1"]);
+    assert_eq!(remount_args("disk2s1", "/mnt/stick"), ["mount", "-mountPoint", "/mnt/stick", "disk2s1"]);
+
+    // a stick mounted outside /Volumes: the open fails, it goes back to /mnt/stick
+    let moved = String::from_utf8(fixture("list.plist")).unwrap().replace("/Volumes/STICK", "/mnt/stick");
+    let r = FixtureRunner { overrides: vec![("list -plist", moved.into_bytes())], ..Default::default() };
+    let e = prepare_write::<()>(&r, 2, true, |_| Err(Error::Platform { code: 13, msg: "denied".into() }));
+    assert!(e.is_err());
+    assert_eq!(
+        r.commands().last().unwrap(),
+        &["mount", "-mountPoint", "/mnt/stick", "disk2s1"].map(String::from).to_vec()
+    );
+
+    // unmountDisk fails and the second listing fails too: everything is mounted again and
+    // "already mounted" counts as success
+    let r = FixtureRunner {
+        failing: vec![("unmountDisk", "busy"), ("mount", "Volume STICK on disk2s1 is already mounted")],
+        list_after_unmount: Some(b"not a plist".to_vec()),
+        ..Default::default()
+    };
+    match prepare_write(&r, 2, true, |_| Ok(())) {
+        Err(Error::Busy(m)) => assert!(m.contains("mounted again") && !m.contains("could NOT"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let mount_stick = vec!["mount".to_string(), "disk2s1".to_string()];
+    assert_eq!(r.commands().last().unwrap(), &mount_stick);
+
+    // without the second listing failing, "already mounted" is still a failure to report
+    let after = String::from_utf8(fixture("list.plist")).unwrap().replace("<string>/Volumes/STICK</string>", "<string></string>");
+    let r = FixtureRunner {
+        failing: vec![("unmountDisk", "busy"), ("mount", "Volume STICK on disk2s1 is already mounted")],
+        list_after_unmount: Some(after.into_bytes()),
+        ..Default::default()
+    };
+    match prepare_write(&r, 2, true, |_| Ok(())) {
+        Err(Error::Busy(m)) => assert!(m.contains("could NOT mount again: disk2s1"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }

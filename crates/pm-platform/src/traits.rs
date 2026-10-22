@@ -139,6 +139,11 @@ pub trait Platform: Send + Sync {
     fn disk_of_path(&self, _path: &Path) -> Option<(u32, Option<u32>)> {
         None
     }
+    /// The form [`Platform::enumerate_volumes`] reports for a volume id the user typed (macOS:
+    /// `/dev/rdiskNsM` → `/dev/diskNsM`), so ids can be compared; unchanged by default.
+    fn canonical_volume_id(&self, id: &VolumeId) -> VolumeId {
+        id.clone()
+    }
 }
 
 /// Format name understood by `FormatEx` / `format.com` for `fs`.

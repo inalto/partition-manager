@@ -34,7 +34,7 @@ pub use platform::{MacPlatform, SystemDiskutil};
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::diskutil::{raw_node, DiskutilRunner};
+    use super::diskutil::{canonical_volume_id, raw_node, DiskutilRunner};
     use super::{device, enumerate, format, guard, mount, session, smart, system_disk};
     use crate::posix;
     use crate::traits::{ExternalTool, MountPoint, OpenMode, Platform, SmartData, WriteSession, ELEVATION_HINT_UNIX};
@@ -88,7 +88,7 @@ mod platform {
         }
 
         fn enumerate_all(&self) -> Result<enumerate::Enumerated> {
-            enumerate::enumerate(self.runner.as_ref(), &open_read_only, self.system_disk())
+            enumerate::enumerate(self.runner.as_ref(), &open_read_only, self.system_disk(), posix::is_root())
         }
     }
 
@@ -179,6 +179,11 @@ mod platform {
 
         fn elevation_hint(&self) -> &'static str {
             ELEVATION_HINT_UNIX
+        }
+
+        /// `/dev/rdiskNsM` and `diskNsM` → `/dev/diskNsM`; anything else unchanged.
+        fn canonical_volume_id(&self, id: &VolumeId) -> VolumeId {
+            canonical_volume_id(&id.0).map(VolumeId).unwrap_or_else(|| id.clone())
         }
 
         fn disk_of_path(&self, path: &Path) -> Option<(u32, Option<u32>)> {
