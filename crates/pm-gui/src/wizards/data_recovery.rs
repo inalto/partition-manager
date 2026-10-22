@@ -806,19 +806,22 @@ mod tests {
     use pm_recover::CarvedFile;
     use std::sync::Arc;
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn destination_must_not_be_on_the_source() {
         assert!(dest_problem("", &['E']).is_some());
         assert!(dest_problem("Recovered", &[]).unwrap().contains("full folder path"));
-        let e = dest_problem("e:\\Recovered", &['E']).unwrap();
-        assert!(e.contains("drive E:"), "{e}");
-        assert!(dest_problem("\\\\?\\E:\\Recovered", &['E']).is_some(), "verbatim paths too");
-        assert!(dest_problem("D:\\Recovered", &['E']).is_none());
-        assert!(dest_problem("\\\\server\\share\\x", &['E']).is_none());
-        assert_eq!(dest_letter(Path::new("c:\\x")), Some('C'));
+        // an absolute folder on no source drive is fine on every OS
+        let ok = std::env::temp_dir().join("Recovered").display().to_string();
+        assert!(dest_problem(&ok, &[]).is_none());
+        // drive letters exist on Windows only (the mount-point equivalent is multi-platform Task D)
+        if cfg!(windows) {
+            let e = dest_problem("e:\\Recovered", &['E']).unwrap();
+            assert!(e.contains("drive E:"), "{e}");
+            assert!(dest_problem("\\\\?\\E:\\Recovered", &['E']).is_some(), "verbatim paths too");
+            assert!(dest_problem("D:\\Recovered", &['E']).is_none());
+            assert!(dest_problem("\\\\server\\share\\x", &['E']).is_none());
+            assert_eq!(dest_letter(Path::new("c:\\x")), Some('C'));
+        }
     }
 
     #[test]

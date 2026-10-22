@@ -145,6 +145,7 @@ fn cli_unknown_volume_exits_1() {
     let out = pm(&["table", "disk:99999"]);
     if stderr(&out).contains("not supported by the platform layer") {
         // an OS without a platform layer yet cannot tell a missing disk from a failure
+        // TODO(Task B/C): remove once Linux/macOS platforms land
         return;
     }
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));

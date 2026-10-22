@@ -77,3 +77,48 @@ libxcb-shape0-dev libxcb-xfixes0-dev` (plus `build-essential`, already present).
    while a run is in progress (Windows keeps a visible `FILE_FLAG_DELETE_ON_CLOSE` file).
    Direct I/O behaviour on real block devices was only exercised on WSL's ext4/9p mounts.
 6. The macOS code path (`F_NOCACHE`) is compile-checked only; CI's macOS job will exercise it.
+
+## Fix round 1
+
+Review finding: `#[cfg(windows)]` had been applied to whole tests that are mostly portable.
+Now only the drive-letter assertions are guarded with `if cfg!(windows)`; the portable parts
+(relative / empty / "full path" / "does not exist" / "cannot be the image" / flat-extent and
+`.partial` rules / `build()` agreement / `recheck`) run on every OS, using `std::env::temp_dir()`
+for OS-neutral absolute paths. Tests changed:
+
+- `pm-gui` `image_create::damaged_page_requires_absolute_mapfile_off_source` (only the `e:\maps`
+  line is guarded)
+- `pm-gui` `rescue::mapfile_must_be_an_absolute_path` (absolute temp path added; `D:\` guarded)
+- `pm-gui` `data_recovery::destination_must_not_be_on_the_source` (absolute temp folder added;
+  letter lines guarded)
+- `pm-cli` `cmd_recover::destination_on_the_source_drive_is_refused` (letter lines guarded; the
+  relative-destination check runs everywhere)
+
+The three wholly letter-dependent tests stay `#[cfg(windows)]` (`image_create::
+image_file_on_the_source_is_refused`, `image_restore::image_on_the_target_disk_is_refused`,
+`rescue::files_on_the_source_or_destination_disk_are_refused`). Added
+`// TODO(Task B/C): remove once Linux/macOS platforms land` next to the NullPlatform early
+return in `cli_unknown_volume_exits_1`.
+
+`cargo test -p pm-gui -p pm-cli`, zero warnings on both.
+
+Windows:
+```
+test result: ok. 52 passed; 0 failed; 0 ignored   (pm bin)
+test result: ok. 7 passed; 0 failed; 0 ignored    (cli)
+test result: ok. 18 passed; 0 failed; 0 ignored   (cli_image)
+test result: ok. 19 passed; 0 failed; 0 ignored   (cli_ops)
+test result: ok. 130 passed; 0 failed; 0 ignored  (pm_gui lib)
+```
+WSL (`RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=~/pm-target-check CI=true`), run on a clean copy of
+`HEAD` plus these five files because another agent's in-progress `pm-platform` work (missing
+`posix/*` modules) did not compile in the shared tree at that moment:
+```
+test result: ok. 52 passed; 0 failed; 0 ignored   (pm bin)
+test result: ok. 7 passed; 0 failed; 0 ignored    (cli)
+test result: ok. 18 passed; 0 failed; 0 ignored   (cli_image)
+test result: ok. 19 passed; 0 failed; 0 ignored   (cli_ops)
+test result: ok. 127 passed; 0 failed; 0 ignored  (pm_gui lib; was 124, +3 restored)
+```
+One unexplained `pm-gui --lib` failure appeared once on Windows while the other agent was
+building in the same target dir; 7 further runs (3 of `--lib`, 4 of both crates) were all green.

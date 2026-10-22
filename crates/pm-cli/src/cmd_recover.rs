@@ -724,9 +724,6 @@ trailer << >>
         assert!(two.len() > images.len());
     }
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn destination_on_the_source_drive_is_refused() {
         use pm_core::{MemDevice, VolumeId, VolumeInfo};
@@ -740,11 +737,14 @@ trailer << >>
             0,
             4096,
         );
-        assert_eq!(dest_letter(Path::new(r"d:\out")), Some('D'));
-        assert_eq!(dest_letter(Path::new(r"\\server\share\x")), None);
-        assert!(matches!(check_dest(&p, "D:", Path::new(r"D:\recovered")), Err(CliError::Usage(_))));
-        assert!(check_dest(&p, "D:", Path::new(r"E:\recovered")).is_ok());
-        assert!(check_dest(&p, vol, Path::new(r"d:\x")).is_err());
+        // drive letters exist on Windows only (the mount-point equivalent is multi-platform Task D)
+        if cfg!(windows) {
+            assert_eq!(dest_letter(Path::new(r"d:\out")), Some('D'));
+            assert_eq!(dest_letter(Path::new(r"\\server\share\x")), None);
+            assert!(matches!(check_dest(&p, "D:", Path::new(r"D:\recovered")), Err(CliError::Usage(_))));
+            assert!(check_dest(&p, "D:", Path::new(r"E:\recovered")).is_ok());
+            assert!(check_dest(&p, vol, Path::new(r"d:\x")).is_err());
+        }
         // a relative destination is resolved against the current directory
         assert!(check_dest(&p, "disk:0", Path::new("relative")).is_ok());
     }

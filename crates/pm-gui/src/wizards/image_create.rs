@@ -490,9 +490,6 @@ mod tests {
         assert_eq!(*r, RescueSettings { mapfile: Some(map), ..settings });
     }
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn damaged_page_requires_absolute_mapfile_off_source() {
         let dir = tempfile::tempdir().unwrap();
@@ -512,7 +509,10 @@ mod tests {
         };
         assert!(problem(&mut s, "data.map".into()).contains("full path"));
         assert!(problem(&mut s, String::new()).contains("Enter the mapfile"));
-        assert!(problem(&mut s, r"e:\maps\data.map".into()).contains("drive E:"));
+        // drive letters exist on Windows only (the mount-point equivalent is multi-platform Task D)
+        if cfg!(windows) {
+            assert!(problem(&mut s, r"e:\maps\data.map".into()).contains("drive E:"));
+        }
         assert!(problem(&mut s, dir.path().join("missing").join("x.map").display().to_string()).contains("does not exist"));
         let image = s.path.clone();
         assert!(problem(&mut s, image).contains("cannot be the image"));

@@ -975,16 +975,16 @@ mod tests {
         assert!(mock.write_sessions_log().is_empty(), "nothing was written");
     }
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn mapfile_must_be_an_absolute_path() {
         use crate::tools::test_env::{model, platform};
         assert!(mapfile_path_problem("rescue.map").unwrap().contains("absolute path"));
         assert!(mapfile_path_problem(r"..\rescue.map").is_some());
         assert!(mapfile_path_problem("").is_some());
-        assert!(mapfile_path_problem(r"D:\Rescue\disk1.map").is_none());
+        assert!(mapfile_path_problem(&std::env::temp_dir().join("disk1.map").display().to_string()).is_none());
+        if cfg!(windows) {
+            assert!(mapfile_path_problem(r"D:\Rescue\disk1.map").is_none());
+        }
         // in the wizard: relative refused, absolute on another drive accepted
         let (m, p) = (model(), platform());
         let env = ToolEnv { platform: &p, live: &m, pending: &[] };
