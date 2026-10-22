@@ -8,13 +8,15 @@
 //! (`TableKind::Unknown`, no partition types). Writes, mounting, formatting and resizing need
 //! root.
 //!
-//! Disk indexes are positions in the sorted list of disks (loop devices last, so attaching an
-//! image does not renumber the real disks). Every enumeration remembers which disk each index
-//! named (kernel name + disk sequence number, or + size on kernels before 5.15); `open_disk`,
-//! `begin_write`, `rescan` and `smart` address that disk by name and refuse with "the disk list
-//! changed, refresh and retry" when another disk now sits there, so a hot-plug between listing
-//! and writing can never redirect a write. Volume operations likewise check that the partition
-//! still starts (and ends) where the last enumeration saw it.
+//! Disk indexes are stable for the life of the process: the first enumeration numbers the disks
+//! in sorted order (loop devices last), and from then on a disk (kernel name + disk sequence
+//! number, or + size on kernels before 5.15) keeps its index, a newly attached disk gets the
+//! next unused one, and the index of a disk that went away is never reused — so indexes can
+//! have gaps. `open_disk`, `begin_write`, `rescan` and `smart` refuse an index whose disk is
+//! gone or was replaced under the same name ("the disk list changed, refresh and retry"), so a
+//! hot-plug between listing and writing, or an enumeration in the middle of an operation, can
+//! never redirect a write. Volume operations likewise check that the volume's disk is still
+//! the enumerated one and that the partition still starts (and ends) where it was seen.
 //!
 //! Filesystems are created and resized with the system tools (`mkfs.*`, `ntfsresize`,
 //! `e2fsck` + `resize2fs`); S.M.A.R.T. comes from `smartctl`. A missing tool gives
@@ -74,11 +76,23 @@ fn changed(index: u32, name: &str) -> Error {
     ))
 }
 
-/// What the last enumeration showed: the disk behind each index and each volume's byte range.
+/// Whether two identities name the same attached disk: same name and disk sequence number,
+/// or same name and size when a sequence number is missing.
+fn same_disk(a: &DiskIdentity, b: &DiskIdentity) -> bool {
+    a.name == b.name
+        && match (a.diskseq, b.diskseq) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.size == b.size,
+        }
+}
+
+/// The index map and what the last enumeration showed of each volume.
 #[derive(Default)]
 struct Cache {
+    /// Every disk shown since the process started, at its index (append-only).
     disks: Vec<DiskIdentity>,
-    volumes: HashMap<String, (u64, u64)>,
+    /// Volume node -> (start, len, disk index) from the last enumeration.
+    volumes: HashMap<String, (u64, u64, u32)>,
 }
 
 /// The real Linux platform.
@@ -189,7 +203,12 @@ fn name_of(d: &DiskInfo) -> &str {
 
 impl LinuxPlatform {
     pub fn new() -> Self {
-        LinuxPlatform { sys_block: PathBuf::from("/sys/block"), cache: Mutex::new(Cache::default()) }
+        Self::with_sys_block(PathBuf::from("/sys/block"))
+    }
+
+    /// A platform reading disks from `sys_block` instead of `/sys/block` (fixture tests).
+    pub fn with_sys_block(sys_block: PathBuf) -> Self {
+        LinuxPlatform { sys_block, cache: Mutex::new(Cache::default()) }
     }
 
     fn cache(&self) -> MutexGuard<'_, Cache> {
@@ -206,38 +225,45 @@ impl LinuxPlatform {
         DiskIdentity { diskseq: sysfs::diskseq(&self.sys_block, &name), name, size: d.size }
     }
 
-    /// Remember `disks` (fresh, position-indexed) as what the caller sees.
-    fn remember(&self, disks: &[DiskInfo]) {
-        let ids = disks.iter().map(|d| self.identity(d)).collect();
-        self.cache().disks = ids;
-    }
-
-    /// The current disks renumbered with the remembered indexes; disks the caller has not been
-    /// shown yet are left out. Without a remembered list the current one becomes it.
-    fn indexed(&self) -> Vec<DiskInfo> {
-        let fresh = self.sysfs_disks();
-        if self.cache().disks.is_empty() {
-            self.remember(&fresh);
-            return fresh;
-        }
-        let known = self.cache().disks.clone();
-        fresh
+    /// Number `fresh` through the process-wide index map: a disk seen before (same name and
+    /// disk sequence number, or same name and size without one) keeps its index for the life
+    /// of the process; a new disk gets the next unused index; the index of a disk that went
+    /// away is never given to another one. Returned in index order.
+    fn number(&self, fresh: Vec<DiskInfo>) -> Vec<DiskInfo> {
+        let ids: Vec<DiskIdentity> = fresh.iter().map(|d| self.identity(d)).collect();
+        let mut cache = self.cache();
+        let mut out: Vec<DiskInfo> = fresh
             .into_iter()
-            .filter_map(|mut d| {
-                let i = known.iter().position(|k| k.name == name_of(&d))?;
+            .zip(ids)
+            .map(|(mut d, id)| {
+                let i = match cache.disks.iter().position(|k| same_disk(k, &id)) {
+                    Some(i) => i,
+                    None => {
+                        cache.disks.push(id);
+                        cache.disks.len() - 1
+                    }
+                };
                 d.index = i as u32;
-                Some(d)
+                d
             })
-            .collect()
+            .collect();
+        out.sort_by_key(|d| d.index);
+        out
     }
 
-    /// The disk the caller knows as `index` (by remembered name, looked up in sysfs now), after
-    /// checking that it is still the same disk. Without a remembered list (nothing enumerated
-    /// yet) the current list is used and remembered.
+    /// The current disks with their stable indexes (see [`LinuxPlatform::number`]).
+    fn indexed(&self) -> Vec<DiskInfo> {
+        self.number(self.sysfs_disks())
+    }
+
+    /// The disk known as `index`, after checking that the disk remembered under that index is
+    /// still attached (same name and disk sequence number, or size). A disk that went away, or
+    /// was replaced by another under the same name, is refused ("refresh and retry"). Without
+    /// any enumeration yet the current disks are numbered first.
     fn resolve(&self, index: u32) -> Result<(DiskInfo, DiskIdentity)> {
         let current = self.sysfs_disks();
         if self.cache().disks.is_empty() {
-            self.remember(&current);
+            self.number(current.clone());
         }
         let expected = self
             .cache()
@@ -255,16 +281,19 @@ impl LinuxPlatform {
         Ok((d, expected))
     }
 
-    /// `(start, len)` the last enumeration reported for volume `id`.
-    fn expected(&self, id: &VolumeId) -> Option<(u64, u64)> {
-        self.cache().volumes.get(&id.0).copied()
+    /// `(start, len)` the last enumeration reported for volume `id`, after checking that its
+    /// disk is still the one enumerated (`Err` "refresh and retry" otherwise); `None` for a
+    /// volume no enumeration has shown yet.
+    fn expected(&self, id: &VolumeId) -> Result<Option<(u64, u64)>> {
+        let Some((start, len, disk)) = self.cache().volumes.get(&id.0).copied() else { return Ok(None) };
+        self.resolve(disk)?;
+        Ok(Some((start, len)))
     }
 
     /// Disks with tables, filesystems, mounts and usage, plus the matching volumes; remembered
     /// as what the caller sees.
     fn scan(&self) -> (Vec<DiskInfo>, Vec<VolumeInfo>) {
-        let mut disks = self.sysfs_disks();
-        self.remember(&disks);
+        let mut disks = self.indexed();
         let mounts = mounts::read_mounts();
         let swaps = mounts::read_swaps();
         let system = system_disk_from(&mounts, &disks);
@@ -310,7 +339,10 @@ impl LinuxPlatform {
                 });
             }
         }
-        self.cache().volumes = volumes.iter().map(|v| (v.id.0.clone(), (v.start, v.len))).collect();
+        self.cache().volumes = volumes
+            .iter()
+            .filter_map(|v| Some((v.id.0.clone(), (v.start, v.len, v.disk?))))
+            .collect();
         (disks, volumes)
     }
 }
@@ -351,7 +383,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn mount(&self, id: &VolumeId, at: &MountPoint) -> Result<()> {
-        mount::mount(id, at, self.expected(id).map(|(s, l)| (s, Some(l))))
+        mount::mount(id, at, self.expected(id)?.map(|(s, l)| (s, Some(l))))
     }
 
     fn unmount(&self, id: &VolumeId, at: &MountPoint) -> Result<()> {
@@ -385,16 +417,16 @@ impl Platform for LinuxPlatform {
         quick: bool,
         progress: &dyn ProgressSink,
     ) -> Result<()> {
-        let expected = self.expected(id).map(|(s, l)| (s, Some(l)));
+        let expected = self.expected(id)?.map(|(s, l)| (s, Some(l)));
         format::format(id, expected, fs, label, cluster, quick, progress)
     }
 
     fn shrink_volume(&self, id: &VolumeId, new_len: u64) -> Result<()> {
-        resize::resize(id, self.expected(id).map(|(s, _)| s), new_len)
+        resize::resize(id, self.expected(id)?.map(|(s, _)| s), new_len)
     }
 
     fn extend_volume(&self, id: &VolumeId, new_len: u64) -> Result<()> {
-        resize::resize(id, self.expected(id).map(|(s, _)| s), new_len)
+        resize::resize(id, self.expected(id)?.map(|(s, _)| s), new_len)
     }
 
     fn smart(&self, disk: u32) -> Result<Option<SmartData>> {
@@ -474,6 +506,52 @@ mod tests {
         }
         assert!(check_identity(2, &id(None), Some(9), 16 << 30).is_ok(), "old kernel: size");
         assert!(check_identity(2, &id(None), None, 8 << 30).is_err());
+    }
+
+    /// A sysfs disk `name` of `size512` sectors, with a `diskseq` file when `seq` is given.
+    fn sys_disk(root: &Path, name: &str, size512: u64, seq: Option<u64>) {
+        let d = root.join(name);
+        std::fs::create_dir_all(d.join("queue")).unwrap();
+        std::fs::write(d.join("size"), format!("{size512}\n")).unwrap();
+        if let Some(s) = seq {
+            std::fs::write(d.join("diskseq"), format!("{s}\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn indexes_survive_hot_plug_and_are_never_reused() {
+        // names that do not exist under /dev here: nothing below opens a device
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().to_path_buf();
+        sys_disk(&root, "sdx", 1000, Some(10));
+        sys_disk(&root, "sdy", 2000, Some(11));
+        let p = LinuxPlatform::with_sys_block(root.clone());
+        let idx = |p: &LinuxPlatform| p.indexed().iter().map(|d| (d.path.clone(), d.index)).collect::<Vec<_>>();
+        assert_eq!(idx(&p), [("/dev/sdx".to_string(), 0), ("/dev/sdy".to_string(), 1)]);
+
+        // hot-plug: sdy goes away, sdw arrives (it sorts first: positional indexes would shift)
+        std::fs::remove_dir_all(root.join("sdy")).unwrap();
+        sys_disk(&root, "sdw", 3000, Some(12));
+        assert_eq!(idx(&p), [("/dev/sdx".to_string(), 0), ("/dev/sdw".to_string(), 2)]);
+        assert!(matches!(p.resolve(1), Err(Error::Invalid(m)) if m.contains("refresh")), "sdy is gone");
+        assert_eq!(p.resolve(0).unwrap().0.path, "/dev/sdx");
+        assert_eq!(p.resolve(2).unwrap().0.path, "/dev/sdw");
+
+        // another stick under the old name: a new index, the old one stays refused
+        sys_disk(&root, "sdy", 2000, Some(13));
+        assert_eq!(idx(&p).last(), Some(&("/dev/sdy".to_string(), 3)));
+        assert!(p.resolve(1).is_err());
+        assert_eq!(p.resolve(3).unwrap().0.path, "/dev/sdy");
+        assert!(matches!(p.resolve(4), Err(Error::NotFound(_))));
+
+        // without disk sequence numbers the size tells disks apart
+        let t2 = tempfile::tempdir().unwrap();
+        sys_disk(t2.path(), "sdx", 1000, None);
+        let q = LinuxPlatform::with_sys_block(t2.path().to_path_buf());
+        assert_eq!(q.resolve(0).unwrap().0.path, "/dev/sdx", "the first use numbers the disks");
+        sys_disk(t2.path(), "sdx", 4000, None);
+        assert!(q.resolve(0).is_err(), "a different size under the same name");
+        assert_eq!(idx(&q), [("/dev/sdx".to_string(), 1)]);
     }
 
     #[test]

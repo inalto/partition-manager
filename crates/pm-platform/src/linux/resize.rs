@@ -41,7 +41,7 @@ pub fn step_error(tool: &str, code: Option<i32>, text: &str) -> Error {
     let lower = text.to_ascii_lowercase();
     if tool == "ntfsresize" && (lower.contains("scheduled for check") || lower.contains("dirty")) {
         return Error::Invalid(format!(
-            "the NTFS volume is marked dirty (scheduled for a consistency check): run `chkdsk /f`              on it in Windows (or `ntfsfix -d` here) and retry. ntfsresize said: {text}"
+            "the NTFS volume is marked dirty (scheduled for a consistency check): run `chkdsk /f` on it in Windows (or `ntfsfix -d` here) and retry. ntfsresize said: {text}"
         ));
     }
     Error::Platform { code: code.map_or(u32::MAX, |c| c as u32), msg: format!("{tool} failed: {text}") }

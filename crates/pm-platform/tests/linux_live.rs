@@ -177,6 +177,16 @@ fn loop_device_end_to_end() {
     assert_eq!(mounted_at(&p1).len(), 1, "p1 mounted again after an unchanged layout");
     assert_eq!(mounted_at(&p2).len(), 1, "p2 mounted again after an unchanged layout");
     assert_eq!(std::fs::read(m1.path().join("hello.txt")).unwrap(), b"hello from pm");
+    // a session that writes into p2 (its first sector, rewritten as it was) does not mount p2
+    // again over possibly new content; untouched p1 is mounted again
+    let mut s = p.begin_write(index).expect("begin_write for a partition write");
+    let mut boot = vec![0u8; 512];
+    s.device().read_at(50 * MIB, &mut boot).unwrap();
+    s.device().write_at(50 * MIB, &boot).unwrap();
+    s.finish().expect("finish after the partition write");
+    assert_eq!(mounted_at(&p1).len(), 1, "p1 (untouched) mounted again");
+    assert!(mounted_at(&p2).is_empty(), "p2 (written into) left unmounted");
+    p.mount(&v2, &at2).expect("mount p2 again by hand");
 
     p.unmount(&v1, &at1).expect("unmount p1");
     p.unmount(&v2, &at2).expect("unmount p2");

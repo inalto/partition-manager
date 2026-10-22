@@ -22,8 +22,9 @@
 //! when something was written, re-read the table once more (holding the lock, so udev does not
 //! re-read it a second time behind our back), then wait for udev (`udevadm settle`) and mount
 //! the unmounted filesystems again: all of them when the session wrote nothing, otherwise those
-//! whose partition node still exists with the same start and length (like Windows, which
-//! remounts the volumes it finds after the disk comes back).
+//! the session did not write into whose partition node still exists with the same start and
+//! length (like Windows, which remounts the volumes it finds after the disk comes back; a
+//! partition whose content was replaced is left unmounted for the user or the next step).
 
 use super::ioctl;
 use super::mounts::{mount_conflicts, MountEntry};
@@ -122,10 +123,27 @@ impl Mounter for SystemMounter {
             // FUSE reports options of its own (user_id=, blksize=) the helper may not accept
             result = attempt(&e.options);
         }
-        match result {
-            Ok(_) => Ok(()),
-            Err(cmd_err) => {
-                log::warn!("re-mount {} at {}: {first}; mount command: {cmd_err}", e.device, e.mount_point);
+        let cmd_err = match result {
+            Ok(_) => return Ok(()),
+            Err(cmd_err) => cmd_err,
+        };
+        // last resort: same device, type and per-mount flags, without the filesystem options
+        match ioctl::mount(&e.device, &e.mount_point, &e.fstype, vfs_flags(&e.options), None) {
+            Ok(()) => {
+                log::warn!(
+                    "re-mounted {} at {} without its filesystem options `{}` ({first}; mount command: {cmd_err})",
+                    e.device,
+                    e.mount_point,
+                    fs_data(&e.super_options)
+                );
+                Ok(())
+            }
+            Err(last) => {
+                log::warn!(
+                    "re-mount {} at {}: {first}; mount command: {cmd_err}; without options: {last}",
+                    e.device,
+                    e.mount_point
+                );
                 Err(first)
             }
         }
@@ -352,10 +370,50 @@ pub fn begin_write(
     }
 }
 
-/// The session's device: records whether anything was written.
+/// Byte ranges `[start, end)` written so far, merged and sorted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Written(Vec<(u64, u64)>);
+
+impl Written {
+    /// Record a write of `len` bytes at `offset`.
+    pub fn add(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let (mut start, mut end) = (offset, offset.saturating_add(len));
+        let mut kept = Vec::with_capacity(self.0.len() + 1);
+        for &(s, e) in &self.0 {
+            if e < start || s > end {
+                kept.push((s, e));
+            } else {
+                start = start.min(s);
+                end = end.max(e);
+            }
+        }
+        kept.push((start, end));
+        kept.sort_unstable();
+        self.0 = kept;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether any written byte lies in `[start, start + len)`.
+    pub fn overlaps(&self, (start, len): (u64, u64)) -> bool {
+        let end = start.saturating_add(len);
+        self.0.iter().any(|&(s, e)| s < end && start < e)
+    }
+
+    pub fn ranges(&self) -> &[(u64, u64)] {
+        &self.0
+    }
+}
+
+/// The session's device: records which byte ranges were written.
 struct Tracked {
     dev: FdDevice,
-    wrote: bool,
+    written: Written,
 }
 
 impl BlockDevice for Tracked {
@@ -369,7 +427,8 @@ impl BlockDevice for Tracked {
         self.dev.read_at(offset, buf)
     }
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
-        self.wrote = true;
+        // recorded before the write: a failed write may still have changed some sectors
+        self.written.add(offset, buf.len() as u64);
         self.dev.write_at(offset, buf)
     }
     fn flush(&mut self) -> Result<()> {
@@ -378,6 +437,18 @@ impl BlockDevice for Tracked {
     fn is_read_only(&self) -> bool {
         self.dev.is_read_only()
     }
+}
+
+/// After a write, whether to mount a filesystem again: only a partition (not a whole-disk
+/// filesystem) that the session did not write into (`written` does not overlap its extent: a
+/// table edit writes outside every partition, a wipe / restore / clone writes inside) and whose
+/// node still covers the same range (`still_there`).
+pub fn remount_after_write(
+    written: &Written,
+    extent: Option<(u64, u64)>,
+    still_there: impl Fn((u64, u64)) -> bool,
+) -> bool {
+    extent.is_some_and(|x| !written.overlaps(x) && still_there(x))
 }
 
 /// Whether partition node `node` still exists with byte range `extent`.
@@ -400,7 +471,7 @@ impl LinuxWriteSession {
         LinuxWriteSession {
             disk,
             path: device.path().to_string(),
-            device: Some(Tracked { dev: device, wrote: false }),
+            device: Some(Tracked { dev: device, written: Written::default() }),
             unmounted,
             mounter,
         }
@@ -415,7 +486,8 @@ impl LinuxWriteSession {
     /// that while the disk is locked and only sends change events. The table is then re-read
     /// once, here; after the lock is released udev's queue is drained (`udevadm settle`).
     fn restore(&mut self) -> Result<()> {
-        let Some(Tracked { dev, wrote }) = self.device.take() else { return Ok(()) };
+        let Some(Tracked { dev, written }) = self.device.take() else { return Ok(()) };
+        let wrote = !written.is_empty();
         let mut first: Option<Error> = None;
         if let Err(e) = dev.sync() {
             first.get_or_insert(os_error(&e, &format!("fsync {}", self.path)));
@@ -462,9 +534,13 @@ impl LinuxWriteSession {
         } else {
             let (keep, gone): (Vec<Unmounted>, Vec<Unmounted>) = unmounted
                 .into_iter()
-                .partition(|u| u.extent.is_some_and(|x| still_there(&u.entry.device, x)));
+                .partition(|u| remount_after_write(&written, u.extent, |x| still_there(&u.entry.device, x)));
             for u in &gone {
-                log::info!("{} not mounted again at {}: its partition changed", u.entry.device, u.entry.mount_point);
+                log::info!(
+                    "{} not mounted again at {}: the session wrote into it or its partition changed",
+                    u.entry.device,
+                    u.entry.mount_point
+                );
             }
             let entries: Vec<MountEntry> = keep.into_iter().map(|u| u.entry).collect();
             for f in remount_all(&*self.mounter, &entries) {
@@ -725,6 +801,36 @@ mod tests {
             Ok(_) => panic!("session over a subvolume mount"),
         }
         assert!(m.log().is_empty(), "nothing unmounted");
+    }
+
+    #[test]
+    fn written_ranges_merge_and_decide_remounting() {
+        let mut w = Written::default();
+        assert!(w.is_empty());
+        w.add(0, 512); // protective MBR
+        w.add(512, 512 * 33); // GPT header + entries: merges with the MBR
+        w.add(100 << 20, 0); // empty writes are ignored
+        w.add((64 << 20) - 512 * 33, 512 * 33); // backup GPT
+        assert_eq!(w.ranges(), [(0, 512 * 34), ((64 << 20) - 512 * 33, 64 << 20)]);
+        let there = |_: (u64, u64)| true;
+        let p1 = Some((1 << 20, 32 << 20));
+        let p2 = Some((40 << 20, 8 << 20));
+        // a table edit: both partitions untouched
+        assert!(remount_after_write(&w, p1, there) && remount_after_write(&w, p2, there));
+        // the first sector of p2 rewritten (wipe / restore / clone onto the same layout)
+        w.add(40 << 20, 512);
+        assert!(remount_after_write(&w, p1, there));
+        assert!(!remount_after_write(&w, p2, there));
+        // touching the bytes just before / after an extent does not count
+        let mut edge = Written::default();
+        edge.add((1 << 20) - 1, 1);
+        edge.add(33 << 20, 10);
+        assert!(remount_after_write(&edge, p1, there));
+        edge.add((33 << 20) - 1, 1);
+        assert!(!remount_after_write(&edge, p1, there));
+        // a whole-disk filesystem, or a partition that moved, is never mounted again
+        assert!(!remount_after_write(&Written::default(), None, there));
+        assert!(!remount_after_write(&Written::default(), p1, |_| false));
     }
 
     #[test]

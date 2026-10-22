@@ -111,7 +111,7 @@ pub fn ready_node(id: &VolumeId, expected: Option<(u64, Option<u64>)>) -> Result
         }
         if !fits(now) {
             return Err(Error::Invalid(format!(
-                "{node} is no longer the partition at byte {} (length {:?}; the kernel now reports                  {now:?}): the partition table changed; refresh the disk list and retry",
+                "{node} is no longer the partition at byte {} (length {:?}; the kernel now reports {now:?}): the partition table changed; refresh the disk list and retry",
                 want.0, want.1
             )));
         }
