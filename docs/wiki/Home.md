@@ -33,7 +33,7 @@ engines.
 - **Rescue.** A ddrescue-style copier (copy, trim, scrape, retry) with a resumable mapfile in
   GNU ddrescue's format, for failing drives. It can also export a failing disk straight into
   a VM image. See [[Rescue Mode]].
-- **Recover.** Find lost partitions, list and restore deleted files from NTFS and FAT, carve
+- **Recover.** Find lost partitions, list and restore deleted files from NTFS, FAT, exFAT and ext (ext entries without names), carve
   files out of raw data by signature, and save or reopen scan sessions. See [[Recovery]].
 - **Analyze.** Space analyzer, surface test, disk benchmark, SMART health.
 - **Safe by construction.** A pending-operations queue, a confirmation before anything is
