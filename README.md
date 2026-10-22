@@ -392,10 +392,11 @@ backup of the machine. In short:
   overlap checks of the direct-copy commands.
 - **"Not on the source disk" checks** for image files, rescue mapfiles and recovery
   destinations ask the platform which disk a path is on (`Platform::disk_of_path`: drive
-  letters and folder mount points on Windows, the mount table on Linux, `diskutil` on macOS).
-  When it cannot tell (a network share, RAM disk, LVM / device-mapper volume) and the device
-  has mounted volumes, the path is refused; choose a folder on a disk of the list. Windows
-  UNC shares are accepted.
+  letters and folder mount points on Windows, the mount table on Linux with LVM / dm / md
+  volumes placed through their member partitions, `diskutil` on macOS). When it cannot tell
+  (a RAM disk, a network share on Linux/macOS, a volume spanning several disks) and the
+  device has mounted volumes or LVM / RAID members, the path is refused; choose a folder on
+  a disk of the list. Windows UNC shares and mapped network drives are accepted.
 - **Old scan sessions.** Scan sessions saved before they recorded the scanned region load as
   whole-device sessions. A carve session saved by an older `pm recover carve` on a
   *partition* therefore restores the wrong bytes: delete it and scan again.

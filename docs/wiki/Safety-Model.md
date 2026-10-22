@@ -116,10 +116,12 @@ same volume as `/dev/disk2s1`, so these checks see through the different names.
 destinations in the CLI; the same files in the Create Image, Restore Image, Rescue Copy and
 Data Recovery wizards) ask the platform which disk and partition a path is on:
 the volume mount point and its extents on Windows (drive letters and folder mount points
-alike), the filesystem's device on Linux, `diskutil info` on macOS. When the platform cannot
-tell (a network share, a RAM disk, an LVM / device-mapper volume) and the device has a
-mounted filesystem, the path is refused with "Cannot tell which disk ..."; a device with
-nothing mounted cannot hold the path, and Windows UNC shares are accepted.
+alike), the filesystem's device on Linux (an LVM, dm-crypt or md volume is placed on the disk
+all its member partitions are on), `diskutil info` on macOS. When the platform cannot tell
+(a RAM disk, a network share on Linux/macOS, a volume spanning several disks) and the device
+has a mounted filesystem or an LVM / RAID member partition, the path is refused with "Cannot
+tell which disk ..."; a device with neither cannot hold the path. Windows UNC shares and
+mapped network drives (which resolve to a UNC path) are accepted.
 
 Limits of these checks: hard links, junctions, storage aliases, a file stored on the disk
 being copied and a differencing image's parent are not detected.

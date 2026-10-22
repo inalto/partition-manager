@@ -255,6 +255,12 @@ impl Created {
     }
 }
 
+/// Where a rescue's outputs may not go: anywhere on the source DISK, not just the partition
+/// being rescued (a failing disk should not be written at all, like the GUI's Rescue Copy).
+fn rescue_place((disk, _, _): (u32, u64, u64)) -> (u32, Option<u32>) {
+    (disk, None)
+}
+
 fn usage(msg: String) -> CliError {
     CliError::Usage(msg)
 }
@@ -358,7 +364,7 @@ fn create_destination(platform: &dyn Platform, a: &RescueArgs, path: &Path) -> R
     // the flags are checked against the source before anything is created
     opts_from_args(a, source.dev.sector_size())?;
     if let Some(extent) = source.disk_extent {
-        let place = crate::cmd_image::place_of_extent(platform, extent);
+        let place = rescue_place(extent);
         crate::cmd_image::refuse_files_on(platform, place, &[path.to_path_buf(), a.mapfile.clone()], "rescued")?;
     }
     drop(source);
@@ -424,7 +430,7 @@ fn run_rescue(
         outputs.push(f.clone());
     }
     if let Some(extent) = source.disk_extent {
-        let place = crate::cmd_image::place_of_extent(platform, extent);
+        let place = rescue_place(extent);
         crate::cmd_image::refuse_files_on(platform, place, &outputs, "rescued")?;
     }
     if let Some((d, _, _)) = target.disk_extent {
@@ -610,5 +616,20 @@ mod tests {
         assert!(opts_from_args(&RescueArgs { sector_size: Some(512), ..args() }, 4096).is_err());
         let huge = RescueArgs { cluster_size: Some(u32::MAX), ..args() };
         assert!(opts_from_args(&huge, 512).is_err());
+    }
+
+    #[test]
+    fn rescue_outputs_stay_off_the_whole_source_disk() {
+        use pm_core::{DiskInfo, MemDevice};
+        use pm_platform::MockPlatform;
+        let p = MockPlatform::new();
+        p.add_disk(2, MemDevice::new(4 << 20), DiskInfo::default());
+        let other_part = std::env::temp_dir().join("pm-rescue-other-part");
+        p.set_disk_of_path(&other_part, 2, Some(2));
+        // rescuing partition 1 (extent 1 MiB..3 MiB): a file on partition 2 of the same disk
+        let place = rescue_place((2, 1 << 20, 3 << 20));
+        assert_eq!(place, (2, None));
+        let r = crate::cmd_image::refuse_files_on(&p, place, &[other_part.join("r.map")], "rescued");
+        assert!(matches!(&r, Err(CliError::Usage(m)) if m.contains("Disk 2, the disk being rescued")), "{r:?}");
     }
 }

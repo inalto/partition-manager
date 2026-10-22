@@ -203,6 +203,56 @@ fn locate(disks: &[DiskInfo], node: &str) -> Option<(u32, Option<u32>)> {
     })
 }
 
+/// The devices at the bottom of the block device `name` (`dm-0`, `md127`): the entries of
+/// `<class>/<name>/slaves/` (`/sys/class/block`), followed recursively; a device without
+/// slaves is its own leaf. `None` when the stack is deeper than 16 levels (a loop).
+fn leaf_devices(class: &Path, name: &str, depth: u32) -> Option<Vec<String>> {
+    if depth > 16 {
+        return None;
+    }
+    let mut slaves: Vec<String> = match std::fs::read_dir(class.join(name).join("slaves")) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
+        Err(_) => return Some(vec![name.to_string()]),
+    };
+    if slaves.is_empty() {
+        return Some(vec![name.to_string()]);
+    }
+    slaves.sort();
+    let mut out = Vec::new();
+    for s in slaves {
+        out.extend(leaf_devices(class, &s, depth + 1)?);
+    }
+    Some(out)
+}
+
+/// [`locate`] for `node`, seeing through device-mapper / md stacks (LVM, dm-crypt, RAID):
+/// a stacked device is placed on the disk all of its leaf devices are on, with the partition
+/// when they are all one partition; `None` when the leaves span several disks or one of them
+/// is not a known disk or partition.
+fn locate_stacked(disks: &[DiskInfo], class: &Path, node: &str) -> Option<(u32, Option<u32>)> {
+    if let Some(found) = locate(disks, node) {
+        return Some(found);
+    }
+    let name = node.strip_prefix("/dev/")?;
+    let leaves = leaf_devices(class, name, 0)?;
+    if leaves.len() == 1 && leaves[0] == name {
+        return None; // not stacked, and not a known disk or partition
+    }
+    let mut placed = leaves.iter().map(|l| locate(disks, &format!("/dev/{l}")));
+    let first = placed.next()??;
+    let mut part = first.1;
+    for p in placed {
+        let (d, n) = p?;
+        if d != first.0 {
+            return None;
+        }
+        if n != part {
+            part = None;
+        }
+    }
+    Some((first.0, part))
+}
+
 fn name_of(d: &DiskInfo) -> &str {
     d.path.trim_start_matches("/dev/")
 }
@@ -468,19 +518,21 @@ impl Platform for LinuxPlatform {
     }
 
     /// The disk (and partition) holding `path`: its `st_dev` through `/sys/dev/block`, else the
-    /// device of the longest `/proc/self/mountinfo` mount point above it. `None` means UNKNOWN
-    /// (tmpfs, network or FUSE filesystems, LVM / device-mapper / md volumes, btrfs subvolumes
-    /// whose device is not found): a caller guarding against writing onto the disk being read
-    /// must refuse in that case, not proceed.
+    /// device of the longest `/proc/self/mountinfo` mount point above it. A device-mapper / md
+    /// device (LVM, dm-crypt, RAID) is placed through its `slaves/` on the one disk they are
+    /// all on. `None` means UNKNOWN (tmpfs, network or FUSE filesystems, a stack spanning
+    /// several disks, btrfs subvolumes whose device is not found): a caller guarding against
+    /// writing onto the disk being read must refuse in that case, not proceed.
     fn disk_of_path(&self, path: &Path) -> Option<(u32, Option<u32>)> {
         let full = crate::canonical_existing(path)?;
         let disks = self.indexed();
-        if let Some(found) = mounts::node_of_st_dev(&full).and_then(|n| locate(&disks, &n)) {
+        let class = Path::new("/sys/class/block");
+        if let Some(found) = mounts::node_of_st_dev(&full).and_then(|n| locate_stacked(&disks, class, &n)) {
             return Some(found);
         }
         let mounts = mounts::read_mounts();
         let entry = mounts::longest_mount(&mounts, &full.to_string_lossy())?;
-        locate(&disks, &entry.device)
+        locate_stacked(&disks, class, &entry.device)
     }
 }
 
@@ -500,6 +552,35 @@ mod tests {
         assert_eq!(locate(&disks, "/dev/nvme0n1"), Some((1, None)));
         assert_eq!(locate(&disks, "/dev/nvme0n1p3"), Some((1, Some(3))));
         assert_eq!(locate(&disks, "/dev/dm-0"), None);
+    }
+
+    #[test]
+    fn stacked_devices_are_placed_through_their_slaves() {
+        let part = |n: u32, node: &str| PartitionInfo { number: n, volume: Some(VolumeId(node.into())), ..Default::default() };
+        let disks = vec![
+            DiskInfo { index: 0, path: "/dev/sda".into(), partitions: vec![part(1, "/dev/sda1"), part(2, "/dev/sda2")], ..Default::default() },
+            DiskInfo { index: 3, path: "/dev/sdb".into(), partitions: vec![part(1, "/dev/sdb1")], ..Default::default() },
+        ];
+        let t = tempfile::tempdir().unwrap();
+        let class = t.path();
+        let slave = |dev: &str, of: &str| std::fs::create_dir_all(class.join(dev).join("slaves").join(of)).unwrap();
+        for leaf in ["sda1", "sda2", "sdb1"] {
+            std::fs::create_dir_all(class.join(leaf)).unwrap();
+        }
+        slave("dm-0", "sda2"); // an LV on one PV
+        slave("dm-1", "sda1"); // an LV spanning two disks
+        slave("dm-1", "sdb1");
+        slave("md0", "sda1"); // RAID over two partitions of one disk
+        slave("md0", "sda2");
+        slave("dm-2", "dm-0"); // dm-crypt over the LV
+        std::fs::create_dir_all(class.join("dm-9").join("slaves")).unwrap(); // no slaves listed
+        assert_eq!(locate_stacked(&disks, class, "/dev/dm-0"), Some((0, Some(2))));
+        assert_eq!(locate_stacked(&disks, class, "/dev/dm-2"), Some((0, Some(2))), "nested");
+        assert_eq!(locate_stacked(&disks, class, "/dev/dm-1"), None, "spans sda and sdb");
+        assert_eq!(locate_stacked(&disks, class, "/dev/md0"), Some((0, None)), "two partitions of sda");
+        assert_eq!(locate_stacked(&disks, class, "/dev/dm-9"), None);
+        assert_eq!(locate_stacked(&disks, class, "/dev/zram0"), None);
+        assert_eq!(locate_stacked(&disks, class, "/dev/sdb1"), Some((3, Some(1))));
     }
 
     #[test]

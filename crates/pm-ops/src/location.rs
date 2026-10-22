@@ -8,12 +8,30 @@
 //! platform), the path is treated as possibly on the device whenever the device has a
 //! mounted filesystem it could be on.
 
-use pm_core::{DiskInfo, VolumeInfo};
+use pm_core::{gpt_types, DiskInfo, PartitionInfo, PartitionType, VolumeInfo};
 use pm_platform::Platform;
 use std::path::{Component, Path, PathBuf, Prefix};
 
 /// A disk, or one of its partitions (`Some(number)`).
 pub type DevicePlace = (u32, Option<u32>);
+
+/// What [`locate`] reports for a path on a network share (a Windows UNC path or mapped
+/// network drive): a "disk" no platform lists, so it is never the device being read.
+pub const NETWORK: DevicePlace = (u32::MAX, None);
+
+/// GPT type of a Linux RAID (md) member.
+const LINUX_RAID: uuid::Uuid = uuid::uuid!("A19D880F-05FC-4D3B-A006-743F0F84911E");
+
+/// A partition that belongs to a stacked volume (an LVM physical volume or an md RAID member,
+/// by its type): it has no mount point of its own, but filesystems on the volume above it
+/// live on it.
+fn is_stack_member(p: &PartitionInfo) -> bool {
+    match p.ptype {
+        Some(PartitionType::Gpt(g)) => g == gpt_types::LINUX_LVM || g == LINUX_RAID,
+        Some(PartitionType::Mbr(b)) => b == 0x8E || b == 0xFD,
+        None => false,
+    }
+}
 
 /// Where a path lies relative to a device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,8 +47,9 @@ pub enum PathPlace {
 }
 
 /// Which disks are listed and which of their partitions carry a mounted filesystem, from the
-/// disks and volumes the platform enumerated (or a [`crate::Model`]'s). Small and cheap to
-/// keep in a wizard's state.
+/// disks and volumes the platform enumerated (or a [`crate::Model`]'s). An LVM physical volume
+/// or md RAID member counts as mounted: the filesystems on the volume above it have no mount
+/// point on the partition itself. Small and cheap to keep in a wizard's state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MountMap {
     listed: Vec<u32>,
@@ -43,7 +62,7 @@ impl MountMap {
     pub fn new(disks: &[DiskInfo], volumes: &[VolumeInfo]) -> Self {
         let mut mounted = Vec::new();
         for d in disks {
-            for p in d.partitions.iter().filter(|p| !p.mount_points.is_empty()) {
+            for p in d.partitions.iter().filter(|p| !p.mount_points.is_empty() || is_stack_member(p)) {
                 mounted.push((d.index, Some(p.number)));
             }
         }
@@ -80,9 +99,24 @@ fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// `(disk, partition)` of `path` according to `platform` (the path is made absolute first).
+/// `(disk, partition)` of `path` according to `platform` (the path is made absolute first);
+/// [`NETWORK`] when the platform cannot place it and its canonical form is a network share
+/// (a mapped drive `Z:` resolves to `\\?\UNC\server\share`).
 pub fn locate(platform: &dyn Platform, path: &Path) -> Option<(u32, Option<u32>)> {
-    platform.disk_of_path(&absolute(path))
+    locate_with(platform, path, pm_platform::canonical_existing)
+}
+
+/// [`locate`] with `canonical` resolving the path (tests pass their own).
+fn locate_with(
+    platform: &dyn Platform,
+    path: &Path,
+    canonical: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<(u32, Option<u32>)> {
+    let abs = absolute(path);
+    platform.disk_of_path(&abs).or_else(|| {
+        let network = is_network_path(&abs) || canonical(&abs).is_some_and(|c| is_network_path(&c));
+        network.then_some(NETWORK)
+    })
 }
 
 /// A Windows UNC path (`\\server\share\...`): a network share is never on a local disk.
@@ -204,6 +238,48 @@ mod tests {
             let unc = Path::new(r"\\server\share\x.img");
             assert_eq!(place_of(unc, None, (0, None), &m), PathPlace::Elsewhere);
         }
+    }
+
+    #[test]
+    fn stack_members_count_as_mounted() {
+        let member = |n: u32, t: PartitionType| PartitionInfo { number: n, start: u64::from(n) << 20, ptype: Some(t), ..Default::default() };
+        let disks = [
+            DiskInfo { index: 0, partitions: vec![member(1, PartitionType::Gpt(gpt_types::LINUX_LVM)), member(2, PartitionType::Gpt(gpt_types::BASIC_DATA))], ..Default::default() },
+            DiskInfo { index: 1, partitions: vec![member(1, PartitionType::Mbr(0xFD)), member(2, PartitionType::Mbr(0x8E))], ..Default::default() },
+            DiskInfo { index: 2, partitions: vec![member(1, PartitionType::Gpt(LINUX_RAID))], ..Default::default() },
+        ];
+        let m = MountMap::new(&disks, &[]);
+        let p = Path::new("/home/rec");
+        // /home on an LV the platform cannot place: the PV's disk could hold it
+        assert_eq!(place_of(p, None, (0, None), &m), PathPlace::Unknown);
+        assert_eq!(place_of(p, None, (0, Some(1)), &m), PathPlace::Unknown);
+        assert_eq!(place_of(p, None, (0, Some(2)), &m), PathPlace::Elsewhere);
+        assert_eq!(place_of(p, None, (1, Some(1)), &m), PathPlace::Unknown);
+        assert_eq!(place_of(p, None, (1, Some(2)), &m), PathPlace::Unknown);
+        assert_eq!(place_of(p, None, (2, None), &m), PathPlace::Unknown);
+    }
+
+    #[test]
+    fn network_shares_are_never_the_device() {
+        let plat = pm_platform::MockPlatform::new();
+        let disks = [disk(0, &[(1, "C:\\")])];
+        let m = MountMap::new(&disks, &[]);
+        let local = std::env::temp_dir().join("pm-loc-net").join("x.img");
+        // a mapped drive: not placed by the platform, canonical form \\?\UNC\server\share
+        let unc = |_: &Path| Some(PathBuf::from(r"\\?\UNC\server\share\x.img"));
+        let located = locate_with(&plat, &local, unc);
+        if cfg!(windows) {
+            assert_eq!(located, Some(NETWORK));
+            assert_eq!(place_of(&local, located, (0, None), &m), PathPlace::Elsewhere);
+            // a verbatim UNC path typed as such
+            let typed = Path::new(r"\\?\UNC\server\share\x.img");
+            assert_eq!(place_of(typed, None, (0, None), &m), PathPlace::Elsewhere);
+        } else {
+            assert_eq!(located, None, "no UNC prefixes off Windows");
+        }
+        // a local path that resolves locally stays unknown
+        assert_eq!(locate_with(&plat, &local, |p: &Path| Some(p.to_path_buf())), None);
+        assert_eq!(place_of(&local, None, (0, None), &m), PathPlace::Unknown);
     }
 
     #[test]

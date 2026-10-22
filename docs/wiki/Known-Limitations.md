@@ -47,10 +47,13 @@ yet.
   OS or a disk that is not in use.
 - **Hard links, junctions and storage aliases** are not detected by the source/destination
   overlap checks of the direct-copy commands.
-- **"Not on the source disk" checks** ask the platform which disk a path is on. A path it
-  cannot place (a network share on Linux/macOS, a RAM disk, an LVM / device-mapper volume)
-  is refused while the device being read has mounted volumes; choose a folder on a disk of
-  the list. Junctions and hard links are not followed.
+- **"Not on the source disk" checks** ask the platform which disk a path is on, after
+  resolving symlinks and junctions. A path it cannot place (a network share on Linux/macOS,
+  a RAM disk, a volume spanning several disks) is refused while the device being read has
+  mounted volumes or LVM / RAID members; choose a folder on a disk of the list. Windows UNC
+  shares and mapped network drives are accepted, so a loopback share of a local disk
+  (`\\localhost\C$\...`) is not recognised as that disk: using one is a deliberate choice
+  the check does not stop. Hard links are not detected.
 - **Old scan sessions.** Scan sessions saved before they recorded the scanned region load as
   whole-device sessions. A carve session saved by an older `pm recover carve` on a
   *partition* therefore restores the wrong bytes: delete it and scan again.
@@ -218,5 +221,4 @@ the ones that can surprise you are marked.
   disk is the same uses its index rather than its serial number in the worker.
 - A refresh requested while a job runs or a dialog is open is dropped; the interface does
   not refresh after a panic during Apply.
-- Mount points through folders, UNC paths and junctions are not covered by the letter checks
-  (see above).
+- The "not on the source disk" checks accept loopback UNC shares of a local disk (see above).

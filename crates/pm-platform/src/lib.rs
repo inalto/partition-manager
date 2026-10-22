@@ -57,9 +57,9 @@ pub fn default_platform() -> Arc<dyn Platform> {
 
 /// `path` made absolute and resolved (symlinks, `..`) up to its deepest existing ancestor; the
 /// part that does not exist yet (e.g. an output file about to be created) is appended as is.
-/// `None` when not even the root exists.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-pub(crate) fn canonical_existing(path: &std::path::Path) -> Option<std::path::PathBuf> {
+/// `None` when not even the root exists. On Windows a path on a mapped network drive comes
+/// back in its `\\?\UNC\server\share\...` form.
+pub fn canonical_existing(path: &std::path::Path) -> Option<std::path::PathBuf> {
     let abs = std::path::absolute(path).ok()?;
     let mut rest = Vec::new();
     let mut cur = abs.as_path();
