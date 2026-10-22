@@ -3,6 +3,10 @@
 //! An APFS volume lives on a synthesized container disk (`disk3s1s1` on `disk3`); the disk
 //! that matters for partitioning is the one holding the container's physical store
 //! (`APFSPhysicalStores`: `disk0s2`), so that wins over `ParentWholeDisk`.
+//!
+//! [`system_disk`] fails closed (`None`, so the planner refuses every disk it cannot rule
+//! out) when `/` spans several disks (a Fusion drive: stores on two disks) or sits on a
+//! virtual volume without APFS stores (CoreStorage).
 
 use super::diskutil::{parse_identifier, parse_info, DeviceInfo, DiskutilRunner};
 use std::path::Path;
@@ -16,11 +20,25 @@ fn physical_location(info: &DeviceInfo) -> Option<(u32, Option<u32>)> {
     }
 }
 
-/// Index of the disk holding `/`; `None` when `diskutil` cannot tell (the planner then
-/// refuses every disk it cannot rule out).
+/// Index of the disk holding `/`; `None` when `diskutil` cannot tell or `/` is not on exactly
+/// one physical disk (see the module documentation).
 pub fn system_disk(runner: &dyn DiskutilRunner) -> Option<u32> {
     let bytes = runner.run(&["info", "-plist", "/"]).map_err(|e| log::warn!("diskutil info /: {e}")).ok()?;
     let info = parse_info(&bytes).map_err(|e| log::warn!("diskutil info /: {e}")).ok()?;
+    if !info.apfs_physical_stores.is_empty() {
+        let mut disks: Vec<u32> = info.apfs_physical_stores.iter().filter_map(|s| parse_identifier(s)).map(|(d, _)| d).collect();
+        disks.sort_unstable();
+        disks.dedup();
+        if disks.len() != 1 {
+            log::info!("/ is on APFS stores {:?} (several disks): system disk unknown", info.apfs_physical_stores);
+            return None;
+        }
+        return disks.first().copied();
+    }
+    if info.virtual_or_physical.eq_ignore_ascii_case("Virtual") {
+        log::info!("/ is on the virtual volume {} (CoreStorage?): system disk unknown", info.identifier);
+        return None;
+    }
     physical_location(&info).map(|(disk, _)| disk)
 }
 

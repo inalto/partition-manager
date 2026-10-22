@@ -2,9 +2,12 @@
 //!
 //! `diskutil` always does a quick format and picks the cluster size itself; it also sets the
 //! partition type to match the new filesystem. NTFS needs third-party tools on macOS.
+//!
+//! Caution (unverified on a Mac): `eraseVolume` on an `Apple_APFS` physical store slice
+//! deletes the whole APFS container, every volume in it included.
 
 use super::diskutil::DiskutilRunner;
-use super::mount::slice_of;
+use super::guard::checked_slice;
 use pm_core::{Error, FsKind, Result, VolumeId};
 
 /// `diskutil` personality name for `fs`.
@@ -23,11 +26,21 @@ pub fn personality(fs: FsKind) -> Result<&'static str> {
 
 /// Erase `id` with a new `fs` named `label` (`UNTITLED` / `Untitled` when empty). `cluster`
 /// and `quick` are ignored: `diskutil` chooses the cluster size and never does a full format.
-pub fn format(runner: &dyn DiskutilRunner, id: &VolumeId, fs: FsKind, label: &str, cluster: Option<u32>) -> Result<()> {
+pub fn format(
+    runner: &dyn DiskutilRunner,
+    id: &VolumeId,
+    fs: FsKind,
+    label: &str,
+    cluster: Option<u32>,
+    quick: bool,
+) -> Result<()> {
     let personality = personality(fs)?;
-    let slice = slice_of(id)?;
+    let slice = checked_slice(runner, id)?;
     if cluster.is_some() {
         log::info!("{slice}: diskutil picks the cluster size itself; the requested one is ignored");
+    }
+    if !quick {
+        log::info!("{slice}: diskutil eraseVolume only does quick formats; full format ignored");
     }
     let name = match (label.trim(), fs) {
         ("", FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32) => "UNTITLED",

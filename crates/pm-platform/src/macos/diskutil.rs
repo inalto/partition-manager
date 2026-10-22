@@ -30,6 +30,20 @@ pub struct ListedPartition {
     pub mount_point: Option<String>,
     /// GPT unique partition GUID.
     pub disk_uuid: Option<String>,
+    /// Bytes in use (`CapacityInUse`, APFS volumes only).
+    pub capacity_in_use: Option<u64>,
+}
+
+/// A synthesized APFS container disk from `diskutil list -plist`: its physical stores and
+/// the volumes inside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApfsContainer {
+    /// `disk1`.
+    pub identifier: String,
+    /// Physical store slices (`disk0s2`).
+    pub stores: Vec<String>,
+    /// The APFS volumes (`disk1s1`, ...), with their mount points.
+    pub volumes: Vec<ListedPartition>,
 }
 
 /// A physical whole disk (`diskN`) from `diskutil list -plist`.
@@ -71,6 +85,21 @@ struct RawListPartition {
     mount_point: Option<String>,
     #[serde(rename = "DiskUUID")]
     disk_uuid: Option<String>,
+    capacity_in_use: Option<u64>,
+}
+
+impl RawListPartition {
+    fn into_listed(self) -> ListedPartition {
+        ListedPartition {
+            identifier: self.device_identifier,
+            size: self.size,
+            content: self.content,
+            volume_name: self.volume_name,
+            mount_point: non_empty(self.mount_point),
+            disk_uuid: non_empty(self.disk_uuid),
+            capacity_in_use: self.capacity_in_use,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -82,6 +111,8 @@ struct RawListDisk {
     partitions: Vec<RawListPartition>,
     #[serde(rename = "APFSPhysicalStores")]
     apfs_physical_stores: Option<Vec<RawStore>>,
+    #[serde(rename = "APFSVolumes")]
+    apfs_volumes: Vec<RawListPartition>,
 }
 
 #[derive(Deserialize, Default)]
@@ -118,18 +149,25 @@ pub fn parse_list(xml: &[u8]) -> Result<Vec<ListedDisk>> {
             identifier: d.device_identifier,
             size: d.size,
             content: d.content,
-            partitions: d
-                .partitions
-                .into_iter()
-                .map(|p| ListedPartition {
-                    identifier: p.device_identifier,
-                    size: p.size,
-                    content: p.content,
-                    volume_name: p.volume_name,
-                    mount_point: non_empty(p.mount_point),
-                    disk_uuid: non_empty(p.disk_uuid),
-                })
-                .collect(),
+            partitions: d.partitions.into_iter().map(RawListPartition::into_listed).collect(),
+        })
+        .collect())
+}
+
+/// Synthesized APFS container disks from `diskutil list -plist` (those with
+/// `APFSPhysicalStores`), with their stores and volumes.
+pub fn parse_apfs_containers(xml: &[u8]) -> Result<Vec<ApfsContainer>> {
+    let raw: RawList = parse_plist(xml, "list")?;
+    Ok(raw
+        .all_disks_and_partitions
+        .into_iter()
+        .filter_map(|d| {
+            let stores: Vec<String> = d.apfs_physical_stores?.iter().filter_map(RawStore::identifier).collect();
+            (!stores.is_empty()).then(|| ApfsContainer {
+                identifier: d.device_identifier,
+                stores,
+                volumes: d.apfs_volumes.into_iter().map(RawListPartition::into_listed).collect(),
+            })
         })
         .collect())
 }
@@ -167,6 +205,16 @@ pub struct DeviceInfo {
     pub solid_state: bool,
     /// Physical stores (`disk0s2`) of an APFS volume or container.
     pub apfs_physical_stores: Vec<String>,
+    /// `Physical` or `Virtual` (APFS / CoreStorage volumes, synthesized disks).
+    pub virtual_or_physical: String,
+}
+
+impl DeviceInfo {
+    /// A synthesized APFS container disk (or one of its volumes): it has physical stores or
+    /// the APFS container scheme as content.
+    pub fn is_apfs_synthesized(&self) -> bool {
+        !self.apfs_physical_stores.is_empty() || self.content.eq_ignore_ascii_case(APFS_CONTAINER_SCHEME)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -198,6 +246,7 @@ struct RawInfo {
     solid_state: bool,
     #[serde(rename = "APFSPhysicalStores")]
     apfs_physical_stores: Vec<RawStore>,
+    virtual_or_physical: String,
 }
 
 /// Parse `diskutil info -plist <dev>`.
@@ -228,6 +277,7 @@ pub fn parse_info(xml: &[u8]) -> Result<DeviceInfo> {
         internal: r.internal,
         solid_state: r.solid_state,
         apfs_physical_stores: r.apfs_physical_stores.iter().filter_map(RawStore::identifier).collect(),
+        virtual_or_physical: r.virtual_or_physical,
     })
 }
 
@@ -253,14 +303,24 @@ pub fn parse_identifier(s: &str) -> Option<(u32, Option<u32>)> {
 }
 
 /// The `diskNsM` identifier `diskutil` takes for a volume id (`/dev/diskNsM`, `/dev/rdiskNsM`
-/// or `diskNsM`).
+/// or `diskNsM`). `None` for a whole disk (`/dev/disk2`: erasing or opening that as a volume
+/// would hit the partition map) and for anything that is not a disk node.
 pub fn volume_identifier(id: &str) -> Option<String> {
     let s = id.strip_prefix("/dev/").unwrap_or(id);
     let s = s.strip_prefix('r').filter(|r| r.starts_with("disk")).unwrap_or(s);
-    parse_identifier(s).map(|_| s.to_string())
+    match parse_identifier(s) {
+        Some((_, Some(_))) => Some(s.to_string()),
+        _ => None,
+    }
 }
 
-/// Raw (character) device node of a volume id: `/dev/diskNsM` → `/dev/rdiskNsM`.
+/// The canonical volume id of a slice: `/dev/rdiskNsM`, `diskNsM` → `/dev/diskNsM` (the form
+/// the enumeration reports); `None` for whole disks and non-disk ids.
+pub fn canonical_volume_id(id: &str) -> Option<String> {
+    volume_identifier(id).map(|s| format!("/dev/{s}"))
+}
+
+/// Raw (character) device node of a volume id: `/dev/diskNsM` → `/dev/rdiskNsM` (slices only).
 pub fn raw_node(id: &str) -> Option<String> {
     volume_identifier(id).map(|s| format!("/dev/r{s}"))
 }
@@ -278,9 +338,9 @@ pub fn bus_of(protocol: &str) -> DiskBus {
     }
 }
 
-/// Partition scheme of a whole disk's `Content`: `Some(Gpt / Mbr)`, `Some(Unknown)` for an
-/// Apple Partition Map (not handled by pm-parttable), `Some(None)` for a disk without a
-/// partition table (blank, or a filesystem on the whole disk).
+/// Partition scheme of a whole disk's `Content`: `Gpt` / `Mbr`, `Unknown` for an Apple
+/// Partition Map (not handled by pm-parttable), `None` for a disk without a partition table
+/// (blank, or a filesystem on the whole disk).
 pub fn scheme_of(content: &str) -> TableKind {
     match content {
         "GUID_partition_scheme" => TableKind::Gpt,
@@ -371,6 +431,13 @@ mod tests {
         assert_eq!(volume_identifier("/dev/rdisk2s1").as_deref(), Some("disk2s1"));
         assert_eq!(volume_identifier("disk2s1").as_deref(), Some("disk2s1"));
         assert_eq!(volume_identifier("/dev/sda1"), None);
+        for whole in ["/dev/disk2", "/dev/rdisk2", "disk2"] {
+            assert_eq!(volume_identifier(whole), None, "{whole}");
+            assert_eq!(raw_node(whole), None, "{whole}");
+            assert_eq!(canonical_volume_id(whole), None, "{whole}");
+        }
+        assert_eq!(canonical_volume_id("/dev/rdisk2s1").as_deref(), Some("/dev/disk2s1"));
+        assert_eq!(canonical_volume_id("disk2s1").as_deref(), Some("/dev/disk2s1"));
         assert_eq!(raw_node("/dev/disk4s2").as_deref(), Some("/dev/rdisk4s2"));
         assert_eq!(raw_node("/dev/rdisk4s2").as_deref(), Some("/dev/rdisk4s2"));
     }

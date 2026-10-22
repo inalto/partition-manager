@@ -35,6 +35,7 @@ mod sys {
 
     /// `ioctl(fd, request, &mut T)`.
     fn ioctl_out<T: Default>(fd: BorrowedFd<'_>, request: u64) -> io::Result<T> {
+        debug_assert_eq!(std::mem::size_of::<T>(), ((request >> 16) & IOCPARM_MASK) as usize);
         let mut v = T::default();
         // SAFETY: `fd` is a valid open descriptor for the duration of the borrow and `v` is a
         // writable value of exactly the size encoded in `request` (u32 / u64 per the header).

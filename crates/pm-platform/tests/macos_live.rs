@@ -1,5 +1,5 @@
-//! Live test of [`MacPlatform`] on a RAM-backed disk image. Ignored by default (needs root and
-//! macOS); run on a Mac with:
+//! Live test of [`MacPlatform`] on a file-backed disk image (a `.dmg` in a temp dir). Ignored
+//! by default (needs root and macOS); run on a Mac with:
 //!
 //! ```text
 //! sudo -E cargo test -p pm-platform --test macos_live -- --ignored --nocapture

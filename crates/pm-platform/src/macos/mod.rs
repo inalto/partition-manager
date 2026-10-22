@@ -2,14 +2,17 @@
 //! nodes for I/O.
 //!
 //! The parsers ([`diskutil`]), the enumeration ([`enumerate`]), the system-disk lookup
-//! ([`system_disk`]) and the `diskutil` mount/format calls go through a [`DiskutilRunner`] and
-//! compile on every OS, so the fixtures in `tests/fixtures/macos/` exercise them anywhere.
-//! [`MacPlatform`], the raw device, the write session and S.M.A.R.T. are macOS-only.
+//! ([`system_disk`]), the target checks ([`guard`]), the take-for-writing sequence ([`write`])
+//! and the `diskutil` mount/format calls go through a [`DiskutilRunner`] and compile on every
+//! OS, so the fixtures in `tests/fixtures/macos/` exercise them anywhere. [`MacPlatform`]
+//! (whose runner executes `/usr/sbin/diskutil` by absolute path), the raw device, the write
+//! session and S.M.A.R.T. are macOS-only.
 
 pub mod device;
 pub mod diskutil;
 pub mod enumerate;
 pub mod format;
+pub mod guard;
 pub mod ioctl;
 pub mod mount;
 #[cfg(target_os = "macos")]
@@ -17,9 +20,13 @@ pub mod session;
 #[cfg(target_os = "macos")]
 pub mod smart;
 pub mod system_disk;
+pub mod write;
 
 pub use device::AlignedDevice;
-pub use diskutil::{parse_info, parse_list, DeviceInfo, DiskutilRunner, ListedDisk, ListedPartition, WholeDisk};
+pub use diskutil::{
+    parse_apfs_containers, parse_info, parse_list, ApfsContainer, DeviceInfo, DiskutilRunner, ListedDisk,
+    ListedPartition, WholeDisk,
+};
 pub use enumerate::{enumerate, DeviceOpener, Enumerated};
 
 #[cfg(target_os = "macos")]
@@ -28,20 +35,24 @@ pub use platform::{MacPlatform, SystemDiskutil};
 #[cfg(target_os = "macos")]
 mod platform {
     use super::diskutil::{raw_node, DiskutilRunner};
-    use super::{device, enumerate, format, mount, session, smart, system_disk};
+    use super::{device, enumerate, format, guard, mount, session, smart, system_disk};
     use crate::posix;
     use crate::traits::{ExternalTool, MountPoint, OpenMode, Platform, SmartData, WriteSession, ELEVATION_HINT_UNIX};
     use pm_core::{BlockDevice, DiskInfo, Error, FsKind, ProgressSink, Result, VolumeId, VolumeInfo};
     use std::path::Path;
 
-    /// Runs `/usr/sbin/diskutil` (no shell, `LC_ALL=C`); a non-zero exit is
-    /// `Error::Platform` with diskutil's message.
+    /// Absolute path: under `sudo` macOS keeps the user's `PATH`, so a `diskutil` found
+    /// through it could be any program running as root.
+    const DISKUTIL: &str = "/usr/sbin/diskutil";
+
+    /// Runs `/usr/sbin/diskutil` by absolute path (never looked up on `PATH`; no shell,
+    /// `LC_ALL=C`); a non-zero exit is `Error::Platform` with diskutil's message.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct SystemDiskutil;
 
     impl DiskutilRunner for SystemDiskutil {
         fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
-            Ok(posix::cmd::run("diskutil", args)?.stdout)
+            Ok(posix::cmd::run(DISKUTIL, args)?.stdout)
         }
     }
 
@@ -95,7 +106,8 @@ mod platform {
         }
 
         fn open_volume(&self, id: &VolumeId, mode: OpenMode) -> Result<Box<dyn BlockDevice>> {
-            let node = raw_node(&id.0).ok_or_else(|| Error::NotFound(format!("{} is not a macOS disk slice", id.0)))?;
+            let slice = guard::checked_slice(self.runner.as_ref(), id)?;
+            let node = raw_node(&slice).ok_or_else(|| Error::NotFound(format!("{} is not a macOS disk slice", id.0)))?;
             Ok(Box::new(device::open_raw(&node, mode)?))
         }
 
@@ -127,10 +139,10 @@ mod platform {
             fs: FsKind,
             label: &str,
             cluster: Option<u32>,
-            _quick: bool,
+            quick: bool,
             _progress: &dyn ProgressSink,
         ) -> Result<()> {
-            format::format(self.runner.as_ref(), id, fs, label, cluster)
+            format::format(self.runner.as_ref(), id, fs, label, cluster, quick)
         }
 
         fn shrink_volume(&self, _id: &VolumeId, _new_len: u64) -> Result<()> {
