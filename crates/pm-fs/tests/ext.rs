@@ -500,14 +500,45 @@ fn ext_corrupt_never_panics() {
     }
 }
 
+/// A read-only device of `len` zero bytes with `sb` at byte 1024: a "huge" ext superblock
+/// without a huge backing file (a 600 GiB file is not sparse on every CI runner's disk).
+struct HugeZero {
+    len: u64,
+    sb: Vec<u8>,
+}
+
+impl pm_core::BlockDevice for HugeZero {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> pm_core::Result<()> {
+        let end = offset.checked_add(buf.len() as u64).filter(|e| *e <= self.len);
+        if end.is_none() {
+            let source = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read past the end");
+            return Err(Error::Io { offset, len: buf.len(), source });
+        }
+        for (i, b) in buf.iter_mut().enumerate() {
+            let at = offset + i as u64;
+            *b = if (1024..1024 + self.sb.len() as u64).contains(&at) { self.sb[(at - 1024) as usize] } else { 0 };
+        }
+        Ok(())
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> pm_core::Result<()> {
+        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only");
+        Err(Error::Io { offset, len: buf.len(), source })
+    }
+    fn flush(&mut self) -> pm_core::Result<()> {
+        Ok(())
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+}
+
 #[test]
 fn ext_huge_geometry_is_a_parse_error_not_an_overflow() {
-    use pm_core::{BlockDevice, FileDevice};
-    // a sparse ~600 GiB device; bpg = 1 makes a group per block, ipg and inode size maximal
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("huge.img");
+    // a ~600 GiB device; bpg = 1 makes a group per block, ipg and inode size maximal
     let len: u64 = 600 << 30;
-    let mut dev = FileDevice::create(&path, len).unwrap();
     let mut sb = vec![0u8; 1024];
     put16(&mut sb, 56, 0xEF53);
     put32(&mut sb, 24, 6); // 64 KiB blocks
@@ -517,9 +548,9 @@ fn ext_huge_geometry_is_a_parse_error_not_an_overflow() {
     put32(&mut sb, 40, 8 * 65536);
     put32(&mut sb, 76, 1);
     put16(&mut sb, 88, 32768);
-    dev.write_at(1024, &sb).unwrap();
+    let dev = HugeZero { len, sb: sb.clone() };
     assert!(matches!(Ext::open(Box::new(dev)), Err(Error::Parse(_))));
     // the same through the crate's dispatching entry point
-    let dev = FileDevice::open(&path, true).unwrap();
+    let dev = HugeZero { len, sb };
     assert!(matches!(pm_fs::open(Box::new(dev)).err(), Some(Error::Parse(_))));
 }

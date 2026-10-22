@@ -85,7 +85,14 @@ impl<'a> WizardCtx<'a> {
             selection,
             system_disk: model.effective_system_disk(),
             platform: None,
-            os_name: pm_platform::host_os_name(),
+            // The disks' OS comes from the model (set by `Model::from_platform`), so a test
+            // model behaves the same on every host; `with_platform` overrides it.
+            os_name: match model.os_name() {
+                "windows" => "windows",
+                "linux" => "linux",
+                "macos" => "macos",
+                _ => pm_platform::host_os_name(),
+            },
         }
     }
 
