@@ -67,8 +67,9 @@ yet.
 
 ## Linux
 
-- **Tested in WSL2 only**, on loop devices (a GPT through a write session, `mkfs.vfat`,
-  mount, the busy-unmount rollback). Never run on a physical disk. `mkfs.ntfs`,
+- **Tested on loop devices only**, in WSL2 and on an AlmaLinux 9.8 host with `/` on LVM (a
+  GPT through a write session, `mkfs.vfat`, mount, the busy-unmount rollback, the CLI
+  walk-through). Never run on a physical disk. `mkfs.ntfs`,
   `mkfs.exfat`, `mkfs.ext4`, `mkfs.xfs`, `ntfsresize`, `e2fsck` / `resize2fs` were tested as
   command lines only; `ntfs3` mounting and `smartctl` on a real drive were not exercised.
 - **Without root** the disks come from sysfs only: the table shows as "not readable", there
@@ -92,12 +93,14 @@ yet.
 
 ## macOS
 
-- **Never run on a Mac.** The macOS layer is compile-checked (`aarch64-apple-darwin`,
-  `x86_64-apple-darwin`) and tested on hand-written `diskutil -plist` fixtures (from Apple's
-  key names, not captures). To verify on a real Mac: `BusProtocol` strings on Apple Silicon,
-  `Ejectable` / `RemovableMedia` on USB media, `FreeSpace` on non-APFS volumes, the APFS
-  physical-store key of `diskutil info`, the FAT12/FAT16 personality names, the raw-node
-  ioctls, Disk Arbitration re-mounting after a session, and the `hdiutil` live test.
+- **Write sessions have never run on a Mac.** The macOS layer builds and passes its tests on an
+  Apple Silicon Mac (macOS 15.5); enumeration of the internal disk and of an `hdiutil` image,
+  the table read of that image through the raw node and the not-root refusal were verified
+  there, and a real `diskutil -plist` capture matched the hand-written fixtures (`BusProtocol`
+  "Apple Fabric", the APFS physical-store keys, a 4 KiB `DeviceBlockSize`). Still to verify
+  with `sudo` on a Mac: `diskutil unmountDisk` and the kernel re-reading the map after a write,
+  `diskutil mount`/`unmount`/`eraseVolume`, the FAT12/FAT16 personality names,
+  `Ejectable` / `RemovableMedia` on USB media, `FreeSpace` on non-APFS volumes, `smartctl`.
 - **Without root** partition offsets come from `diskutil` and are approximate: the disk shows
   "partition table not readable, offsets approximate" and nothing is written from them.
 - **APFS.** Containers are shown as their physical store partition, which carries the

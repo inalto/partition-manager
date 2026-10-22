@@ -1,8 +1,8 @@
 # Before the first real-disk run
 
 Everything in this repository is tested on in-memory disks (`MockPlatform`) and image files
-(`FilePlatform`, `--disk-file`); the Linux layer also on loop devices in WSL2. **Nothing has
-yet been run elevated against a real disk.** This checklist is the first live test. Work
+(`FilePlatform`, `--disk-file`); the Linux layer also on loop devices (WSL2 and an AlmaLinux host with `/` on LVM), the
+macOS layer read-only on a Mac mini. **Nothing has yet been run elevated against a real disk.** This checklist is the first live test. Work
 through it in order, on scratch media, and stop at the first surprise.
 
 The numbered checklist is for Windows. On Linux and macOS start with the loop-device and
@@ -71,7 +71,8 @@ In the steps below `N` is the disk number of the test disk.
 A loop device over a sparse file behaves like a real disk (sysfs entry, partition nodes,
 udev, mount) and needs no spare hardware. Run as root (`sudo`); `pm` is
 `./target/release/pm` (or `target/debug/pm`). This walk-through was run in WSL2 (Ubuntu
-24.04) on 2026-10-22.
+24.04) and, with the release build, on an AlmaLinux 9.8 host with `/` on LVM (both on
+2026-10-22; see `docs/superpowers/reports/multiplatform-live-tests.md`).
 
 ```sh
 truncate -s 256M /tmp/pm-live.img
@@ -102,13 +103,18 @@ sudo losetup -d $LOOP && rm /tmp/pm-live.img
   wrote into or changed.
 - `pm doctor` lists the external tools found (`mkfs.*`, `ntfsresize`, `resize2fs`, `e2fsck`,
   `partprobe`, `udevadm`, `smartctl`).
+- A file written by `sudo pm image` belongs to root; remove it with `sudo` too.
 - The `#[ignore]`d platform test covers the same ground at the API level:
   `sudo -E env "PATH=$PATH" cargo test -p pm-platform --test linux_live -- --ignored --test-threads=1`.
+  Where `sudo` resets `HOME` (RHEL-style sudoers), add `RUSTUP_HOME=$HOME/.rustup
+  CARGO_HOME=$HOME/.cargo RUSTUP_TOOLCHAIN=stable` and a `CARGO_TARGET_DIR` of its own, so that
+  rustup finds the toolchain and no root-owned files land in `target/`.
 
 ## macOS: a disk image
 
-**Never run on a Mac yet** (the macOS layer is compile-checked and fixture-tested only), so
-treat every step as the first. A disk image attached without mounting gives a `/dev/diskN`
+**Only the read-only part has run on a Mac** (Mac mini M2, macOS 15.5, 2026-10-22: `pm doctor`,
+`pm list`, `pm table` of an attached image, and the refusal of `init-disk` without root). The
+`sudo` steps below are still untried, so treat them as the first. A disk image attached without mounting gives a `/dev/diskN`
 that `diskutil` treats like an external disk. Run as root (`sudo`).
 
 ```sh
@@ -133,7 +139,7 @@ hdiutil detach /dev/diskN && rm /tmp/pm-live.dmg
 - If a step behaves differently, keep `RUST_LOG=debug` output (`2>> pm.log`), the
   `diskutil list -plist` and `diskutil info -plist /dev/diskN` output, and report them; the
   fixtures in `crates/pm-platform/tests/fixtures/macos/` were written by hand from Apple's key
-  names, not captured.
+  names; a capture from an Apple Silicon Mac matched their keys and shapes.
 - The `#[ignore]`d `macos_live` test in `pm-platform` automates the image part.
 
 ## What to know before a real disk

@@ -38,7 +38,7 @@ The design spec excludes these:
 - **VHDX writing.** Create and write VHDX images (today read-only), and replay the log of an
   unclean shutdown.
 - **Linux and macOS live verification.** Run the Linux checklist on a physical USB disk and
-  the macOS walk-through on a Mac; capture real `diskutil -plist` output as fixtures
+  the macOS `sudo` walk-through on a Mac (the read-only part ran on an M2 Mac mini); capture real `diskutil -plist` output as fixtures
   (Apple Silicon, a snapshot root, Fusion).
 - **Linux follow-ups.** Fill the unprivileged view from the udev database
   (`/run/udev/data`), `/boot` flags, btrfs multi-device file systems, a single enumeration

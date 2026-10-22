@@ -10,8 +10,8 @@ scriptable command line (`pm`) that share the same engines.
 | OS | Status |
 |---|---|
 | Windows | Full support, including boot repair. |
-| Linux | Supported (sysfs, `/dev` nodes, `mkfs.*`, `ntfsresize` / `resize2fs`, `smartctl`); tested in WSL2 on loop devices. |
-| macOS | Supported through `diskutil` and raw `rdisk` nodes; compile- and fixture-tested only, never run on a Mac. |
+| Linux | Supported (sysfs, `/dev` nodes, `mkfs.*`, `ntfsresize` / `resize2fs`, `smartctl`); tested on loop devices in WSL2 and on an LVM-rooted AlmaLinux host. |
+| macOS | Supported through `diskutil` and raw `rdisk` nodes; builds and passes its tests on an Apple Silicon Mac, where reads were verified; write sessions not yet. |
 
 Linux and macOS have no boot repair and no drive letters; macOS cannot format NTFS or resize
 file systems. See [[Known Limitations]].

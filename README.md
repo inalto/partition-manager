@@ -77,8 +77,8 @@ More detail, including where each check lives: [docs/ARCHITECTURE.md](docs/ARCHI
 | OS | Status | Verified |
 |---|---|---|
 | Windows | Full: disks, partitions, volumes, write sessions, mount, format, resize, SMART, boot repair. | Test suite; real-disk checklist in [docs/FIRST-LIVE-TEST.md](docs/FIRST-LIVE-TEST.md) still to be run. |
-| Linux | Supported: disks from sysfs, raw I/O on `/dev` nodes, write sessions (unmount, `O_EXCL`, `flock`, `BLKRRPART`), mount/unmount at folders, format with `mkfs.*`, NTFS/ext resize with `ntfsresize`/`resize2fs`, SMART with `smartctl`. | Test suite in WSL2 (Ubuntu 24.04) plus a live loop-device test as root: GPT through a write session, `mkfs.vfat`, mount, busy-unmount rollback. Never run on a physical disk. |
-| macOS | Supported: disks from `diskutil -plist`, raw I/O on `/dev/rdiskN` (sector-aligned), write sessions (`diskutil unmountDisk`), mount/unmount/erase through `diskutil`, SMART with `smartctl`. | Compile checks and fixture tests only (`cargo check --target aarch64-apple-darwin`, the CI macOS job); **never run on a Mac**. |
+| Linux | Supported: disks from sysfs, raw I/O on `/dev` nodes, write sessions (unmount, `O_EXCL`, `flock`, `BLKRRPART`), mount/unmount at folders, format with `mkfs.*`, NTFS/ext resize with `ntfsresize`/`resize2fs`, SMART with `smartctl`. | Test suite in WSL2 (Ubuntu 24.04) and on an AlmaLinux 9.8 host with `/` on LVM (711 tests), the live loop-device test as root (GPT through a write session, `mkfs.vfat`, mount, busy-unmount rollback) and the loop-device walk-through of `docs/FIRST-LIVE-TEST.md` on that host. Never run on a physical disk. |
+| macOS | Supported: disks from `diskutil -plist`, raw I/O on `/dev/rdiskN` (sector-aligned), write sessions (`diskutil unmountDisk`), mount/unmount/erase through `diskutil`, SMART with `smartctl`. | Builds and passes the whole test suite on an Apple Silicon Mac (macOS 15.5); enumeration, table reads of an `hdiutil` image and the not-root refusal verified there. **Write sessions have never run on a Mac** (they need `sudo`). |
 
 Continuous integration builds and tests the workspace on all three OSes
 (`cargo test --workspace`; tests that touch real hardware are `#[ignore]`d). The macOS
@@ -401,7 +401,7 @@ backup of the machine. In short:
   whole-device sessions. A carve session saved by an older `pm recover carve` on a
   *partition* therefore restores the wrong bytes: delete it and scan again.
 - **Linux and macOS.** See [Platform support](#platform-support) for what is unavailable.
-  Linux was tested in WSL2 on loop devices only, macOS was never run on a Mac; `disk:N` is a
+  Linux was tested on loop devices only (WSL2 and an LVM-rooted AlmaLinux host), on macOS only read-only use was tried on a Mac; `disk:N` is a
   position in the list (use the `/dev/...` node); a Linux write session refuses bind mounts
   and btrfs subvolumes on the disk, and on macOS the volumes a session unmounted are not
   mounted again by Partition Manager. Details per OS are on the wiki's Known Limitations
