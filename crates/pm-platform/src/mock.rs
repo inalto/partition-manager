@@ -8,6 +8,7 @@ use pm_core::{
 };
 use pm_parttable::{read_table, write_table, Table};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 type SharedDisk = Arc<Mutex<Store>>;
@@ -93,6 +94,8 @@ struct State {
     /// Volumes with a handle from [`Platform::open_volume`] still open (shared with the
     /// handles, which remove themselves when dropped).
     open_volumes: Arc<Mutex<Vec<VolumeId>>>,
+    /// Answers of [`Platform::disk_of_path`], by path ([`MockPlatform::set_disk_of_path`]).
+    path_disks: BTreeMap<PathBuf, (u32, Option<u32>)>,
 }
 
 /// Test double for [`Platform`].
@@ -171,6 +174,12 @@ impl MockPlatform {
 
     pub fn set_system_disk(&self, index: u32) {
         self.st().system_disk = Some(index);
+    }
+
+    /// Make [`Platform::disk_of_path`] report `(disk, partition)` for `path` and every path
+    /// below it (the deepest registered ancestor wins).
+    pub fn set_disk_of_path(&self, path: impl Into<PathBuf>, disk: u32, partition: Option<u32>) {
+        self.st().path_disks.insert(path.into(), (disk, partition));
     }
 
     /// Current `(volume, mount point)` pairs added through [`Platform::mount`].
@@ -528,6 +537,11 @@ impl Platform for MockPlatform {
 
     fn system_disk(&self) -> Option<u32> {
         self.st().system_disk
+    }
+
+    fn disk_of_path(&self, path: &Path) -> Option<(u32, Option<u32>)> {
+        let st = self.st();
+        path.ancestors().find_map(|a| st.path_disks.get(a).copied())
     }
 
     fn free_letters(&self) -> Vec<char> {

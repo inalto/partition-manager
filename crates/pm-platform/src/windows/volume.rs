@@ -62,6 +62,29 @@ fn volume_info(id: VolumeId) -> VolumeInfo {
     }
 }
 
+/// `path` in the comparable form of a volume mount point: backslashes, upper case, trailing
+/// backslash, without the `\\?\` prefix.
+fn mount_key(path: &str) -> String {
+    let p = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let mut s = p.replace('/', "\\").to_uppercase();
+    if !s.ends_with('\\') {
+        s.push('\\');
+    }
+    s
+}
+
+/// The volume whose mount point (`C:\`, `C:\mnt\x\`) is the longest prefix of the absolute
+/// path `path` (whole components only, case-insensitive).
+pub fn volume_of_path<'a>(path: &str, volumes: &'a [VolumeInfo]) -> Option<&'a VolumeInfo> {
+    let key = mount_key(path);
+    volumes
+        .iter()
+        .flat_map(|v| v.mount_points.iter().map(move |m| (mount_key(m), v)))
+        .filter(|(m, _)| key.starts_with(m.as_str()))
+        .max_by_key(|(m, _)| m.len())
+        .map(|(_, v)| v)
+}
+
 /// All volumes known to the volume manager.
 pub fn enumerate_volumes() -> Result<Vec<VolumeInfo>> {
     let ids = ioctl::list_volumes().map_err(|c| platform_error(c, "enumerate volumes"))?;
@@ -79,5 +102,24 @@ mod tests {
         assert_eq!(root_path(&id), r"\\?\Volume{1234}\");
         let id = VolumeId(r"\\?\Volume{1234}".into());
         assert_eq!(root_path(&id), r"\\?\Volume{1234}\");
+    }
+
+    #[test]
+    fn path_to_volume_by_longest_mount_point() {
+        let vol = |id: &str, mps: &[&str]| VolumeInfo {
+            id: VolumeId(id.into()),
+            mount_points: mps.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let vols = [vol("c", &[r"C:\"]), vol("m", &[r"C:\mnt\data\"]), vol("e", &[r"E:\", r"C:\mnt\e\"])];
+        let of = |p: &str| volume_of_path(p, &vols).map(|v| v.id.0.as_str());
+        assert_eq!(of(r"C:\Users\x\img.bin"), Some("c"));
+        assert_eq!(of(r"\\?\C:\mnt\data\sub\f"), Some("m"));
+        assert_eq!(of(r"c:/MNT/DATA"), Some("m"), "case and separators do not matter");
+        assert_eq!(of(r"C:\mnt\database\f"), Some("c"), "whole components only");
+        assert_eq!(of(r"e:\x"), Some("e"));
+        assert_eq!(of(r"C:\mnt\e\x"), Some("e"));
+        assert_eq!(of(r"F:\x"), None);
+        assert_eq!(of(r"\\?\UNC\server\share\x"), None);
     }
 }

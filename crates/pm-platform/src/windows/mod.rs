@@ -174,6 +174,15 @@ impl Platform for WindowsPlatform {
     fn elevation_hint(&self) -> &'static str {
         crate::ELEVATION_HINT_WINDOWS
     }
+    fn disk_of_path(&self, path: &std::path::Path) -> Option<(u32, Option<u32>)> {
+        let full = crate::canonical_existing(path)?;
+        let volumes = volume::enumerate_volumes().ok()?;
+        let v = volume::volume_of_path(&full.to_string_lossy(), &volumes)?;
+        let disk = v.disk?;
+        let number = disk::disk_info(disk)
+            .and_then(|d| d.partitions.iter().find(|p| p.start == v.start).map(|p| p.number));
+        Some((disk, number))
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +201,23 @@ mod tests {
         assert!(p.is_absolute());
         assert!(p.exists());
         assert!(system32_path(ExternalTool::BcdBoot.exe_name()).unwrap().exists());
+    }
+
+    #[test]
+    fn disk_of_path_finds_the_windows_folder_on_the_system_disk() {
+        // query-only: works without elevation
+        let p = WindowsPlatform::new();
+        let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let found = p.disk_of_path(std::path::Path::new(&windir));
+        if let Some(system) = p.system_disk() {
+            let (disk, number) = found.expect("the Windows folder is on a disk");
+            assert_eq!(disk, system);
+            assert!(number.is_some_and(|n| n >= 1), "{number:?}");
+        }
+        // a file that does not exist yet resolves through its existing parent
+        let new_file = std::path::Path::new(&windir).join("pm-no-such-dir").join("x.img");
+        assert_eq!(p.disk_of_path(&new_file), found);
+        assert_eq!(p.disk_of_path(std::path::Path::new(r"\\no-such-server\share\x")), None);
     }
 
     fn cmd(args: &[&str]) -> Result<String> {

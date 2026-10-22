@@ -49,6 +49,14 @@ pub fn is_removable(index: u32) -> Option<bool> {
     parse_device_descriptor(&b).ok().map(|d| d.removable)
 }
 
+/// Layout of disk `index` alone (no volume merge, no filesystem probing); partition numbers
+/// follow the on-disk table when it is readable.
+pub fn disk_info(index: u32) -> Option<DiskInfo> {
+    let path = disk_path(index);
+    let (handle, readable) = open_for_query(&path).ok()?;
+    query_disk(index, &path, &handle, readable).ok()
+}
+
 /// Every disk with partitions, merged with `volumes` (by disk and start offset).
 pub fn enumerate_disks(volumes: &[VolumeInfo], system_disk: Option<u32>) -> Vec<DiskInfo> {
     let mut out = Vec::new();

@@ -290,3 +290,18 @@ fn mock_add_device_backs_a_disk_with_any_device() {
     raw[4096..4608].fill(0);
     assert!(p.disk_bytes(2) == raw);
 }
+
+#[test]
+fn disk_of_path_answers_from_the_registered_map() {
+    use std::path::Path;
+    let p = MockPlatform::new();
+    assert_eq!(p.disk_of_path(Path::new("/mnt/usb/file.img")), None);
+    p.set_disk_of_path("/mnt/usb", 2, Some(1));
+    p.set_disk_of_path("/mnt/usb/nested", 3, None);
+    assert_eq!(p.disk_of_path(Path::new("/mnt/usb")), Some((2, Some(1))));
+    assert_eq!(p.disk_of_path(Path::new("/mnt/usb/dir/file.img")), Some((2, Some(1))));
+    assert_eq!(p.disk_of_path(Path::new("/mnt/usb/nested/x")), Some((3, None)), "deepest wins");
+    assert_eq!(p.disk_of_path(Path::new("/mnt/other")), None);
+    // the trait default: unknown
+    assert_eq!(pm_platform::NullPlatform.disk_of_path(Path::new("/")), None);
+}

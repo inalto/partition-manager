@@ -1,11 +1,13 @@
 //! Partition Manager platform layer: the only crate that talks to the operating system.
 //!
 //! Engines, the GUI and the CLI consume the [`Platform`] trait. [`default_platform`] returns the
-//! real implementation (Windows; Linux and macOS follow) or [`NullPlatform`] elsewhere; [`MockPlatform`] backs the tests.
+//! real implementation (Windows, Linux; macOS follows) or [`NullPlatform`] elsewhere; [`MockPlatform`] backs the tests.
 
 pub mod aligned;
 pub mod console;
 pub mod file_platform;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod mock;
 #[cfg(unix)]
 pub mod posix;
@@ -17,6 +19,8 @@ pub mod windows;
 pub use file_platform::{FilePlatform, NO_SYSTEM_DISK};
 pub use mock::MockPlatform;
 pub use traits::*;
+#[cfg(target_os = "linux")]
+pub use linux::LinuxPlatform;
 #[cfg(unix)]
 pub use posix::{BenchFile, FileBenchTarget};
 #[cfg(windows)]
@@ -27,15 +31,37 @@ pub use windows::{
 use pm_core::{BlockDevice, DiskInfo, Error, FsKind, ProgressSink, Result, VolumeId, VolumeInfo};
 use std::sync::Arc;
 
-/// The platform for the current OS: [`WindowsPlatform`] on Windows, [`NullPlatform`] elsewhere.
+/// The platform for the current OS: [`WindowsPlatform`] on Windows, [`LinuxPlatform`] on Linux,
+/// [`NullPlatform`] elsewhere.
 pub fn default_platform() -> Arc<dyn Platform> {
     #[cfg(windows)]
     {
         Arc::new(WindowsPlatform::new())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(LinuxPlatform::new())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         Arc::new(NullPlatform)
+    }
+}
+
+/// `path` made absolute and resolved (symlinks, `..`) up to its deepest existing ancestor; the
+/// part that does not exist yet (e.g. an output file about to be created) is appended as is.
+/// `None` when not even the root exists.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub(crate) fn canonical_existing(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let abs = std::path::absolute(path).ok()?;
+    let mut rest = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            return Some(rest.iter().rev().fold(c, |acc: std::path::PathBuf, part| acc.join(part)));
+        }
+        rest.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?;
     }
 }
 
@@ -207,6 +233,18 @@ mod tests {
         assert_eq!(MountPoint::Letter('e').to_path_string(), r"E:\");
         assert_eq!(MountPoint::Folder(r"C:\mnt\x".into()).to_path_string(), r"C:\mnt\x\");
         assert_eq!(MountPoint::Folder(r"C:\mnt\y\".into()).to_path_string(), r"C:\mnt\y\");
+    }
+
+    #[test]
+    fn canonical_existing_keeps_the_missing_tail() {
+        let t = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(t.path()).unwrap();
+        std::fs::create_dir(base.join("d")).unwrap();
+        assert_eq!(canonical_existing(&base.join("d")).unwrap(), base.join("d"));
+        assert_eq!(
+            canonical_existing(&base.join("d").join("..").join("d").join("new").join("f.img")).unwrap(),
+            base.join("d").join("new").join("f.img")
+        );
     }
 
     #[test]

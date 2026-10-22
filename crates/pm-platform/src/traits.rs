@@ -3,7 +3,7 @@
 use pm_core::{BlockDevice, DiskInfo, FsKind, ProgressSink, Result, VolumeId, VolumeInfo};
 use pm_parttable::Table;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How a disk or volume is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +131,13 @@ pub trait Platform: Send + Sync {
     /// How to run a command with the rights this platform needs, for error hints.
     fn elevation_hint(&self) -> &'static str {
         host_elevation_hint()
+    }
+    /// The disk index holding the file or directory `path`, with the partition number (as
+    /// [`pm_parttable::read_table`] numbers it) when known; `None` when it cannot be
+    /// determined (network share, RAM disk, LVM / device-mapper volume, image platform, ...).
+    /// Used to refuse writing an image or a recovered file onto the disk being read.
+    fn disk_of_path(&self, _path: &Path) -> Option<(u32, Option<u32>)> {
+        None
     }
 }
 
