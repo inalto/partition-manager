@@ -19,8 +19,8 @@ can be practised risk-free on image files with `--disk-file`.
 
 Prebuilt binaries for every tagged version are on the
 [Releases page](https://github.com/inalto/partition-manager/releases): `pm` (CLI) and
-`partition-manager` (GUI) for Windows x86_64 (zip), Linux x86_64 (tar.gz, needs glibc 2.35 or
-newer: Ubuntu 22.04, Debian 12, Fedora 36 and later; older distributions build from source) and
+`partition-manager` (GUI) for Windows x86_64 (zip), Linux x86_64 (tar.gz, built on Ubuntu 22.04 against glibc 2.35 and verified to run on
+AlmaLinux 9 with glibc 2.34; older distributions build from source) and
 macOS on Apple Silicon and Intel (tar.gz, unsigned: after downloading run
 `xattr -d com.apple.quarantine pm partition-manager`). `SHA256SUMS.txt` lists the checksums.
 The release workflow (`.github/workflows/release.yml`) builds them from the tag with the

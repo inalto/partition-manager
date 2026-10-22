@@ -9,7 +9,7 @@ You need a Rust toolchain from <https://rustup.rs>. Get the source from
 
 **Prebuilt binaries.** Every tagged version has `pm` and `partition-manager` on the
 [Releases page](https://github.com/inalto/partition-manager/releases) for Windows x86_64,
-Linux x86_64 (glibc 2.35 or newer) and macOS on Apple Silicon and Intel (unsigned: run
+Linux x86_64 (built against glibc 2.35, runs on AlmaLinux 9's 2.34 too) and macOS on Apple Silicon and Intel (unsigned: run
 `xattr -d com.apple.quarantine pm partition-manager` after downloading), with
 `SHA256SUMS.txt`. The rest of this page is for building from source.
 
