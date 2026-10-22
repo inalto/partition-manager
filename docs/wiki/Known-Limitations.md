@@ -93,14 +93,13 @@ yet.
 
 ## macOS
 
-- **Write sessions have never run on a Mac.** The macOS layer builds and passes its tests on an
-  Apple Silicon Mac (macOS 15.5); enumeration of the internal disk and of an `hdiutil` image,
-  the table read of that image through the raw node and the not-root refusal were verified
-  there, and a real `diskutil -plist` capture matched the hand-written fixtures (`BusProtocol`
-  "Apple Fabric", the APFS physical-store keys, a 4 KiB `DeviceBlockSize`). Still to verify
-  with `sudo` on a Mac: `diskutil unmountDisk` and the kernel re-reading the map after a write,
-  `diskutil mount`/`unmount`/`eraseVolume`, the FAT12/FAT16 personality names,
-  `Ejectable` / `RemovableMedia` on USB media, `FreeSpace` on non-APFS volumes, `smartctl`.
+- **Tested on an `hdiutil` disk image only** (Mac mini M2, macOS 15.5): the whole suite, the
+  `macos_live` test and the CLI walk-through as root (a GPT through a session, `create` with
+  FAT32 through `diskutil eraseVolume`, the auto-mount by Disk Arbitration, a partition image,
+  unmount); a real `diskutil -plist` capture matched the hand-written fixtures. Never run on a
+  physical disk; APFS/HFS+/exFAT formatting, `Ejectable` / `RemovableMedia` on USB media,
+  `FreeSpace` on non-APFS volumes, the FAT12/FAT16 personality names and `smartctl` are still
+  unverified.
 - **Without root** partition offsets come from `diskutil` and are approximate: the disk shows
   "partition table not readable, offsets approximate" and nothing is written from them.
 - **APFS.** Containers are shown as their physical store partition, which carries the

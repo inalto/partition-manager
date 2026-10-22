@@ -112,10 +112,10 @@ sudo losetup -d $LOOP && rm /tmp/pm-live.img
 
 ## macOS: a disk image
 
-**Only the read-only part has run on a Mac** (Mac mini M2, macOS 15.5, 2026-10-22: `pm doctor`,
-`pm list`, `pm table` of an attached image, and the refusal of `init-disk` without root). The
-`sudo` steps below are still untried, so treat them as the first. A disk image attached without mounting gives a `/dev/diskN`
-that `diskutil` treats like an external disk. Run as root (`sudo`).
+This walk-through was run as root on a Mac mini M2 (macOS 15.5) on 2026-10-22, together with
+the `macos_live` test (see `docs/superpowers/reports/multiplatform-live-tests.md`); without `sudo`
+the same commands list and read but refuse to write. A disk image attached without mounting
+gives a `/dev/diskN` that `diskutil` treats like an external disk. Run as root (`sudo`).
 
 ```sh
 hdiutil create -size 64m -layout NONE /tmp/pm-live.dmg
@@ -131,6 +131,9 @@ diskutil list /dev/diskN  # diskNs1 MS-DOS FAT32 T1
 hdiutil detach /dev/diskN && rm /tmp/pm-live.dmg
 ```
 
+- After `create`, macOS mounts the new volume itself at `/Volumes/<label>`; unmount it with
+  `pm unmount /dev/diskNs1 --folder /Volumes/<label>` (another folder is refused). `pm mount
+  --folder DIR` needs an existing empty directory.
 - `/dev/diskN` and `/dev/rdiskN` name the same disk; I/O goes through the raw `rdisk` node in
   whole sectors.
 - Without `sudo` the partition offsets come from `diskutil` and are approximate: the list

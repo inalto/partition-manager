@@ -72,11 +72,29 @@ unprivileged part ran.
   real `rdisk`; `init-disk --gpt --dry-run` plans; `init-disk --gpt --yes` is refused:
   "access denied (writing a disk needs root)" and the table is unchanged afterwards.
 
-**Not covered (needs `sudo` on the Mac).** The write session (`diskutil unmountDisk`, GPT write,
-the kernel re-reading the map), `diskutil mount`/`unmount`/`eraseVolume`, the FAT16/FAT12
-personality names, `smartctl`, the `macos_live` test, and the GUI. To run them: give the account
-passwordless `sudo` (or run the macOS section of `docs/FIRST-LIVE-TEST.md` by hand), then
-`sudo env "PATH=$PATH" cargo test -p pm-platform --test macos_live -- --ignored`.
+### Root run (after the user enabled passwordless `sudo` for the account)
+
+- `sudo … cargo test -p pm-platform --test macos_live -- --ignored`: **1 passed** (2.8 s): image
+  attached, GPT written through a session, re-read, `diskutil` sees `diskNs1`, image ejected.
+- The documented walk-through as root: `doctor` (Elevated yes, System disk 0, `disk0` now GPT
+  with its three slices typed), `init-disk --gpt` (dry run, then real; `diskutil list` shows
+  `GUID_partition_scheme`, i.e. the kernel re-read the map on close), `create --fs fat32 --label
+  T1` (table written, `diskutil eraseVolume FAT32`; `diskutil list` shows `Microsoft Basic Data
+  T1`, `diskutil info` says MS-DOS FAT32 at offset 1048576, and Disk Arbitration mounted it at
+  `/Volumes/T1`), `pm list` (T1 FAT32, 2 KB used), `table` (one entry at 1 MiB), `image` of the
+  partition (773 KB smart copy into a 48 MB raw file), `unmount`, `delete --dry-run`, detach.
+  No image or mount left behind.
+
+**Findings fixed during the run.** (1) `pm unmount /dev/disk4s1 --folder /tmp/pm-mnt` unmounted
+the volume although it was mounted at `/Volumes/T1`, and reported the folder as typed: the
+macOS `unmount` ignored the folder. Fix `3ca9728`: the folder must match the slice's real mount
+point (as on Linux), otherwise `NotFound` names both. (2) `pm image … /tmp/pm-mnt/self.img` with
+a missing directory reported "I/O error at offset 0 (len 0): No such file or directory". Fix
+`f0d79a5`: file open/create errors name the path and map to `NotFound` / `Platform`.
+
+**Not covered.** A physical disk; `diskutil mount` into a folder (the walk-through mounted
+nothing by hand, Disk Arbitration did); APFS/HFS+/exFAT formatting and the FAT12/FAT16
+personality names; `smartctl` (not installed); the GUI.
 
 The captured plists are not committed (they carry the machine's volume UUIDs); the key
 comparison above is the record.
