@@ -5,7 +5,7 @@
 use pm_core::{DiskBus, DiskInfo, VolumeId};
 use pm_platform::linux::{
     classify_node, mount_conflicts, parse_block_dir, parse_block_dir_with, parse_mountinfo, parse_proc_mounts,
-    parse_vpd_pg80, system_disk_from, MountEntry, NodeKind,
+    parse_vpd_pg80, system_disk_from, system_disk_with, MountEntry, NodeKind,
 };
 use std::fs;
 use std::path::Path;
@@ -206,11 +206,52 @@ fn system_disk_from_root_partition() {
     assert_eq!(system_disk_from(&parse_proc_mounts(&stacked), &disks), Some(by_path(&disks, "/dev/sda").index));
 }
 
+/// `/sys/class/block` with device-mapper / md stacks: dm-0 (LVM `cl-root`) over sda2, dm-1
+/// (`big-root`) over sda2 + nvme0n1p1, md0 over sda1 + sda2, dm-2 (LUKS) over dm-0.
+fn stacks(t: &tempfile::TempDir) -> std::path::PathBuf {
+    let class = t.path().join("class");
+    for (dev, slaves, dm_name) in [
+        ("dm-0", &["sda2"][..], Some("cl-root")),
+        ("dm-1", &["sda2", "nvme0n1p1"][..], Some("big-root")),
+        ("md0", &["sda1", "sda2"][..], None),
+        ("dm-2", &["dm-0"][..], Some("luks-root")),
+    ] {
+        for s in slaves {
+            fs::create_dir_all(class.join(dev).join("slaves").join(s)).unwrap();
+        }
+        if let Some(n) = dm_name {
+            write(&class.join(dev).join("dm/name"), n);
+        }
+    }
+    class
+}
+
+#[test]
+fn system_disk_through_lvm_dm_and_md() {
+    let (t, root) = fixture();
+    let disks = parse_block_dir(&root);
+    let class = stacks(&t);
+    let sda = by_path(&disks, "/dev/sda").index;
+    let at_root = |dev: &str| system_disk_with(&parse_proc_mounts(&format!("{dev} / xfs rw 0 0\n")), &disks, &class);
+    // the RHEL / Fedora default: / on an LV of a volume group on sda2
+    assert_eq!(at_root("/dev/mapper/cl-root"), Some(sda));
+    assert_eq!(at_root("/dev/dm-0"), Some(sda));
+    // LUKS over LVM over sda2
+    assert_eq!(at_root("/dev/mapper/luks-root"), Some(sda));
+    // an md mirror of two partitions of the same disk
+    assert_eq!(at_root("/dev/md0"), Some(sda));
+    // an LV spanning two disks: unknown, fail closed
+    assert_eq!(at_root("/dev/mapper/big-root"), None);
+    assert_eq!(at_root("/dev/dm-1"), None);
+}
+
 #[test]
 fn system_disk_fails_closed_on_lvm_dm_and_pseudo_roots() {
-    // Review Focus 4: never a wrong index
-    let (_t, root) = fixture();
+    // Review Focus 4: never a wrong index (stacks whose slaves are unknown stay unknown)
+    let (t, root) = fixture();
     let disks = parse_block_dir(&root);
+    let empty_class = t.path().join("empty-class");
+    fs::create_dir_all(&empty_class).unwrap();
     for line in [
         "/dev/mapper/ubuntu--vg-ubuntu--lv / ext4 rw,relatime 0 0",
         "/dev/dm-0 / xfs rw 0 0",
@@ -221,7 +262,7 @@ fn system_disk_fails_closed_on_lvm_dm_and_pseudo_roots() {
         "/dev/root / ext4 rw 0 0",
     ] {
         let m = parse_proc_mounts(&format!("{line}\n/dev/nvme0n1p1 /boot/efi vfat rw 0 0\n"));
-        assert_eq!(system_disk_from(&m, &disks), None, "{line}");
+        assert_eq!(system_disk_with(&m, &disks, &empty_class), None, "{line}");
     }
     assert_eq!(system_disk_from(&[], &disks), None, "no / at all");
 }

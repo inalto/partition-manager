@@ -35,7 +35,7 @@ pub mod system_disk;
 pub use mounts::{mount_conflicts, parse_mountinfo, parse_proc_mounts, MountEntry};
 pub use session::LinuxWriteSession;
 pub use sysfs::{classify_node, parse_block_dir, parse_block_dir_with, parse_vpd_pg80, NodeKind};
-pub use system_disk::system_disk_from;
+pub use system_disk::{system_disk_from, system_disk_with};
 
 use crate::posix::{is_root, os_error, statvfs, FdDevice};
 use crate::traits::{ExternalTool, MountPoint, OpenMode, Platform, SmartData, WriteSession};
