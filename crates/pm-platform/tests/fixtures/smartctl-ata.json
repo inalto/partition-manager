@@ -1,0 +1,60 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "svn_revision": "5530",
+    "platform_info": "x86_64-linux-6.8.0",
+    "build_info": "(local build)",
+    "argv": ["smartctl", "-j", "-a", "/dev/sda"],
+    "exit_status": 64
+  },
+  "device": {"name": "/dev/sda", "info_name": "/dev/sda [SAT]", "type": "sat", "protocol": "ATA"},
+  "model_family": "Western Digital Blue",
+  "model_name": "WDC WD20EZAZ-00GGJB0",
+  "serial_number": "WD-WXA1A12345678",
+  "firmware_version": "80.00A80",
+  "user_capacity": {"blocks": 3907029168, "bytes": 2000398934016},
+  "logical_block_size": 512,
+  "physical_block_size": 4096,
+  "rotation_rate": 5400,
+  "smart_support": {"available": true, "enabled": true},
+  "smart_status": {"passed": false},
+  "ata_smart_attributes": {
+    "revision": 16,
+    "table": [
+      {
+        "id": 1, "name": "Raw_Read_Error_Rate", "value": 200, "worst": 200, "thresh": 51,
+        "when_failed": "",
+        "flags": {"value": 47, "string": "POSR-K ", "prefailure": true, "updated_online": true, "performance": true, "error_rate": true, "event_count": false, "auto_keep": true},
+        "raw": {"value": 0, "string": "0"}
+      },
+      {
+        "id": 5, "name": "Reallocated_Sector_Ct", "value": 140, "worst": 140, "thresh": 140,
+        "when_failed": "now",
+        "flags": {"value": 51, "string": "PO--CK ", "prefailure": true, "updated_online": true, "performance": false, "error_rate": false, "event_count": true, "auto_keep": true},
+        "raw": {"value": 1832, "string": "1832"}
+      },
+      {
+        "id": 9, "name": "Power_On_Hours", "value": 71, "worst": 71, "thresh": 0,
+        "when_failed": "",
+        "flags": {"value": 50, "string": "-O--CK ", "prefailure": false, "updated_online": true, "performance": false, "error_rate": false, "event_count": true, "auto_keep": true},
+        "raw": {"value": 21734, "string": "21734"}
+      },
+      {
+        "id": 194, "name": "Temperature_Celsius", "value": 114, "worst": 97, "thresh": 0,
+        "when_failed": "",
+        "flags": {"value": 34, "string": "-O---K ", "prefailure": false, "updated_online": true, "performance": false, "error_rate": false, "event_count": false, "auto_keep": true},
+        "raw": {"value": 158915641377, "string": "33 (Min/Max 18/37)"}
+      },
+      {
+        "id": 197, "name": "Current_Pending_Sector", "value": 200, "worst": 200, "thresh": 0,
+        "when_failed": "",
+        "flags": {"value": 50, "string": "-O--CK ", "prefailure": false, "updated_online": true, "performance": false, "error_rate": false, "event_count": true, "auto_keep": true},
+        "raw": {"value": 7, "string": "7"}
+      }
+    ]
+  },
+  "power_on_time": {"hours": 21734},
+  "power_cycle_count": 1203,
+  "temperature": {"current": 33}
+}
