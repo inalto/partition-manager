@@ -81,6 +81,7 @@ fn model() -> Model {
         }],
         system_disk: Some(0),
         windows_found: Vec::new(),
+        os: String::new(),
     }
 }
 

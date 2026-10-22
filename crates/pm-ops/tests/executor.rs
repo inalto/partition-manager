@@ -75,6 +75,79 @@ fn run(p: &MockPlatform, ops: &[Operation]) -> ExecReport {
     execute(p, ops, &opts(), &NullProgress, &CancelToken::new()).expect("execute returns a report")
 }
 
+/// The mock as the platform of `os` (`Platform::os_name`), for the per-OS rules.
+struct AsOs<'a>(&'a MockPlatform, &'static str);
+
+impl Platform for AsOs<'_> {
+    fn enumerate_disks(&self) -> pm_core::Result<Vec<DiskInfo>> {
+        self.0.enumerate_disks()
+    }
+    fn enumerate_volumes(&self) -> pm_core::Result<Vec<VolumeInfo>> {
+        self.0.enumerate_volumes()
+    }
+    fn open_disk(&self, i: u32, m: OpenMode) -> pm_core::Result<Box<dyn pm_core::BlockDevice>> {
+        self.0.open_disk(i, m)
+    }
+    fn open_volume(&self, id: &pm_core::VolumeId, m: OpenMode) -> pm_core::Result<Box<dyn pm_core::BlockDevice>> {
+        self.0.open_volume(id, m)
+    }
+    fn begin_write(&self, d: u32) -> pm_core::Result<Box<dyn pm_platform::WriteSession>> {
+        self.0.begin_write(d)
+    }
+    fn mount(&self, id: &pm_core::VolumeId, at: &MountPoint) -> pm_core::Result<()> {
+        self.0.mount(id, at)
+    }
+    fn unmount(&self, id: &pm_core::VolumeId, at: &MountPoint) -> pm_core::Result<()> {
+        self.0.unmount(id, at)
+    }
+    fn set_offline(&self, d: u32, o: bool) -> pm_core::Result<()> {
+        self.0.set_offline(d, o)
+    }
+    fn rescan(&self, d: u32) -> pm_core::Result<()> {
+        self.0.rescan(d)
+    }
+    fn format(
+        &self,
+        id: &pm_core::VolumeId,
+        fs: FsKind,
+        label: &str,
+        cluster: Option<u32>,
+        quick: bool,
+        progress: &dyn pm_core::ProgressSink,
+    ) -> pm_core::Result<()> {
+        self.0.format(id, fs, label, cluster, quick, progress)
+    }
+    fn shrink_volume(&self, id: &pm_core::VolumeId, n: u64) -> pm_core::Result<()> {
+        self.0.shrink_volume(id, n)
+    }
+    fn extend_volume(&self, id: &pm_core::VolumeId, n: u64) -> pm_core::Result<()> {
+        self.0.extend_volume(id, n)
+    }
+    fn smart(&self, d: u32) -> pm_core::Result<Option<pm_platform::SmartData>> {
+        self.0.smart(d)
+    }
+    fn is_elevated(&self) -> bool {
+        self.0.is_elevated()
+    }
+    fn system_disk(&self) -> Option<u32> {
+        self.0.system_disk()
+    }
+    fn free_letters(&self) -> Vec<char> {
+        self.0.free_letters()
+    }
+    fn run_tool(&self, t: pm_platform::ExternalTool, a: &[String]) -> pm_core::Result<String> {
+        self.0.run_tool(t, a)
+    }
+    fn os_name(&self) -> &'static str {
+        self.1
+    }
+}
+
+/// [`run`] with the mock posing as the platform of `os`.
+fn run_as(os: &'static str, p: &MockPlatform, ops: &[Operation]) -> ExecReport {
+    execute(&AsOs(p, os), ops, &opts(), &NullProgress, &CancelToken::new()).expect("execute returns a report")
+}
+
 fn table_of(p: &MockPlatform, disk: u32) -> Table {
     let mut dev = MemDevice::from_vec(p.disk_bytes(disk));
     read_table(&mut dev).unwrap()
@@ -540,7 +613,7 @@ fn execute_migrate_regenerates_disk_guid_and_calls_bcdboot() {
         target_table: None,
         keep_ids: false,
     };
-    let r = run(&p, &[op]);
+    let r = run_as("windows", &p, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);
     assert_eq!(r.completed, 1);
     assert_sessions_finished(&p);
@@ -589,7 +662,12 @@ fn execute_migrate_regenerates_disk_guid_and_calls_bcdboot() {
         target_table: None,
         keep_ids: false,
     };
-    let r = run(&p2, &[op]);
+    // off Windows the same migration is refused before anything is written: no bcdboot there
+    let r = run_as("linux", &p2, &[op.clone()]);
+    assert_eq!(r.completed, 0, "{:?}", r.log);
+    assert!(r.failed.is_some() && r.log.iter().any(|l| l.contains("Boot repair is Windows-only")), "{:?}", r.log);
+    assert!(p2.write_sessions_log().is_empty());
+    let r = run_as("windows", &p2, &[op]);
     assert_eq!(r.failed, None, "{:?}", r.log);
     assert!(r.log.iter().any(|l| l.contains("boot fix failed")), "{:?}", r.log);
     assert!(p2.mounted().is_empty(), "temporary letters removed after a failure");
@@ -1466,4 +1544,26 @@ fn read_only_or_offline_disks_and_extended_types_are_refused() {
         };
         pm_ops::precheck(&m, &img).unwrap();
     }
+}
+
+#[test]
+fn precheck_follows_the_os_of_the_disks() {
+    let p = MockPlatform::new();
+    p.add_disk(0, MemDevice::new(DISK_LEN), meta(0));
+    p.add_disk(1, MemDevice::new(DISK_LEN), DiskInfo { path: "/dev/sdb".into(), flags: pm_core::DiskFlags { read_only: true, ..Default::default() }, ..meta(1) });
+    p.set_system_disk(ELSEWHERE);
+    let clone = |boot_fix| Operation::CloneDisk { src_disk: 0, dst_disk: 2, sizing: Sizing::Fit, mode: CloneMode::Smart, boot_fix, target_table: None };
+    let mut m = Model::from_platform(&AsOs(&p, "macos")).unwrap();
+    assert_eq!(m.os_name(), "macos");
+    let e = pm_ops::precheck(&m, &clone(BootFix::Uefi)).unwrap_err().to_string();
+    assert!(e.contains("Boot repair is Windows-only"), "{e}");
+    assert!(pm_ops::precheck(&m, &clone(BootFix::None)).is_ok());
+    // the read-only advice names the OS's own tool
+    let wipe = Operation::WipeDisk { disk: 1, method: WipeMethod::Zero };
+    assert!(pm_ops::precheck(&m, &wipe).unwrap_err().to_string().contains("diskutil info /dev/sdb"));
+    m.os = "linux".into();
+    assert!(pm_ops::precheck(&m, &wipe).unwrap_err().to_string().contains("blockdev --setrw /dev/sdb"));
+    m.os = "windows".into();
+    assert!(pm_ops::precheck(&m, &wipe).unwrap_err().to_string().contains("Set-Disk 1 -IsReadOnly $false"));
+    assert!(pm_ops::precheck(&m, &clone(BootFix::Uefi)).is_ok());
 }

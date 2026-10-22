@@ -76,26 +76,42 @@ pub struct ExecReport {
 /// * a clone / migration that puts a source partition into a smaller target unless the source
 ///   is an NTFS volume that can be shrunk online. (Conservative: a filesystem smaller
 ///   than its partition would fit, but the model does not know filesystem sizes.)
-/// * any write to a disk Windows reports as read-only or offline;
+/// * any write to a disk the OS reports as read-only or offline (the advice names the OS's
+///   own tool);
+/// * a disk copy / OS migration with boot repair when the disks are not Windows' (boot
+///   repair runs `bcdboot` / `bootsect`, which exist on Windows only);
 /// * a rescue-mode image whose mapfile folder does not exist, whose mapfile is the image
 ///   itself, or whose cluster size is zero.
+/// Why boot repair is refused off Windows (also shown by the GUI's copy wizards).
+pub const BOOT_REPAIR_WINDOWS_ONLY: &str =
+    "Boot repair is Windows-only; the clone will not be made bootable from this host.";
+
 pub fn precheck(model: &Model, op: &Operation) -> Result<()> {
+    let os = model.os_name();
     if let Some(d) = written_disk(model, op).and_then(|d| model.disk(d)) {
         let i = d.index;
         if d.flags.read_only {
-            return Err(Error::Invalid(format!(
-                "Disk {i} is read-only; clear its read-only attribute first (Disk Management, or \
-                 Set-Disk {i} -IsReadOnly $false)"
-            )));
+            let how = match os {
+                "windows" => format!("Disk Management, or Set-Disk {i} -IsReadOnly $false"),
+                "macos" => format!("`diskutil info {}` must say Writable: Yes; check the media's lock switch", d.path),
+                _ => format!("`sudo blockdev --setrw {}`; check the media's lock switch", d.path),
+            };
+            return Err(Error::Invalid(format!("Disk {i} is read-only; clear its read-only attribute first ({how})")));
         }
         if d.flags.offline {
-            return Err(Error::Invalid(format!(
-                "Disk {i} is offline; bring it online first (Disk Management, or Set-Disk {i} \
-                 -IsOffline $false)"
-            )));
+            let how = match os {
+                "windows" => format!("Disk Management, or Set-Disk {i} -IsOffline $false"),
+                _ => "reconnect it and refresh the disk list".to_string(),
+            };
+            return Err(Error::Invalid(format!("Disk {i} is offline; bring it online first ({how})")));
         }
     }
     match op {
+        Operation::CloneDisk { boot_fix, .. } | Operation::MigrateOs { boot_fix, .. }
+            if *boot_fix != crate::BootFix::None && os != "windows" =>
+        {
+            Err(Error::Invalid(format!("{BOOT_REPAIR_WINDOWS_ONLY} Choose no boot repair.")))
+        }
         Operation::SetLabel { .. } => Err(set_label_unsupported()),
         Operation::ResizeMove { disk, number, new_len, .. } => {
             if let Some(p) = model.partition(*disk, *number) {

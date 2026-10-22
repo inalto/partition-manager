@@ -78,9 +78,9 @@ pub(crate) fn check_rescue_settings(path: &Path, format: ImageFormat, r: &Rescue
     Ok(())
 }
 
-/// Path equality as Windows sees it (case-insensitive there).
+/// Paths compare case-insensitively where the default filesystems do (Windows, macOS).
 fn same_path(a: &Path, b: &Path) -> bool {
-    if cfg!(windows) {
+    if cfg!(any(windows, target_os = "macos")) {
         a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
     } else {
         a == b

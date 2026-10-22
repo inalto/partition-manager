@@ -19,7 +19,7 @@ pub use model::{table_from_disk, Model};
 pub use operation::{BootFix, CloneMode, Operation, RescueSettings, Sizing, WipeMethod};
 pub use planner::Planner;
 pub use sizing::{plan_disk_clone, windows_partition, LayoutSpec, TargetLayout};
-pub use executor::{execute, execute_queued, precheck, ExecOpts, ExecReport, StepEvent};
+pub use executor::{execute, execute_queued, precheck, ExecOpts, ExecReport, StepEvent, BOOT_REPAIR_WINDOWS_ONLY};
 pub use identity::{adopt_generated_ids, layout_matches};
 pub use location::{locate, path_problem_on, place_of, place_problem, MountMap, PathPlace};
 pub use queue::OpQueue;

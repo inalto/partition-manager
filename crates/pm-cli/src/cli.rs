@@ -368,12 +368,13 @@ impl CliError {
         }
     }
 
-    /// Whether this is an access-denied failure (elevation missing).
-    fn is_access_denied(&self) -> bool {
+    /// Whether this is an access-denied failure (elevation missing) on `os`
+    /// (`Platform::os_name`).
+    fn is_access_denied(&self, os: &str) -> bool {
         match self {
             CliError::Runtime(pm_core::Error::Platform { code, msg }) => {
                 let m = msg.to_ascii_lowercase();
-                denied_code(*code) || m.contains("access denied") || m.contains("permission denied")
+                denied_code(os, *code) || m.contains("access denied") || m.contains("permission denied")
             }
             CliError::Runtime(pm_core::Error::Io { source, .. }) => {
                 source.kind() == std::io::ErrorKind::PermissionDenied
@@ -383,19 +384,30 @@ impl CliError {
     }
 }
 
-/// Whether the OS error `code` means "no rights": `ERROR_ACCESS_DENIED` (5) on Windows,
-/// `EACCES` (13) / `EPERM` (1) on Linux and macOS (where 5 is `EIO`, an I/O error).
-fn denied_code(code: u32) -> bool {
-    (cfg!(windows) && code == 5) || (cfg!(unix) && (code == 13 || code == 1))
+/// Whether the OS error `code` of a platform for `os` (`Platform::os_name`) means "no
+/// rights": `ERROR_ACCESS_DENIED` (5) on Windows, `EACCES` (13) / `EPERM` (1) elsewhere
+/// (where 5 is `EIO`, an I/O error).
+fn denied_code(os: &str, code: u32) -> bool {
+    if os == "windows" {
+        code == 5
+    } else {
+        code == 13 || code == 1
+    }
 }
 
 impl CliError {
     /// The message, with `elevation_hint` (`Platform::elevation_hint`) appended to an
-    /// access-denied failure.
+    /// access-denied failure, for a platform of the host OS.
     pub fn render(&self, elevation_hint: &str) -> String {
+        self.render_for(pm_platform::host_os_name(), elevation_hint)
+    }
+
+    /// [`CliError::render`] for a platform driving `os` (`Platform::os_name`), which decides
+    /// what an error code means.
+    pub fn render_for(&self, os: &str, elevation_hint: &str) -> String {
         match self {
             CliError::Usage(m) | CliError::Failed(m) => m.clone(),
-            CliError::Runtime(e) if self.is_access_denied() => format!("{e} (hint: {elevation_hint})"),
+            CliError::Runtime(e) if self.is_access_denied(os) => format!("{e} (hint: {elevation_hint})"),
             CliError::Runtime(e) => e.to_string(),
         }
     }
@@ -484,6 +496,11 @@ mod tests {
         assert!(!plat(2, "No such device").render(hint).contains(hint));
         let io = CliError::Runtime(Error::io(0, 512, std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
         assert!(io.render(hint).contains(hint));
+        // the platform's OS decides, not the host's
+        assert!(plat(5, "read failed").render_for("windows", hint).contains(hint));
+        assert!(!plat(5, "read failed").render_for("linux", hint).contains(hint));
+        assert!(plat(13, "open").render_for("macos", hint).contains(hint));
+        assert!(!plat(13, "open").render_for("windows", hint).contains(hint));
         assert!(matches!(arg_error(Error::Cancelled), CliError::Runtime(_)));
     }
 }

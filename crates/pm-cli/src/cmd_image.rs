@@ -122,7 +122,7 @@ pub fn run_image(
     let read_from = source_backing_files(platform, source.source_files(), source.disk_index());
     refuse_source_overwrite(&read_from, &partial.files_written())?;
     if let Some(extent) = source.disk_extent {
-        refuse_files_on_source(platform, place_of_extent(platform, extent), &[file.to_path_buf()])?;
+        refuse_files_on_source(platform, place_of_extent(platform, extent), &partial.files_written())?;
     }
 
     // Everything that can be refused is refused before any output file is touched.

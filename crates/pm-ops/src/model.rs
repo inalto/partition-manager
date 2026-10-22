@@ -25,6 +25,10 @@ pub struct Model {
     /// (the second rule of [`windows_partition`]).
     #[serde(default)]
     pub windows_found: Vec<(u32, u64)>,
+    /// `Platform::os_name` of the platform the model was read from; empty: the host's (models
+    /// built by hand, and saved before this field existed).
+    #[serde(default)]
+    pub os: String,
 }
 
 impl Model {
@@ -36,9 +40,19 @@ impl Model {
             volumes: p.enumerate_volumes()?,
             system_disk: p.system_disk(),
             windows_found: Vec::new(),
+            os: p.os_name().to_string(),
         };
         m.probe_windows(&platform_windows_probe(p));
         Ok(m)
+    }
+
+    /// The OS the disks belong to (`Platform::os_name`, see [`Model::os`]).
+    pub fn os_name(&self) -> &str {
+        if self.os.is_empty() {
+            pm_platform::host_os_name()
+        } else {
+            &self.os
+        }
     }
 
     /// Fill [`Model::windows_found`] with `probe`: on every disk where no candidate partition

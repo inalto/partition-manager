@@ -72,7 +72,7 @@ pub fn mbr_disk(index: u32) -> DiskInfo {
 }
 
 pub fn model_of(disks: Vec<DiskInfo>) -> Model {
-    Model { disks, volumes: Vec::new(), system_disk: None, windows_found: Vec::new() }
+    Model { disks, volumes: Vec::new(), system_disk: None, windows_found: Vec::new(), os: String::new() }
 }
 
 /// A platform that places every path under `dir` on a disk no test model has (disk 99), so

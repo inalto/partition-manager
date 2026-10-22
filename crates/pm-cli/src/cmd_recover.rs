@@ -219,12 +219,12 @@ fn source_place(platform: &dyn Platform, arg: &DeviceArg) -> Result<SourcePlace,
     })
 }
 
-/// `p` with `\` as `/`, without a trailing separator, lower-case on Windows (where paths
-/// are case-insensitive), for prefix comparisons of mount points.
+/// `p` with `\` as `/`, without a trailing separator, lower-case on Windows and macOS (whose
+/// default filesystems are case-insensitive), for prefix comparisons of mount points.
 fn path_key(p: &str) -> String {
     let s = p.replace('\\', "/");
     let s = s.trim_end_matches('/').to_string();
-    if cfg!(windows) {
+    if cfg!(any(windows, target_os = "macos")) {
         s.to_ascii_lowercase()
     } else {
         s

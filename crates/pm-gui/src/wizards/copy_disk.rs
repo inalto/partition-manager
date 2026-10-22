@@ -225,8 +225,7 @@ pub fn sizing_ui(ui: &mut egui::Ui, sizing: &mut Sizing) {
 }
 
 /// Shown instead of the boot repair choice on Linux and macOS.
-pub const BOOT_REPAIR_WINDOWS_ONLY: &str =
-    "Boot repair is Windows-only; the clone will not be made bootable from this host.";
+pub use pm_ops::BOOT_REPAIR_WINDOWS_ONLY;
 
 /// `wanted` where boot repair can run (`os`, `Platform::os_name`: Windows), else none.
 pub fn boot_fix_for(os: &str, wanted: BootFix) -> BootFix {
@@ -394,6 +393,8 @@ mod tests {
         big.model = "Big SSD".into();
         let mut m = model_of(vec![gpt_disk(1), big, mbr_disk(0)]);
         m.system_disk = Some(0);
+        // Windows disks: boot repair is available
+        m.os = "windows".into();
         m
     }
 

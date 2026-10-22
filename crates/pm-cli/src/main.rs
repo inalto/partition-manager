@@ -115,7 +115,7 @@ fn main() {
     let result = dispatch(platform.as_ref(), on_images, cli.command, &cancel, &mut out);
     let _ = out.flush();
     if let Err(e) = result {
-        eprintln!("error: {}", e.render(platform.elevation_hint()));
+        eprintln!("error: {}", e.render_for(platform.os_name(), platform.elevation_hint()));
         std::process::exit(e.exit_code());
     }
 }

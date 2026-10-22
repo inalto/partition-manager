@@ -93,9 +93,11 @@ Windows' `disk_of_path` covers letters and folder mount points.
 
 Extra (commit `f142eb5`): `pm image` (direct and `--rescue`) and `pm rescue` had no
 "output on the source" check at all on any OS. The Linux walk-through showed `pm image
-/dev/loop0:1 <file on loop0p1>` filling the partition (ENOSPC). They now refuse the image,
-its `.partial` and the mapfile on the device being imaged/rescued, and a rescue mapfile on
-the destination disk (`refuse_files_on`, test `image_files_on_the_source_are_refused`).
+/dev/loop0:1 <file on loop0p1>` filling the partition (ENOSPC). They now refuse the image
+and the mapfile on the device being imaged/rescued, and a rescue mapfile on the destination
+disk (`refuse_files_on`, test `image_files_on_the_source_are_refused`). As committed in
+`f142eb5`, the direct `pm image` checked only the image file, not its `.partial` (the
+`--rescue` path checked both); the review round adds the `.partial` (and flat-VMDK extents).
 
 ## D2. Apps
 
@@ -158,7 +160,8 @@ CLI outside tests.
   sets `RUSTUP_TOOLCHAIN=stable` when `rust-toolchain.toml` pins a Windows toolchain. Ran it
   in WSL: 1m54s, tarball listed `pm`, `partition-manager`, README.md, LICENSE (artifacts
   removed afterwards).
-- `.github/workflows/ci.yml` unchanged (Task B needed no extra apt package).
+- `.github/workflows/ci.yml` was not modified by Task D: Task B found no apt package missing
+  from the line Task A put there.
 
 ## Tests
 
@@ -193,8 +196,8 @@ refused now (unit-tested; not re-run live).
 1. **Unplaceable paths are refused more often.** On Linux/macOS a path on NFS/SMB, tmpfs or
    LVM is "Cannot tell which disk" and refused while the source disk has a mounted volume
    (as the brief asked). Recovering or imaging a mounted system disk to a NAS mount is
-   therefore refused; Windows UNC paths are accepted. A disk holding an LVM PV shows no
-   mount points, so an LVM destination is not refused for it (gap).
+   therefore refused; Windows UNC paths are accepted. (The LVM-PV gap and mapped drives are
+   fixed in the review round below.)
 2. **Behaviour change on Windows:** `pm image disk:N <file on disk N>` and `pm rescue`
    outputs on the source disk are now refused (they were not checked before).
 3. `disk_arg` uses a process-global registry filled by `main` (only when a `/dev/...`
@@ -208,3 +211,58 @@ refused now (unit-tested; not re-run live).
 6. Not verified live: the GUI on Linux (only its unit tests ran in WSL), the new
    `refuse_files_on` path on a real mount, `pm doctor` on macOS.
 7. clippy is not installed for the pinned toolchain here; not run.
+
+## Review round (whole-branch review, CHANGES REQUIRED, no Criticals)
+
+Commits: `fix(ops,platform): placement guard on mapped drives and LVM/md members` (I1, I2,
+M1) and `fix(cli,ops): per-OS boot-fix and path checks` (M3–M7, M9). M2, M8, M10 deferred
+as ruled.
+
+- **I1 (mapped drives, Windows regression): fixed.** `pm_platform::canonical_existing` is
+  now `pub`; `pm_ops::locate` returns `location::NETWORK` (a disk index no platform lists)
+  when `disk_of_path` gives `None` and the path, typed or canonical, is UNC / verbatim UNC
+  (`Z:\backup` on a mapped drive canonicalises to `\\?\UNC\server\share\backup`). The
+  canonicalisation happens once per located text (GUI `PathLocation` cache), not per frame.
+  Test `network_shares_are_never_the_device` (verbatim UNC from the canonical form, typed
+  verbatim UNC, a local path stays unknown). Docs: README, wiki Safety-Model and
+  Known-Limitations (mapped drives accepted; loopback `\\localhost\C$` documented as a
+  deliberate hole).
+- **I2 (LVM / md fail-open on Linux): fixed both ways.** (a) `MountMap` counts a partition
+  typed LVM (GPT `E6D6D379-...`, MBR 0x8E) or Linux RAID (GPT `A19D880F-...`, MBR 0xFD) as
+  mounted, so an unplaceable path is refused for its disk (test
+  `stack_members_count_as_mounted`). (b) Linux `disk_of_path` places a dm / md device
+  through `/sys/class/block/<dev>/slaves`, recursively: `(disk, Some(part))` when every leaf
+  is that partition, `(disk, None)` for several partitions of one disk, `None` when the
+  leaves span disks or are unknown (fixture test `stacked_devices_are_placed_through_their_slaves`:
+  dm-0 over sda2, dm-2 over dm-0, dm-1 over sda1+sdb1, md0 over sda1+sda2).
+- **M1: fixed.** `pm rescue` checks its outputs against the whole source disk
+  (`rescue_place`), test `rescue_outputs_stay_off_the_whole_source_disk`; `pm image` keeps
+  partition granularity.
+- **M3: fixed.** `CliError::render_for(os, hint)` decides the access-denied codes by the
+  platform's `os_name()` (main uses it); `render(hint)` = host. Test cases added.
+- **M4: fixed.** `Model` records `os` (`Platform::os_name`, `#[serde(default)]`, empty =
+  host; `Model::os_name()`); `precheck` refuses `CloneDisk` / `MigrateOs` with a boot fix off
+  Windows with `pm_ops::BOOT_REPAIR_WINDOWS_ONLY` (the GUI uses the same text), so `pm
+  clone-disk --boot-fix`, `pm migrate-os` and `pm apply` JSON are refused before anything is
+  written. Tests: `precheck_follows_the_os_of_the_disks`, and the migration test runs as
+  "windows" and as "linux" (refused, no session) through a test wrapper over MockPlatform.
+- **M5: fixed.** `path_key` (pm recover) and `same_path` (image partial files) are
+  case-insensitive on macOS as on Windows.
+- **M6: fixed.** Known-Limitations: the "letter checks" line and "junctions are not followed"
+  replaced (paths are canonicalised; hard links not detected).
+- **M7: fixed.** Direct `pm image` checks `.partial` (all `files_written()`); report wording
+  corrected above.
+- **M9: fixed.** Read-only / offline refusals advise per OS: Windows Disk Management /
+  `Set-Disk`, Linux `sudo blockdev --setrw /dev/X`, macOS `diskutil info /dev/X` (Writable).
+
+Tests after the round:
+- Windows `cargo test --workspace --no-fail-fast`: **694 passed, 0 failed, 3 ignored**.
+- Cross-checks `--tests` for `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`: Finished,
+  no warnings.
+- WSL `cargo test --workspace --no-fail-fast`: **711 passed, 0 failed, 1 ignored**, no warnings.
+- WSL live, as root (`sudo -E env PATH=... cargo test -p pm-platform -- --ignored
+  --test-threads=1`): `test loop_device_end_to_end ... ok`, `test result: ok. 1 passed; 0
+  failed`.
+
+Remaining concern: a mapped drive is accepted because it is a network share; a mapped drive
+pointing back at a local disk's share is the same loopback hole as `\\localhost\C$`.

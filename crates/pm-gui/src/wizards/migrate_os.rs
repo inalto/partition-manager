@@ -205,7 +205,7 @@ mod tests {
         let mut new_ssd = gpt_disk(2);
         new_ssd.partitions.clear();
         new_ssd.size = 4096 * MIB;
-        let m = model_of(vec![sys, new_ssd, mbr_disk(0)]);
+        let m = Model { os: "windows".into(), ..model_of(vec![sys, new_ssd, mbr_disk(0)]) };
         let mut ctx = WizardCtx::new(&m, vec![], Selected::None);
         // from Linux / macOS the clone is not made bootable
         ctx.os_name = "macos";
@@ -245,7 +245,7 @@ mod tests {
         let mut new_ssd = gpt_disk(2);
         new_ssd.partitions.clear();
         new_ssd.size = 4096 * MIB;
-        let m = model_of(vec![sys, new_ssd]);
+        let m = Model { os: "windows".into(), ..model_of(vec![sys, new_ssd]) };
         let ctx = WizardCtx::new(&m, vec![], Selected::None);
         let mut s = MigrateState::initial(&ctx).unwrap();
         s.dst = Some(2);
