@@ -90,6 +90,12 @@ fn same_disk(a: &DiskIdentity, b: &DiskIdentity) -> bool {
 #[derive(Default)]
 struct Cache {
     /// Every disk shown since the process started, at its index (append-only).
+    ///
+    /// Limit on kernels before 5.15 (no `diskseq`): the key is name + size, so another disk of
+    /// exactly the same size attached under the same name keeps the old index and is not
+    /// detected here. Only the caller's own identity check (serial number / disk id of the
+    /// enumerated disk against the live one, e.g. the executor's same-disk check) catches that
+    /// swap.
     disks: Vec<DiskIdentity>,
     /// Volume node -> (start, len, disk index) from the last enumeration.
     volumes: HashMap<String, (u64, u64, u32)>,

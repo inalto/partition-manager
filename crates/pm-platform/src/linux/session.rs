@@ -32,6 +32,7 @@ use crate::posix::{cmd, os_error, FdDevice};
 use crate::traits::WriteSession;
 use pm_core::{BlockDevice, DiskInfo, Error, Result};
 use pm_parttable::{write_table, Table};
+use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::BorrowedFd;
 use std::path::Path;
@@ -370,9 +371,11 @@ pub fn begin_write(
     }
 }
 
-/// Byte ranges `[start, end)` written so far, merged and sorted.
+/// Byte ranges `[start, end)` written so far, merged (overlapping or adjacent ranges become
+/// one) and keyed by start, so recording a write and testing an extent are `O(log n)` even for
+/// a sparse clone with tens of thousands of disjoint writes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Written(Vec<(u64, u64)>);
+pub struct Written(BTreeMap<u64, u64>);
 
 impl Written {
     /// Record a write of `len` bytes at `offset`.
@@ -381,18 +384,20 @@ impl Written {
             return;
         }
         let (mut start, mut end) = (offset, offset.saturating_add(len));
-        let mut kept = Vec::with_capacity(self.0.len() + 1);
-        for &(s, e) in &self.0 {
-            if e < start || s > end {
-                kept.push((s, e));
-            } else {
-                start = start.min(s);
+        // the range starting at or before `start` that reaches it
+        if let Some((&s, &e)) = self.0.range(..=start).next_back() {
+            if e >= start {
+                start = s;
                 end = end.max(e);
+                self.0.remove(&s);
             }
         }
-        kept.push((start, end));
-        kept.sort_unstable();
-        self.0 = kept;
+        // the ranges starting inside (or right at the end of) the new one
+        while let Some((&s, &e)) = self.0.range(start..=end).next() {
+            end = end.max(e);
+            self.0.remove(&s);
+        }
+        self.0.insert(start, end);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -402,11 +407,13 @@ impl Written {
     /// Whether any written byte lies in `[start, start + len)`.
     pub fn overlaps(&self, (start, len): (u64, u64)) -> bool {
         let end = start.saturating_add(len);
-        self.0.iter().any(|&(s, e)| s < end && start < e)
+        // ranges are disjoint and sorted: only the last one starting before `end` can reach in
+        len > 0 && self.0.range(..end).next_back().is_some_and(|(_, &e)| e > start)
     }
 
-    pub fn ranges(&self) -> &[(u64, u64)] {
-        &self.0
+    /// The merged ranges in order.
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        self.0.iter().map(|(&s, &e)| (s, e)).collect()
     }
 }
 
@@ -831,6 +838,30 @@ mod tests {
         // a whole-disk filesystem, or a partition that moved, is never mounted again
         assert!(!remount_after_write(&Written::default(), None, there));
         assert!(!remount_after_write(&Written::default(), p1, |_| false));
+    }
+
+    #[test]
+    fn many_disjoint_writes_are_cheap_and_merge() {
+        let start = std::time::Instant::now();
+        let mut w = Written::default();
+        for i in 0..50_000u64 {
+            w.add(i * 8192, 4096); // every other 4 KiB block: nothing merges
+        }
+        assert_eq!(w.ranges().len(), 50_000);
+        assert!(w.overlaps((8192 * 49_999, 1)) && !w.overlaps((8192 * 49_999 + 4096, 4096)));
+        for i in 0..50_000u64 {
+            w.add(i * 8192 + 4096, 4096); // fill the gaps: one range remains
+        }
+        assert_eq!(w.ranges(), [(0, 8192 * 50_000)]);
+        // overlapping, contained and spanning writes
+        let mut v = Written::default();
+        v.add(100, 10);
+        v.add(200, 10);
+        v.add(105, 2);
+        v.add(50, 200);
+        assert_eq!(v.ranges(), [(50, 250)]);
+        assert!(!v.overlaps((250, 10)) && !v.overlaps((40, 10)) && !v.overlaps((100, 0)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
     }
 
     #[test]

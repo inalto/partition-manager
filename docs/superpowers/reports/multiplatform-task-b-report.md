@@ -259,3 +259,71 @@ Fix (`f711ad3`):
    verified on x86_64, where a test compares them with libc's `BLKSSZGET`/`BLKPBSZGET`.
 10. After a successful session, filesystems the session unmounted stay unmounted (by design,
     documented in `session.rs`).
+
+Concerns 1, 6 and 10 were resolved in the review rounds below. Concern 2 (sysfs-only view
+without root) is reduced: serial numbers now come from the udev database.
+
+## Review rounds
+
+**Round 1** (`93db830`, five Important items and nine Minor items; the report was not
+updated in that round):
+- **Disk identity:** each index remembers name + `diskseq`, or name + size on older kernels.
+  `open_disk`, `begin_write`, `rescan` and `smart` check `BLKGETDISKSEQ` (or the size) on the
+  opened disk and refuse with "refresh and retry" if it changed. Serial numbers come from udev
+  `ID_SERIAL_SHORT`, then `device/serial`, `wwid`, `vpd_pg80`.
+- **mountinfo:** mounts are read from `/proc/self/mountinfo`. Bind mounts, subvolumes and
+  covered mounts are refused before anything is unmounted. Rollback re-mounts with the original
+  `MS_*` flags and filesystem options (`mount -o` fallback) and recreates a missing mount
+  directory.
+- **Sessions re-mount:** a session that wrote nothing re-mounts everything it unmounted.
+- **Volume nodes are validated** for mount, unmount, format, resize and `open_volume`: a
+  canonical block device under `/dev` that is a partition of a managed disk, or a managed disk
+  without partitions. A whole partitioned disk, dm/md nodes and `/dev/..` escapes are refused.
+- **Tool lookup as root:** system directories come first; a `PATH` entry is used only if it is
+  root-owned and not group/world-writable.
+- **Minor fixes:**
+  - the partition node is re-checked against its start/len after `udevadm settle`;
+  - `mkfs.ntfs -F` on whole disks;
+  - kernel partitions are kept when the table reader sees none, and volumes are matched to
+    table entries on (start, len);
+  - `/dev/root` is resolved via `st_dev`;
+  - mounts use `nosuid,nodev`;
+  - a dirty NTFS volume gets a clear error;
+  - Windows `disk_of_path` also matches `\\?\Volume{GUID}\` paths;
+  - on Linux, `disk_of_path` returning `None` is documented as "unknown, refuse".
+
+**Round 2** (`1e7030c`):
+- Disk indexes are append-only for the life of the process. A disk keeps its index, a new disk
+  gets the next unused one, and a removed disk's index is never reused. The index is checked
+  before every disk and volume operation. Indexes can therefore have gaps; I read the consumers
+  (`Model::disk`, GUI views, `pm list`) and none assumes contiguous indexes.
+- Sessions record the byte ranges they write. After a write, only partitions the session did
+  not write into, and still at the same start and length, are re-mounted.
+- Re-mount has a last fallback without the filesystem options.
+- Two error strings were fixed.
+
+**Round 3** (this commit):
+- The written-range tracker is a `BTreeMap` that merges neighbours, so recording a write and
+  testing an extent are O(log n). A test with 50,000 disjoint writes completes in well under
+  the 5 s it allows.
+- Documented limit: on kernels before 5.15 a disk is keyed by name + size, so a same-size swap
+  under the same name is only caught by the caller's serial / disk-id check.
+
+**Verification after round 3:**
+- WSL `cargo test -p pm-platform`: lib 68, linux_fixtures 11, file_platform 4, macos_fixtures
+  20, mock 8 — all `test result: ok`, no warnings.
+- Live test under sudo: `test result: ok. 1 passed; 0 failed; 0 ignored`.
+- Windows `cargo test -p pm-platform`: lib 62, file_platform 4, macos_fixtures 20, mock 8
+  ok, windows_live 3 ignored.
+
+The live test now also covers:
+- the refused `begin_write` re-mounts with the original options (`nosuid,nodev` kept);
+- a session without writes re-mounts both partitions;
+- a session that rewrites the same table re-mounts both;
+- a session that writes into p2 re-mounts only p1;
+- format and `open_volume` on the whole loop disk are refused.
+
+During round 2 it passed in 5 of 5 full root runs, and in 10 of 10 during round 1.
+
+`cargo check --workspace --tests --target x86_64-unknown-linux-gnu` was last run in round 2,
+on HEAD plus my changes, and was clean. Round 3 changed only `linux/` and this report.
