@@ -1359,3 +1359,94 @@ fn clone_operations_without_the_new_fields_still_deserialize() {
     let back: Operation = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
     assert_eq!(back, op);
 }
+
+/// A disk whose table could not be read (`TableKind::Unknown`, macOS / Linux without root):
+/// partition 1 at an approximate start, plus a superfloppy-style disk (`TableKind::None`, one
+/// whole-disk partition at offset 0) and a Windows superfloppy (MBR, one partition at 0).
+fn model_with_tableless_disks() -> Model {
+    let mut m = model();
+    let mut approx = part(1, 20480, 10 * GIB, None);
+    approx.fs = Some(FsKind::Fat32);
+    approx.used = Some(GIB);
+    m.disks.push(disk(4, 20 * GIB, TableKind::Unknown, vec![approx]));
+    let mut whole = part(1, 0, 8 * GIB, None);
+    whole.guid = None;
+    whole.fs = Some(FsKind::Fat32);
+    whole.used = Some(GIB);
+    m.disks.push(disk(5, 8 * GIB, TableKind::None, vec![whole.clone()]));
+    let mut win_floppy = whole;
+    win_floppy.ptype = mbr(0x0C);
+    m.disks.push(disk(6, 8 * GIB, TableKind::Mbr, vec![win_floppy]));
+    // a table-less disk whose single partition does not start at 0: not a whole-disk volume
+    let mut odd = part(1, MIB, 4 * GIB, None);
+    odd.fs = Some(FsKind::Fat32);
+    odd.used = Some(GIB);
+    m.disks.push(disk(7, 8 * GIB, TableKind::None, vec![odd]));
+    m
+}
+
+fn wipe_part(disk: u32) -> Operation {
+    Operation::WipePartition { disk, number: 1, method: WipeMethod::Zero }
+}
+
+fn image_part(disk: u32) -> Operation {
+    Operation::ImagePartition {
+        disk,
+        number: 1,
+        path: std::env::temp_dir().join("pm-planner-tableless.img"),
+        format: ImageFormat::Raw,
+        mode: CloneMode::Sector,
+        rescue: None,
+    }
+}
+
+fn clone_part(src_disk: u32) -> Operation {
+    Operation::ClonePartition {
+        src_disk,
+        src_number: 1,
+        dst_disk: 2,
+        dst_start: MIB,
+        dst_len: 20 * GIB,
+        mode: CloneMode::Sector,
+    }
+}
+
+#[test]
+fn approximate_partitions_are_never_read_or_written() {
+    let m = model_with_tableless_disks();
+    for op in [
+        wipe_part(4),
+        image_part(4),
+        clone_part(4),
+        Operation::DeletePartition { disk: 4, number: 1 },
+        Operation::ResizeMove { disk: 4, number: 1, new_start: 20480, new_len: 11 * GIB },
+    ] {
+        let msg = invalid_msg(Planner::simulate(&m, &op));
+        assert!(msg.contains("Disk 4") && msg.contains("could not be read"), "{op:?}: {msg}");
+    }
+    // a table-less disk whose partition is not the whole disk
+    for op in [wipe_part(7), image_part(7), clone_part(7)] {
+        let msg = invalid_msg(Planner::simulate(&m, &op));
+        assert!(msg.contains("Disk 7 is not initialized"), "{op:?}: {msg}");
+    }
+}
+
+#[test]
+fn whole_disk_volume_without_a_table_can_be_wiped_imaged_and_cloned() {
+    let m = model_with_tableless_disks();
+    for d in [5, 6] {
+        Planner::simulate(&m, &wipe_part(d)).unwrap_or_else(|e| panic!("wipe disk {d}: {e}"));
+        Planner::simulate(&m, &image_part(d)).unwrap_or_else(|e| panic!("image disk {d}: {e}"));
+        Planner::simulate(&m, &clone_part(d)).unwrap_or_else(|e| panic!("clone disk {d}: {e}"));
+    }
+    // but no table edit on the table-less one: deleting or resizing would need a table
+    for op in [
+        Operation::DeletePartition { disk: 5, number: 1 },
+        Operation::ResizeMove { disk: 5, number: 1, new_start: 0, new_len: 4 * GIB },
+    ] {
+        let msg = invalid_msg(Planner::simulate(&m, &op));
+        assert!(msg.contains("Disk 5 is not initialized"), "{op:?}: {msg}");
+    }
+    // the Windows superfloppy (an MBR disk) keeps every operation it had
+    Planner::simulate(&m, &Operation::DeletePartition { disk: 6, number: 1 }).unwrap();
+}

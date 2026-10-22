@@ -8,12 +8,14 @@
 
 use super::{disk_preview, row};
 use crate::selection::Selected;
-use crate::tools::{on_letters_problem, Device};
+use crate::tools::{located_problem, Device, PathLocation};
 use crate::wizard::{shared, StepResult, Wizard, WizardCtx};
 use eframe::egui;
 use pm_core::format_size;
 use pm_image::ImageFormat;
-use pm_ops::{CloneMode, Model, Operation, RescueSettings};
+use pm_ops::{CloneMode, Model, MountMap, Operation, RescueSettings};
+use pm_platform::Platform;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 /// Formats offered, in menu order.
@@ -34,18 +36,23 @@ pub const SKIP_SIZES: [u64; 5] = [64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 2
 pub const MAX_RETRIES: u32 = 10;
 
 /// Why `map` cannot be the mapfile of the rescue-mode image `image`, if it cannot: the same
-/// rules as the Rescue wizard (a full path whose folder exists, not on a drive of the source),
-/// and not the image itself.
-pub fn mapfile_problem(map: &str, image: &str, format: ImageFormat, source_letters: &[char]) -> Option<String> {
+/// rules as the Rescue wizard (a full path whose folder exists, not on the source: `on_source`
+/// says why a path is), and not the image itself.
+pub fn mapfile_problem(
+    map: &str,
+    image: &str,
+    format: ImageFormat,
+    on_source: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
     let t = map.trim();
     if t.is_empty() {
         return Some("Enter the mapfile path.".into());
     }
     let p = Path::new(t);
     if !p.is_absolute() {
-        return Some("The mapfile needs a full path: enter an absolute path, e.g. D:\\Backups\\disk1.vhd.map.".into());
+        return Some(format!("The mapfile needs a full path: enter an absolute path, e.g. {}.", crate::format_util::example_path("Backups/disk1.vhd.map")));
     }
-    if let Some(e) = on_letters_problem(t, source_letters, "mapfile", "the device being imaged") {
+    if let Some(e) = on_source(t) {
         return Some(e);
     }
     if p.file_name().is_none() || t.ends_with(['\\', '/']) {
@@ -101,7 +108,7 @@ pub fn path_problem(path: &str) -> Option<String> {
     }
     let p = Path::new(t);
     if !p.is_absolute() {
-        return Some("Enter a full path, e.g. D:\\Backups\\disk1.vhd.".into());
+        return Some(format!("Enter a full path, e.g. {}.", crate::format_util::example_path("Backups/disk1.vhd")));
     }
     if p.file_name().is_none() || t.ends_with(['\\', '/']) {
         return Some("The path names a folder, not a file.".into());
@@ -120,9 +127,13 @@ pub struct ImageCreateState {
     pub mode: CloneMode,
     /// [`path_problem`] of the last checked path (checked when the text changes).
     checked: Option<(String, Option<String>)>,
-    /// Drive letters on the source (the image may not be written there: it would read what
-    /// it writes). Updated from the model whenever a step is drawn.
-    pub source_letters: Vec<char>,
+    /// Mounted partitions of the model: the image may not be written onto the source (it
+    /// would read what it writes). Updated from the model whenever a step is drawn.
+    pub mounts: MountMap,
+    /// The platform asked where the image file and the mapfile are.
+    pub platform: Option<Arc<dyn Platform>>,
+    image_loc: PathLocation,
+    map_loc: PathLocation,
     /// Damaged disk page: continue on read errors (ddrescue mode).
     pub rescue: bool,
     /// Retry passes over the bad sectors (0..=[`MAX_RETRIES`]).
@@ -147,7 +158,10 @@ impl ImageCreateState {
             format: ImageFormat::VhdDynamic,
             mode: CloneMode::Smart,
             checked: None,
-            source_letters: source.letters(ctx.model),
+            mounts: ctx.mounts(),
+            platform: ctx.platform.clone(),
+            image_loc: PathLocation::default(),
+            map_loc: PathLocation::default(),
             rescue: false,
             retries: 0,
             skip_size: SKIP_SIZES[0],
@@ -177,7 +191,10 @@ impl ImageCreateState {
         if !self.rescue {
             return None;
         }
-        mapfile_problem(&self.mapfile_path(), &self.path, self.format, &self.source_letters)
+        let on_source = |t: &str| {
+            located_problem(self.platform.as_deref(), &self.map_loc, &self.mounts, t, self.source, "mapfile", "the device being imaged")
+        };
+        mapfile_problem(&self.mapfile_path(), &self.path, self.format, on_source)
     }
 
     /// The rescue settings of the operation (`None` unless rescue mode is on).
@@ -200,9 +217,18 @@ impl ImageCreateState {
         self.checked.as_ref().and_then(|c| c.1.clone())
     }
 
-    /// Why the image may not be written where `path` says: on the device being imaged.
+    /// Why the image may not be written where `path` says: on the device being imaged (or
+    /// possibly on it, when the platform cannot tell where the path is).
     pub fn on_source_problem(&self) -> Option<String> {
-        on_letters_problem(&self.path, &self.source_letters, "image file", "the device being imaged")
+        located_problem(
+            self.platform.as_deref(),
+            &self.image_loc,
+            &self.mounts,
+            &self.path,
+            self.source,
+            "image file",
+            "the device being imaged",
+        )
     }
 
     pub fn build(&self) -> Result<Vec<Operation>, String> {
@@ -223,7 +249,7 @@ impl ImageCreateState {
 }
 
 fn source_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
-    s.source_letters = s.source.letters(ctx.model);
+    s.mounts = ctx.mounts();
     let m: &Model = ctx.model;
     ui.label("Select the disk or partition to image:");
     let mut choice = Some(s.source);
@@ -246,10 +272,10 @@ fn source_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> St
 }
 
 fn file_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
-    s.source_letters = s.source.letters(ctx.model);
+    s.mounts = ctx.mounts();
     egui::Grid::new("image_file").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label("Image file:");
-        let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(380.0).hint_text("D:\\Backups\\disk1.vhd"));
+        let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(380.0).hint_text(crate::format_util::example_path("Backups/disk1.vhd")));
         if resp.lost_focus() {
             s.path = fix_extension(&s.path, s.format);
         }
@@ -282,7 +308,7 @@ fn mode_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> Ste
 }
 
 fn damaged_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
-    s.source_letters = s.source.letters(ctx.model);
+    s.mounts = ctx.mounts();
     ui.checkbox(&mut s.rescue, "Continue on read errors (ddrescue mode)");
     ui.indent("img_rescue_why", |ui| {
         ui.weak(
@@ -387,7 +413,7 @@ pub fn new(ctx: &WizardCtx) -> Option<Wizard> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{gpt_disk, model_of};
+    use crate::test_util::{gpt_disk, model_of, platform_placing};
     use crate::wizard::check_ops;
 
     #[test]
@@ -412,7 +438,7 @@ mod tests {
     fn build_image_ops_from_filled_state() {
         let dir = tempfile::tempdir().unwrap();
         let m = model_of(vec![gpt_disk(1)]);
-        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3));
+        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3)).with_platform(platform_placing(dir.path()));
         let mut s = ImageCreateState::initial(&ctx).unwrap();
         assert_eq!(s.source, Device::Partition(1, 3));
         assert!(s.build().is_err(), "no path yet");
@@ -436,7 +462,7 @@ mod tests {
     fn build_image_op_with_rescue_settings() {
         let dir = tempfile::tempdir().unwrap();
         let m = model_of(vec![gpt_disk(1)]);
-        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3));
+        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3)).with_platform(platform_placing(dir.path()));
         let mut s = ImageCreateState::initial(&ctx).unwrap();
         let path = dir.path().join("data.vhd");
         s.path = path.display().to_string();
@@ -494,9 +520,9 @@ mod tests {
     fn damaged_page_requires_absolute_mapfile_off_source() {
         let dir = tempfile::tempdir().unwrap();
         let m = model_of(vec![gpt_disk(1)]);
-        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3));
+        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3)).with_platform(platform_placing(dir.path()));
         let mut s = ImageCreateState::initial(&ctx).unwrap();
-        assert_eq!(s.source_letters, ['E']);
+        assert_eq!(s.mounts.has_mounts((1, Some(3))), Some(true), "E: is on the source");
         s.path = dir.path().join("data.vhd").display().to_string();
         s.rescue = true;
         assert_eq!(s.damaged_problem(), None, "the default mapfile next to the image");
@@ -509,10 +535,15 @@ mod tests {
         };
         assert!(problem(&mut s, "data.map".into()).contains("full path"));
         assert!(problem(&mut s, String::new()).contains("Enter the mapfile"));
-        // drive letters exist on Windows only (the mount-point equivalent is multi-platform Task D)
-        if cfg!(windows) {
-            assert!(problem(&mut s, r"e:\maps\data.map".into()).contains("drive E:"));
-        }
+        // a folder the platform places on the source partition, or cannot place at all
+        let plat = pm_platform::MockPlatform::new();
+        let on_src = std::env::temp_dir().join("pm-gui-src-part");
+        plat.set_disk_of_path(&on_src, 1, Some(3));
+        plat.set_disk_of_path(dir.path(), 99, None);
+        s.platform = Some(std::sync::Arc::new(plat));
+        assert!(problem(&mut s, on_src.join("data.map").display().to_string()).contains("is on the device being imaged"));
+        let unplaced = std::env::temp_dir().join("pm-gui-nowhere").join("data.map");
+        assert!(problem(&mut s, unplaced.display().to_string()).contains("Cannot tell which disk the mapfile"));
         assert!(problem(&mut s, dir.path().join("missing").join("x.map").display().to_string()).contains("does not exist"));
         let image = s.path.clone();
         assert!(problem(&mut s, image).contains("cannot be the image"));
@@ -554,20 +585,39 @@ mod tests {
         assert!(!restore.page_titles().iter().any(|t| t.contains("Damaged")), "{:?}", restore.page_titles());
     }
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn image_file_on_the_source_is_refused() {
         let m = model_of(vec![gpt_disk(1)]);
-        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3));
+        let plat = pm_platform::MockPlatform::new();
+        let tmp = std::env::temp_dir();
+        let (on_src, on_disk, elsewhere) = (tmp.join("pm-ic-e"), tmp.join("pm-ic-d1"), tmp.join("pm-ic-other"));
+        plat.set_disk_of_path(&on_src, 1, Some(3));
+        plat.set_disk_of_path(&on_disk, 1, Some(1));
+        plat.set_disk_of_path(&elsewhere, 7, Some(1));
+        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3)).with_platform(std::sync::Arc::new(plat));
         let mut s = ImageCreateState::initial(&ctx).unwrap();
-        assert_eq!(s.source_letters, ['E']);
-        s.path = r"e:\backup\data.vhd".into();
+        s.path = on_src.join("data.vhd").display().to_string();
         let e = s.build().unwrap_err();
-        assert!(e.contains("drive E:") && e.contains("being imaged"), "{e}");
-        s.path = r"D:\backup\data.vhd".into();
+        assert!(e.contains("is on the device being imaged"), "{e}");
+        // another partition of the same disk, or another disk
+        s.path = on_disk.join("data.vhd").display().to_string();
         assert!(s.on_source_problem().is_none());
+        s.path = elsewhere.join("data.vhd").display().to_string();
         assert!(s.build().is_ok());
+        // the whole disk is imaged: every partition of it is the source
+        s.source = Device::Disk(1);
+        s.path = on_disk.join("data.vhd").display().to_string();
+        assert!(s.build().is_err());
+        // the platform cannot place the path, and the source has a mounted volume: refused
+        s.path = tmp.join("pm-ic-unknown").join("data.vhd").display().to_string();
+        assert!(s.build().unwrap_err().contains("Cannot tell"));
+        if cfg!(windows) {
+            // a drive letter is one more mount point the platform places
+            let plat = pm_platform::MockPlatform::new();
+            plat.set_disk_of_path(r"E:\", 1, Some(3));
+            s.platform = Some(std::sync::Arc::new(plat));
+            s.path = r"E:\backup\data.vhd".into();
+            assert!(s.build().unwrap_err().contains("being imaged"));
+        }
     }
 }

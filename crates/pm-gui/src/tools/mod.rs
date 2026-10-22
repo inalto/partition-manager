@@ -243,46 +243,71 @@ impl Device {
         out
     }
 
-    /// Drive letters stored on the device.
-    pub fn letters(self, m: &Model) -> Vec<char> {
-        let Some(d) = m.disk(self.disk()) else { return Vec::new() };
-        d.partitions
-            .iter()
-            .filter(|p| match self {
-                Device::Disk(_) => true,
-                Device::Partition(_, n) => p.number == n,
-            })
-            .filter_map(|p| p.letter())
-            .collect()
+    /// `(disk, partition)` as [`pm_ops::place_of`] takes it.
+    pub fn place(self) -> (u32, Option<u32>) {
+        match self {
+            Device::Disk(d) => (d, None),
+            Device::Partition(d, n) => (d, Some(n)),
+        }
     }
 }
 
-/// The drive letter of the absolute path `p`, if it has one (`E:\x`, `\\?\E:\x`).
-///
-/// Limitation of every letter-based check built on this: a path reaching a volume through a
-/// folder mount point, a junction, a UNC share or a `\\?\Volume{…}` name has no (or another)
-/// drive letter and is not recognised as being on that volume.
-pub fn path_letter(p: &std::path::Path) -> Option<char> {
-    use std::path::{Component, Prefix};
-    match p.components().next()? {
-        Component::Prefix(x) => match x.kind() {
-            Prefix::Disk(b) | Prefix::VerbatimDisk(b) => Some((b as char).to_ascii_uppercase()),
-            _ => None,
-        },
-        _ => None,
+/// Where a path the user is typing lies: [`Platform::disk_of_path`], asked again only when the
+/// text changes (it may enumerate volumes or run `diskutil`, too slow for every frame).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PathLocation {
+    /// The trimmed path last located, and the answer.
+    last: std::cell::RefCell<Option<(String, Option<(u32, Option<u32>)>)>>,
+}
+
+impl PathLocation {
+    /// `(disk, partition)` of `path` on `platform`, asked when the text changed since the last
+    /// call. Without a platform (or for an empty path) the location is unknown.
+    pub fn locate(&self, platform: Option<&dyn Platform>, path: &str) -> Option<(u32, Option<u32>)> {
+        let t = path.trim();
+        let mut last = self.last.borrow_mut();
+        match &*last {
+            Some((p, located)) if p == t => *located,
+            _ => {
+                let located = match platform {
+                    Some(p) if !t.is_empty() => pm_ops::locate(p, std::path::Path::new(t)),
+                    _ => None,
+                };
+                *last = Some((t.to_string(), located));
+                located
+            }
+        }
     }
 }
 
-/// Why the file `path` (described as `what`) may not be used because it lies on one of
-/// `letters`, the drives of `device` (a device being read or written), if it may not.
-/// Only drive-letter paths are recognised (see [`path_letter`]): folder mount points,
-/// junctions, UNC and `\\?\Volume{…}` paths are not covered. Relative paths have no letter;
-/// callers that must not miss them require absolute paths.
-pub fn on_letters_problem(path: &str, letters: &[char], what: &str, device: &str) -> Option<String> {
-    let c = path_letter(std::path::Path::new(path.trim()))?;
-    letters
-        .contains(&c)
-        .then(|| format!("The {what} is on drive {c}:, which is on {device}; choose a location on another disk."))
+/// Why the file `path` (described as `what`) may not be used because it lies on `device`
+/// (a device being read or written, described as `desc`), or may lie on it: `located` is
+/// [`Platform::disk_of_path`] of the path (see [`PathLocation`]); when the platform cannot
+/// tell, a device with mounted volumes in `mounts` is assumed to hold it (fail closed).
+/// Relative paths are the caller's to refuse.
+pub fn on_device_problem(
+    mounts: &pm_ops::MountMap,
+    located: Option<(u32, Option<u32>)>,
+    path: &str,
+    device: Device,
+    what: &str,
+    desc: &str,
+) -> Option<String> {
+    let p = std::path::Path::new(path.trim());
+    pm_ops::place_problem(pm_ops::place_of(p, located, device.place(), mounts), what, p, desc)
+}
+
+/// [`on_device_problem`] for a path located with `loc` on `platform`.
+pub fn located_problem(
+    platform: Option<&dyn Platform>,
+    loc: &PathLocation,
+    mounts: &pm_ops::MountMap,
+    path: &str,
+    device: Device,
+    what: &str,
+    desc: &str,
+) -> Option<String> {
+    on_device_problem(mounts, loc.locate(platform, path), path, device, what, desc)
 }
 
 /// Open `disk` of `platform` (on a worker thread), whole or the `range` slice of it.
@@ -500,6 +525,30 @@ mod tests {
     }
 
     #[test]
+    fn path_locations_are_cached_per_text() {
+        let plat = pm_platform::MockPlatform::new();
+        let base = std::env::temp_dir().join("pm-gui-loc");
+        plat.set_disk_of_path(&base, 1, Some(3));
+        let path = base.join("x.img").display().to_string();
+        let loc = PathLocation::default();
+        assert_eq!(loc.locate(Some(&plat), &path), Some((1, Some(3))));
+        // a later answer of the platform is not asked for the same text
+        plat.set_disk_of_path(&base, 7, None);
+        assert_eq!(loc.locate(Some(&plat), &format!(" {path} ")), Some((1, Some(3))));
+        assert_eq!(loc.locate(None, "/other"), None);
+        assert_eq!(loc.locate(Some(&plat), &path), Some((7, None)), "asked again after the text changed");
+        let m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
+        let mounts = pm_ops::MountMap::new(&m.disks, &m.volumes);
+        let on = on_device_problem(&mounts, Some((1, Some(3))), &path, Device::Disk(1), "image file", "Disk 1").unwrap();
+        assert!(on.contains("is on Disk 1"), "{on}");
+        assert!(on_device_problem(&mounts, Some((1, Some(3))), &path, Device::Partition(1, 2), "image file", "x").is_none());
+        assert!(on_device_problem(&mounts, Some((0, None)), &path, Device::Disk(1), "image file", "x").is_none());
+        // unknown: Disk 1 has a mounted volume (E:), so it could hold the file
+        let unk = on_device_problem(&mounts, None, &path, Device::Disk(1), "image file", "Disk 1").unwrap();
+        assert!(unk.contains("Cannot tell"), "{unk}");
+    }
+
+    #[test]
     fn devices_and_write_guard() {
         let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
         let all = Device::all(&m);
@@ -507,7 +556,8 @@ mod tests {
         assert!(all.contains(&Device::Partition(0, 5)));
         assert!(!all.contains(&Device::Partition(0, 2)), "extended container excluded");
         assert_eq!(Device::Partition(1, 3).range(&m), Some((117 * pm_core::MIB, 684 * pm_core::MIB)));
-        assert_eq!(Device::Disk(1).letters(&m), ['E']);
+        assert_eq!(Device::Disk(1).place(), (1, None));
+        assert_eq!(Device::Partition(1, 3).place(), (1, Some(3)));
         assert_eq!(Device::from_selection(Selected::Free(1, 0, 1)), Some(Device::Disk(1)));
         // unknown system disk: fail closed
         assert!(write_problem(&m, &[], 0).unwrap().contains("cannot determine"));
@@ -532,8 +582,80 @@ pub mod test_env {
         m
     }
 
+    /// [`pm_platform::NullPlatform`] that places every path under the temporary folder on a
+    /// disk no test model has (disk 99), like a scratch disk of its own.
+    pub struct NullWithScratch;
+
+    impl Platform for NullWithScratch {
+        fn enumerate_disks(&self) -> pm_core::Result<Vec<pm_core::DiskInfo>> {
+            pm_platform::NullPlatform.enumerate_disks()
+        }
+        fn enumerate_volumes(&self) -> pm_core::Result<Vec<pm_core::VolumeInfo>> {
+            pm_platform::NullPlatform.enumerate_volumes()
+        }
+        fn open_disk(&self, i: u32, m: OpenMode) -> pm_core::Result<Box<dyn BlockDevice>> {
+            pm_platform::NullPlatform.open_disk(i, m)
+        }
+        fn open_volume(&self, id: &pm_core::VolumeId, m: OpenMode) -> pm_core::Result<Box<dyn BlockDevice>> {
+            pm_platform::NullPlatform.open_volume(id, m)
+        }
+        fn begin_write(&self, d: u32) -> pm_core::Result<Box<dyn pm_platform::WriteSession>> {
+            pm_platform::NullPlatform.begin_write(d)
+        }
+        fn mount(&self, id: &pm_core::VolumeId, at: &pm_platform::MountPoint) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.mount(id, at)
+        }
+        fn unmount(&self, id: &pm_core::VolumeId, at: &pm_platform::MountPoint) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.unmount(id, at)
+        }
+        fn set_offline(&self, d: u32, o: bool) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.set_offline(d, o)
+        }
+        fn rescan(&self, d: u32) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.rescan(d)
+        }
+        fn format(
+            &self,
+            id: &pm_core::VolumeId,
+            fs: pm_core::FsKind,
+            label: &str,
+            cluster: Option<u32>,
+            quick: bool,
+            progress: &dyn ProgressSink,
+        ) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.format(id, fs, label, cluster, quick, progress)
+        }
+        fn shrink_volume(&self, id: &pm_core::VolumeId, n: u64) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.shrink_volume(id, n)
+        }
+        fn extend_volume(&self, id: &pm_core::VolumeId, n: u64) -> pm_core::Result<()> {
+            pm_platform::NullPlatform.extend_volume(id, n)
+        }
+        fn smart(&self, d: u32) -> pm_core::Result<Option<pm_platform::SmartData>> {
+            pm_platform::NullPlatform.smart(d)
+        }
+        fn is_elevated(&self) -> bool {
+            pm_platform::NullPlatform.is_elevated()
+        }
+        fn system_disk(&self) -> Option<u32> {
+            pm_platform::NullPlatform.system_disk()
+        }
+        fn free_letters(&self) -> Vec<char> {
+            pm_platform::NullPlatform.free_letters()
+        }
+        fn run_tool(&self, t: pm_platform::ExternalTool, a: &[String]) -> pm_core::Result<String> {
+            pm_platform::NullPlatform.run_tool(t, a)
+        }
+        fn os_name(&self) -> &'static str {
+            pm_platform::NullPlatform.os_name()
+        }
+        fn disk_of_path(&self, path: &std::path::Path) -> Option<(u32, Option<u32>)> {
+            path.starts_with(std::env::temp_dir()).then_some((99, None))
+        }
+    }
+
     pub fn platform() -> Arc<dyn Platform> {
-        Arc::new(pm_platform::NullPlatform)
+        Arc::new(NullWithScratch)
     }
 
     /// Draw `w` for one frame in both themes; returns the last outcome.

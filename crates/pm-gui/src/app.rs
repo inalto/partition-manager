@@ -333,7 +333,7 @@ impl AppState {
 
     /// The context the open wizard `w` is drawn with.
     pub fn wizard_ctx(&self, w: &OpenWizard) -> WizardCtx<'_> {
-        WizardCtx::new(self.queue.preview(), w.free_letters.clone(), w.selection)
+        WizardCtx::new(self.queue.preview(), w.free_letters.clone(), w.selection).with_platform(self.platform.clone())
     }
 
     /// Open the wizard of `action` on `sel`; actions without one (yet) are remembered in
@@ -341,7 +341,7 @@ impl AppState {
     fn open_wizard(&mut self, action: Action, sel: Selected) {
         // GetLogicalDrives: instant, fine on the UI thread
         let free_letters = self.platform.free_letters();
-        let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel);
+        let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel).with_platform(self.platform.clone());
         let wizard = crate::wizards::for_action(action, &ctx).or_else(|| crate::wizards::clone_for_action(action, &ctx));
         match wizard {
             Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters }),
@@ -366,7 +366,7 @@ impl AppState {
         let window: Box<dyn ToolWindow> = match t {
             Tool::CreateImage | Tool::RestoreImage => {
                 let free_letters = Vec::new();
-                let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel);
+                let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel).with_platform(self.platform.clone());
                 let w = if t == Tool::CreateImage {
                     crate::wizards::image_create::new(&ctx)
                 } else {
@@ -385,10 +385,10 @@ impl AppState {
             )),
             Tool::RescueCopy => Box::new(crate::wizards::rescue::RescueWizard::new(device)),
             Tool::DiskBenchmark => Box::new(crate::tools::benchmark::BenchmarkWindow::new(
-                sel.partition_in(live).and_then(|p| p.letter()).map(|c| format!("{c}:\\")),
+                sel.partition_in(live).and_then(|p| p.mount_points.first().cloned()),
             )),
             Tool::SpaceAnalyzer => Box::new(crate::tools::space_analyzer::SpaceAnalyzerWindow::new(
-                sel.partition_in(live).and_then(|p| p.letter()).map(|c| format!("{c}:\\")),
+                sel.partition_in(live).and_then(|p| p.mount_points.first().cloned()),
             )),
             Tool::SurfaceTest => Box::new(crate::tools::surface_test::SurfaceTestWindow::new(device)),
             Tool::Smart => Box::new(crate::tools::smart::SmartWindow::new(device.map(|d| d.disk()))),

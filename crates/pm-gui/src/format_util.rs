@@ -68,6 +68,16 @@ pub fn disk_header(d: &DiskInfo) -> String {
     d.display_name()
 }
 
+/// An example absolute path for hints and messages: `rel` (with `/` separators) under `D:\`
+/// on Windows, under `/mnt/data/` on Linux and macOS (`""`: that folder itself).
+pub fn example_path(rel: &str) -> String {
+    if cfg!(windows) {
+        format!("D:\\{}", rel.replace('/', "\\"))
+    } else {
+        format!("/mnt/data/{rel}")
+    }
+}
+
 /// `"12.50 MB/s"`; empty when the rate is unknown (zero).
 pub fn format_rate(bps: f64) -> String {
     if bps.is_finite() && bps >= 1.0 {

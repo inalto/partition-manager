@@ -61,6 +61,11 @@ pub struct WizardCtx<'a> {
     pub selection: Selected,
     /// The running system disk, if known.
     pub system_disk: Option<u32>,
+    /// The platform, for the few questions the model cannot answer (which disk a typed path
+    /// is on); `None` in tests and wherever no platform is at hand.
+    pub platform: Option<std::sync::Arc<dyn pm_platform::Platform>>,
+    /// `Platform::os_name` of the platform (the host's without one).
+    pub os_name: &'static str,
 }
 
 impl<'a> WizardCtx<'a> {
@@ -74,7 +79,26 @@ impl<'a> WizardCtx<'a> {
             .collect();
         letters.sort_unstable();
         letters.dedup();
-        WizardCtx { model, platform_free_letters: letters, selection, system_disk: model.effective_system_disk() }
+        WizardCtx {
+            model,
+            platform_free_letters: letters,
+            selection,
+            system_disk: model.effective_system_disk(),
+            platform: None,
+            os_name: pm_platform::host_os_name(),
+        }
+    }
+
+    /// The same context with `platform` at hand.
+    pub fn with_platform(mut self, platform: std::sync::Arc<dyn pm_platform::Platform>) -> Self {
+        self.os_name = platform.os_name();
+        self.platform = Some(platform);
+        self
+    }
+
+    /// Which partitions of the model carry a mounted filesystem.
+    pub fn mounts(&self) -> pm_ops::MountMap {
+        pm_ops::MountMap::new(&self.model.disks, &self.model.volumes)
     }
 }
 

@@ -9,7 +9,10 @@ use crate::wizard::{shared, StepResult, Wizard, WizardCtx};
 use eframe::egui;
 use pm_core::{align_down, align_up, format_size, TableKind, MIB};
 use pm_image::ImageFormat;
-use pm_ops::{Model, Operation};
+use crate::tools::PathLocation;
+use pm_ops::{Model, MountMap, Operation};
+use pm_platform::Platform;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 /// Where an image is restored to.
@@ -29,14 +32,31 @@ impl RestoreTarget {
     }
 }
 
-/// The disk of `m` holding the drive letter of `path`, and that letter.
-pub fn image_disk(m: &Model, path: &str) -> Option<(u32, char)> {
-    let c = crate::tools::path_letter(Path::new(path.trim()))?;
-    m.disks.iter().find(|d| d.partitions.iter().any(|p| p.letter() == Some(c))).map(|d| (d.index, c))
+/// The disks of `m` that hold the image file `path` (`located`: where the platform places it,
+/// see [`crate::tools::PathLocation`]), or may hold it when the platform cannot tell (every disk
+/// with a mounted volume): never a restore target, since restoring locks and overwrites the
+/// disk the image is read from. `known` says whether the location was known.
+pub fn image_disks(m: &Model, located: Option<(u32, Option<u32>)>, path: &str) -> (Vec<u32>, bool) {
+    let p = Path::new(path.trim());
+    let mounts = MountMap::new(&m.disks, &m.volumes);
+    let disks = m
+        .disks
+        .iter()
+        .map(|d| d.index)
+        .filter(|d| pm_ops::place_of(p, located, (*d, None), &mounts) != pm_ops::PathPlace::Elsewhere)
+        .collect();
+    (disks, located.is_some())
 }
 
-fn image_on_target(d: u32, c: char) -> String {
-    format!("The image file is on drive {c}:, which is on Disk {d}; it cannot be restored onto that disk. Copy it to another disk first.")
+fn image_on_target(d: u32, known: bool) -> String {
+    if known {
+        format!("The image file is on Disk {d}; it cannot be restored onto that disk. Copy it to another disk first.")
+    } else {
+        format!(
+            "Cannot tell which disk the image file is on, and Disk {d} has mounted volumes it could be on; \
+             it cannot be restored onto that disk. Copy the image to another disk of the list first."
+        )
+    }
 }
 
 /// Format and virtual capacity of the image at `path` (reads its header).
@@ -70,15 +90,31 @@ pub struct ImageRestoreState {
     /// The identified path and its format / capacity (or why it cannot be used).
     pub info: Option<(String, Result<(ImageFormat, u64), String>)>,
     pub target: Option<RestoreTarget>,
-    /// The disk holding the image file, with its drive letter: never a target (restoring
-    /// locks and overwrites the disk the image is read from). Updated from the model when the
-    /// target step is drawn.
-    pub image_disk: Option<(u32, char)>,
+    /// The disks holding (or possibly holding) the image file, and whether its location is
+    /// known ([`image_disks`]): never a target. Updated from the model when the target step is
+    /// drawn.
+    pub image_disks: (Vec<u32>, bool),
+    /// The platform asked where the image file is.
+    pub platform: Option<Arc<dyn Platform>>,
+    image_loc: PathLocation,
 }
 
 impl ImageRestoreState {
-    pub fn initial(_ctx: &WizardCtx) -> Option<ImageRestoreState> {
-        Some(ImageRestoreState { path: String::new(), info: None, target: None, image_disk: None })
+    pub fn initial(ctx: &WizardCtx) -> Option<ImageRestoreState> {
+        Some(ImageRestoreState {
+            path: String::new(),
+            info: None,
+            target: None,
+            image_disks: (Vec::new(), false),
+            platform: ctx.platform.clone(),
+            image_loc: PathLocation::default(),
+        })
+    }
+
+    /// Recompute [`ImageRestoreState::image_disks`] over `m`.
+    pub fn refresh_image_disks(&mut self, m: &Model) {
+        let located = self.image_loc.locate(self.platform.as_deref(), &self.path);
+        self.image_disks = image_disks(m, located, &self.path);
     }
 
     /// The capacity of the identified image, when the path is the identified one.
@@ -105,8 +141,8 @@ impl ImageRestoreState {
             return Err("Enter the path of an image file.".into());
         }
         let target = self.target.ok_or("Choose where to restore the image.")?;
-        if let Some((d, c)) = self.image_disk.filter(|(d, _)| *d == target.disk()) {
-            return Err(image_on_target(d, c));
+        if self.image_disks.0.contains(&target.disk()) {
+            return Err(image_on_target(target.disk(), self.image_disks.1));
         }
         let (dst_disk, dst_start) = match target {
             RestoreTarget::Disk(d) => (d, None),
@@ -119,7 +155,7 @@ impl ImageRestoreState {
 fn file_ui(s: &mut ImageRestoreState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> StepResult {
     ui.horizontal(|ui| {
         ui.label("Image file:");
-        let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(400.0).hint_text("D:\\Backups\\disk1.vhd"));
+        let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(400.0).hint_text(crate::format_util::example_path("Backups/disk1.vhd")));
         // read the header once the user is done typing, not on every keystroke
         if !resp.has_focus() {
             s.refresh_info();
@@ -140,14 +176,18 @@ fn file_ui(s: &mut ImageRestoreState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> St
 fn target_ui(s: &mut ImageRestoreState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
     let m = ctx.model;
     let Some(cap) = s.capacity() else { return StepResult::Invalid("Choose an image file first.".into()) };
-    s.image_disk = image_disk(m, &s.path);
-    let blocked = s.image_disk.map(|b| b.0);
-    let list: Vec<RestoreTarget> = targets(m, cap, ctx.system_disk).into_iter().filter(|t| Some(t.disk()) != blocked).collect();
-    if let Some((d, c)) = s.image_disk {
-        ui.weak(format!("Disk {d} is not offered: it holds the image file (drive {c}:)."));
-        if s.target.is_some_and(|t| t.disk() == d) {
-            s.target = None;
+    s.refresh_image_disks(m);
+    let (blocked, known) = s.image_disks.clone();
+    let list: Vec<RestoreTarget> = targets(m, cap, ctx.system_disk).into_iter().filter(|t| !blocked.contains(&t.disk())).collect();
+    for d in &blocked {
+        if known {
+            ui.weak(format!("Disk {d} is not offered: it holds the image file."));
+        } else {
+            ui.weak(format!("Disk {d} is not offered: it may hold the image file (its disk cannot be determined)."));
         }
+    }
+    if s.target.is_some_and(|t| blocked.contains(&t.disk())) {
+        s.target = None;
     }
     if list.is_empty() {
         return StepResult::Invalid(format!("No disk or unallocated space can hold {}.", format_size(cap)));
@@ -247,23 +287,31 @@ mod tests {
         assert!(bad.capacity().is_none());
     }
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn image_on_the_target_disk_is_refused() {
         let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
         m.system_disk = Some(7);
-        assert_eq!(image_disk(&m, r"E:\img\disk.vhd"), Some((1, 'E')));
-        assert_eq!(image_disk(&m, r"D:\disk.vhd"), None);
-        let ctx = WizardCtx::new(&m, vec![], Selected::None);
+        let tmp = std::env::temp_dir();
+        let img = |d: &str| tmp.join(d).join("disk.vhd").display().to_string();
+        assert_eq!(image_disks(&m, Some((1, Some(3))), &img("a")), (vec![1], true));
+        assert_eq!(image_disks(&m, Some((9, None)), &img("a")), (vec![], true));
+        // unknown location: every disk with a mounted volume (only Disk 1 has one, E:)
+        assert_eq!(image_disks(&m, None, &img("a")), (vec![1], false));
+        let plat = pm_platform::MockPlatform::new();
+        plat.set_disk_of_path(tmp.join("pm-ir-e"), 1, Some(3));
+        let ctx = WizardCtx::new(&m, vec![], Selected::None).with_platform(std::sync::Arc::new(plat));
         let mut s = ImageRestoreState::initial(&ctx).unwrap();
-        s.path = r"E:\img\disk.vhd".into();
-        s.image_disk = image_disk(&m, &s.path);
+        s.path = img("pm-ir-e");
+        s.refresh_image_disks(&m);
         s.target = Some(RestoreTarget::Disk(1));
         let e = s.build().unwrap_err();
-        assert!(e.contains("drive E:") && e.contains("Disk 1"), "{e}");
+        assert!(e.contains("is on Disk 1"), "{e}");
         s.target = Some(RestoreTarget::Disk(0));
         assert!(s.build().is_ok(), "another disk is fine");
+        // a path the platform cannot place may be on Disk 1
+        s.path = img("pm-ir-unknown");
+        s.refresh_image_disks(&m);
+        s.target = Some(RestoreTarget::Disk(1));
+        assert!(s.build().unwrap_err().contains("Cannot tell"));
     }
 }

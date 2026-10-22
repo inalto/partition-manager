@@ -7,6 +7,7 @@
 
 pub mod executor;
 pub mod identity;
+pub mod location;
 pub mod model;
 pub mod operation;
 pub mod planner;
@@ -20,5 +21,6 @@ pub use planner::Planner;
 pub use sizing::{plan_disk_clone, windows_partition, LayoutSpec, TargetLayout};
 pub use executor::{execute, execute_queued, precheck, ExecOpts, ExecReport, StepEvent};
 pub use identity::{adopt_generated_ids, layout_matches};
+pub use location::{locate, path_problem_on, place_of, place_problem, MountMap, PathPlace};
 pub use queue::OpQueue;
 pub use steps::image::{export_rescue_image, mapfile_path};

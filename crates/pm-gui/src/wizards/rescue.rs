@@ -12,13 +12,13 @@
 //! the source itself, and the destination must hold the whole source.
 
 use crate::tools::{
-    danger, device_combo, error_text, on_letters_problem, open_range, wizard_window, write_problem, Device, Footer, Nav,
-    Task, ToolEnv, ToolWindow, WindowKind, WindowOutcome,
+    danger, device_combo, error_text, on_device_problem, open_range, wizard_window, write_problem, Device, Footer, Nav,
+    PathLocation, Task, ToolEnv, ToolWindow, WindowKind, WindowOutcome,
 };
 use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense};
 use pm_core::{align_up, format_size, parse_size, BlockDevice, CancelToken, Error, ProgressSink};
 use pm_image::{rescue, BlockStatus, ImageFormat, MapFile, RescueOpts, RescueStats};
-use pm_ops::{Model, Operation};
+use pm_ops::{Model, MountMap, Operation};
 use pm_platform::{OpenMode, Platform};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +78,7 @@ pub fn file_dest_problem(path: &str) -> Option<String> {
     }
     let p = Path::new(t);
     if !p.is_absolute() || p.file_name().is_none() {
-        return Some("Enter a full file path, e.g. D:\\Rescue\\disk1.img.".into());
+        return Some(format!("Enter a full file path, e.g. {}.", crate::format_util::example_path("Rescue/disk1.img")));
     }
     match p.parent() {
         Some(d) if d.is_dir() => None,
@@ -86,19 +86,32 @@ pub fn file_dest_problem(path: &str) -> Option<String> {
     }
 }
 
-/// Why the file `path` (described as `what`) may not be used: it lies on a drive of the
-/// source disk (it would be read while it changes, or written onto the failing drive) or of a
-/// destination disk (which is locked and overwritten during the rescue).
-pub fn rescue_path_problem(live: &Model, src: Device, dest: &Dest, path: &str, what: &str) -> Option<String> {
-    let src_letters = Device::Disk(src.disk()).letters(live);
-    on_letters_problem(path, &src_letters, what, &format!("Disk {} (the source)", src.disk())).or_else(|| match dest {
-        Dest::Device(d) => on_letters_problem(
-            path,
-            &Device::Disk(d.disk()).letters(live),
-            what,
-            &format!("Disk {} (the destination)", d.disk()),
-        ),
-        Dest::File(_) => None,
+/// Why the file `path` (described as `what`) may not be used: it lies on the source disk (it
+/// would be read while it changes, or written onto the failing drive) or on a destination disk
+/// (which is locked and overwritten during the rescue), or may lie on one of them (`located`,
+/// where the platform places the path, is unknown and the disk has mounted volumes).
+pub fn rescue_path_problem(
+    live: &Model,
+    located: Option<(u32, Option<u32>)>,
+    src: Device,
+    dest: &Dest,
+    path: &str,
+    what: &str,
+) -> Option<String> {
+    let mounts = MountMap::new(&live.disks, &live.volumes);
+    let src_disk = Device::Disk(src.disk());
+    on_device_problem(&mounts, located, path, src_disk, what, &format!("Disk {} (the source)", src.disk())).or_else(|| {
+        match dest {
+            Dest::Device(d) => on_device_problem(
+                &mounts,
+                located,
+                path,
+                Device::Disk(d.disk()),
+                what,
+                &format!("Disk {} (the destination)", d.disk()),
+            ),
+            Dest::File(_) => None,
+        }
     })
 }
 
@@ -269,13 +282,14 @@ pub fn mapfile_path_problem(path: &str) -> Option<String> {
     if t.is_empty() {
         return Some("Enter the mapfile path.".into());
     }
-    (!Path::new(t).is_absolute()).then(|| "The mapfile needs a full path: enter an absolute path, e.g. D:\\Rescue\\disk1.map.".into())
+    (!Path::new(t).is_absolute()).then(|| format!("The mapfile needs a full path: enter an absolute path, e.g. {}.", crate::format_util::example_path("Rescue/disk1.map")))
 }
 
 /// Re-check a plan against `fresh` (the layout read on the worker just before writing): the
 /// source and destination still exist with the confirmed ranges, and every check of the
-/// wizard still passes. Returns the source range to read.
-fn recheck(fresh: &Model, plan: &Plan) -> Result<(u64, u64), String> {
+/// wizard still passes (`locate`: where the platform places a path). Returns the source range
+/// to read.
+fn recheck(fresh: &Model, plan: &Plan, locate: &dyn Fn(&str) -> Option<(u32, Option<u32>)>) -> Result<(u64, u64), String> {
     let changed = |d: Device| {
         format!(
             "The layout of Disk {} changed since the rescue was set up ({} moved, changed size or is gone); \
@@ -304,13 +318,13 @@ fn recheck(fresh: &Model, plan: &Plan) -> Result<(u64, u64), String> {
         DestPlan::File(f, _) => Dest::File(f.display().to_string()),
     };
     if let Dest::File(f) = &dest {
-        if let Some(e) = rescue_path_problem(fresh, plan.src, &dest, f, "destination file") {
+        if let Some(e) = rescue_path_problem(fresh, locate(f), plan.src, &dest, f, "destination file") {
             return Err(e);
         }
     }
     let mapfile = plan.mapfile.display().to_string();
     if let Some(e) = mapfile_path_problem(&mapfile)
-        .or_else(|| rescue_path_problem(fresh, plan.src, &dest, &mapfile, "mapfile"))
+        .or_else(|| rescue_path_problem(fresh, locate(&mapfile), plan.src, &dest, &mapfile, "mapfile"))
         .or_else(|| missing_image_problem(&dest, &mapfile))
     {
         return Err(e);
@@ -327,7 +341,8 @@ fn run_rescue(
 ) -> pm_core::Result<RescueOutcome> {
     let started = std::time::Instant::now();
     let fresh = Model::from_platform(p)?;
-    let src_range = recheck(&fresh, &plan).map_err(Error::Invalid)?;
+    let locate = |t: &str| pm_ops::locate(p, Path::new(t));
+    let src_range = recheck(&fresh, &plan, &locate).map_err(Error::Invalid)?;
     // never the whole disk for a partition source: exactly the re-checked range
     let slice = matches!(plan.src, Device::Partition(..)).then_some(src_range);
     let dev = open_range(p, plan.src.disk(), slice, OpenMode::ReadOnly)?;
@@ -341,7 +356,7 @@ fn run_rescue(
         plan.opts.zero_unused = true;
     }
     // once more right before the first write: the used-map scan can take a while
-    if recheck(&Model::from_platform(p)?, &plan).map_err(Error::Invalid)? != src_range {
+    if recheck(&Model::from_platform(p)?, &plan, &locate).map_err(Error::Invalid)? != src_range {
         return Err(Error::Invalid("The source changed while the rescue was starting; nothing was written.".into()));
     }
     let stats = match &plan.dest {
@@ -383,6 +398,9 @@ pub struct RescueWizard {
     mapfile_for: Option<Dest>,
     resume: Option<(String, Result<Option<Resume>, String>)>,
     file_check: Option<(String, Option<String>)>,
+    /// Where the platform places the destination file and the mapfile (asked when the text changes).
+    file_loc: PathLocation,
+    map_loc: PathLocation,
     pub sector: u32,
     /// Sectors per copy-phase read.
     pub cluster: u64,
@@ -411,6 +429,8 @@ impl RescueWizard {
             mapfile_for: None,
             resume: None,
             file_check: None,
+            file_loc: PathLocation::default(),
+            map_loc: PathLocation::default(),
             sector: 512,
             cluster: 256,
             skip: "64 KB".into(),
@@ -464,7 +484,8 @@ impl RescueWizard {
                     self.file_check = Some((f.clone(), file_dest_problem(f)));
                 }
                 let folder = self.file_check.as_ref().and_then(|c| c.1.clone());
-                folder.or_else(|| rescue_path_problem(env.live, src, &self.dest, f, "destination file"))
+                let located = self.file_loc.locate(Some(&**env.platform), f);
+                folder.or_else(|| rescue_path_problem(env.live, located, src, &self.dest, f, "destination file"))
             }
         }
     }
@@ -475,7 +496,8 @@ impl RescueWizard {
             return Err(e);
         }
         if let Some(src) = self.src {
-            if let Some(e) = rescue_path_problem(env.live, src, &self.dest, &self.mapfile, "mapfile") {
+            let located = self.map_loc.locate(Some(&**env.platform), &self.mapfile);
+            if let Some(e) = rescue_path_problem(env.live, located, src, &self.dest, &self.mapfile, "mapfile") {
                 return Err(e);
             }
         }
@@ -580,7 +602,7 @@ impl RescueWizard {
         let mut new_format = None;
         match &mut self.dest {
             Dest::File(f) => {
-                ui.add(egui::TextEdit::singleline(f).desired_width(420.0).hint_text("D:\\Rescue\\disk1.img"));
+                ui.add(egui::TextEdit::singleline(f).desired_width(420.0).hint_text(crate::format_util::example_path("Rescue/disk1.img")));
                 ui.horizontal(|ui| {
                     ui.label("Format of a new image:");
                     let mut fmt = self.dest_format;
@@ -891,24 +913,27 @@ mod tests {
         assert_eq!(bar[9], BlockStatus::NonTried);
     }
 
-    // drive-letter / Windows-path logic: the mount-point equivalent arrives with the Linux and
-    // macOS platform layers (multi-platform Task D)
-    #[cfg(windows)]
     #[test]
     fn files_on_the_source_or_destination_disk_are_refused() {
         let mut m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
         m.system_disk = Some(7);
-        // E: is partition 3 of Disk 1
+        let tmp = std::env::temp_dir();
+        let x = tmp.join("x.img").display().to_string();
+        // the platform places the file on partition 3 of Disk 1
         let src = Device::Partition(1, 1);
-        let to_file = Dest::File("E:\\x.img".into());
-        let e = rescue_path_problem(&m, src, &to_file, "E:\\x.img", "destination file").unwrap();
-        assert!(e.contains("drive E:") && e.contains("Disk 1 (the source)"), "{e}");
-        assert!(rescue_path_problem(&m, Device::Disk(0), &to_file, "E:\\x.img", "destination file").is_none());
+        let to_file = Dest::File(x.clone());
+        let e = rescue_path_problem(&m, Some((1, Some(3))), src, &to_file, &x, "destination file").unwrap();
+        assert!(e.contains("Disk 1 (the source)"), "{e}");
+        assert!(rescue_path_problem(&m, Some((1, Some(3))), Device::Disk(0), &to_file, &x, "destination file").is_none());
         // the mapfile neither on the source nor on a destination disk
         let to_disk = Dest::Device(Device::Disk(1));
-        let e = rescue_path_problem(&m, Device::Disk(0), &to_disk, "e:\\r.map", "mapfile").unwrap();
+        let e = rescue_path_problem(&m, Some((1, Some(3))), Device::Disk(0), &to_disk, &x, "mapfile").unwrap();
         assert!(e.contains("the destination"), "{e}");
-        assert!(rescue_path_problem(&m, Device::Disk(0), &to_disk, "D:\\r.map", "mapfile").is_none());
+        assert!(rescue_path_problem(&m, Some((5, None)), Device::Disk(0), &to_disk, &x, "mapfile").is_none());
+        // a place the platform cannot tell: Disk 1 has a mounted volume (E:), Disk 0 none
+        let e = rescue_path_problem(&m, None, Device::Disk(0), &to_disk, &x, "mapfile").unwrap();
+        assert!(e.contains("Cannot tell") && e.contains("Disk 1 (the destination)"), "{e}");
+        assert!(rescue_path_problem(&m, None, Device::Disk(0), &to_file, &x, "mapfile").is_none());
         // device destinations: the default mapfile is in the profile folder, never the cwd
         let d = default_mapfile(&Dest::Device(Device::Disk(3)));
         if let Some(h) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
@@ -1005,9 +1030,12 @@ mod tests {
             used_only: false,
             mapfile: PathBuf::from("rescue.map"),
         };
-        assert!(recheck(&m, &plan).unwrap_err().contains("absolute path"));
+        let locate = |t: &str| p.disk_of_path(Path::new(t));
+        assert!(recheck(&m, &plan, &locate).unwrap_err().contains("absolute path"));
         let plan = Plan { mapfile: dir.path().join("disk1.map"), ..plan };
-        assert!(recheck(&m, &plan).is_ok());
+        assert!(recheck(&m, &plan, &locate).is_ok());
+        // a mapfile the platform cannot place, next to a mounted source: refused
+        assert!(recheck(&m, &plan, &|_| None).unwrap_err().contains("Cannot tell"));
     }
 
     #[test]

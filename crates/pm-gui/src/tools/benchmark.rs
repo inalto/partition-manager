@@ -186,7 +186,7 @@ impl BenchmarkWindow {
                         }
                     });
                 ui.label("or folder:");
-                ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(180.0).hint_text("D:\\"));
+                ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(180.0).hint_text(crate::format_util::example_path("")));
                 ui.end_row();
 
                 ui.label("Transfer size from:");

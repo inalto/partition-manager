@@ -6,7 +6,7 @@ use crate::cmd_apply::{run_ops, Env, RunFlags};
 use crate::cmd_clone::{
     copy_device, copy_planned, existing_canonical, finish, open_checked, plan_used_map, summary, SharedSource,
 };
-use crate::device_arg::{open_spec, parse_device, vmdk_extent_files, DeviceArg};
+use crate::device_arg::{open_spec, parse_device_on, vmdk_extent_files, DeviceArg};
 use crate::partial::Partial;
 use crate::progress::StderrProgress;
 use pm_core::{align_up, format_size, BlockDevice, CancelToken, Error};
@@ -127,7 +127,7 @@ pub fn run_image_rescue(
 ) -> Result<(), CliError> {
     let fmt = pick_format(format, file)?;
     let clone_mode = crate::cmd_ops::clone_mode(mode);
-    let op = match parse_device(src).map_err(arg_error)? {
+    let op = match parse_device_on(env.platform, src).map_err(arg_error)? {
         DeviceArg::Disk(disk) => Some(Operation::ImageDisk {
             disk,
             path: file.to_path_buf(),

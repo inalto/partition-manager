@@ -7,7 +7,7 @@
 
 use crate::cli::{arg_error, CliError};
 use crate::cmd_ops::TableArg;
-use crate::device_arg::{open_spec, parse_device, DeviceArg, Identity, Opened};
+use crate::device_arg::{open_spec, parse_device_on, resolve_volume, volume_extent, DeviceArg, Identity, Opened};
 use crate::progress::StderrProgress;
 use clap::Subcommand;
 use pm_core::{format_size, CancelToken, DiskInfo, Error, TableKind};
@@ -176,67 +176,108 @@ fn device_identity(platform: &dyn Platform, o: &Opened) -> DeviceIdentity {
     }
 }
 
-/// The drive letters of the volumes stored on the device `arg` names.
-fn source_letters(platform: &dyn Platform, arg: &DeviceArg) -> Vec<char> {
-    let letter_of = |m: &String| {
-        let b = m.as_bytes();
-        (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':').then(|| (b[0] as char).to_ascii_uppercase())
-    };
-    let disk_letters = |index: u32, number: Option<u32>| -> Vec<char> {
-        platform
-            .enumerate_disks()
-            .unwrap_or_default()
-            .iter()
-            .filter(|d| d.index == index)
-            .flat_map(|d| d.partitions.iter().filter(|p| number.map_or(true, |n| p.number == n)))
-            .filter_map(|p| p.letter())
-            .collect()
-    };
-    match arg {
-        DeviceArg::Volume(v) => {
-            if let Some(c) = letter_of(v) {
-                return vec![c];
-            }
-            platform
-                .enumerate_volumes()
-                .unwrap_or_default()
-                .iter()
-                .filter(|vol| vol.id.0.eq_ignore_ascii_case(v))
-                .flat_map(|vol| vol.mount_points.iter().filter_map(letter_of))
-                .collect()
-        }
-        DeviceArg::Disk(i) => disk_letters(*i, None),
+/// Where the device `arg` names lives: `(disk, partition)`, a volume's own mount points
+/// (a volume the platform cannot place on one disk), or nothing (an image file).
+enum SourcePlace {
+    Device((u32, Option<u32>)),
+    UnplacedVolume(Vec<String>),
+    File,
+}
+
+fn source_place(platform: &dyn Platform, arg: &DeviceArg) -> Result<SourcePlace, CliError> {
+    Ok(match arg {
+        DeviceArg::Disk(i) => SourcePlace::Device((*i, None)),
         DeviceArg::Partition(parent, n) => match &**parent {
-            DeviceArg::Disk(i) => disk_letters(*i, Some(*n)),
-            _ => Vec::new(),
+            DeviceArg::Disk(i) => SourcePlace::Device((*i, Some(*n))),
+            _ => SourcePlace::File,
         },
-        DeviceArg::File(_) => Vec::new(),
+        DeviceArg::Volume(v) => {
+            let id = resolve_volume(platform, v).map_err(arg_error)?;
+            match volume_extent(platform, &id) {
+                Some((d, start, _)) => {
+                    let number = platform
+                        .enumerate_disks()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|x| x.index == d)
+                        .and_then(|x| x.partitions.into_iter().find(|p| p.start == start))
+                        .map(|p| p.number);
+                    SourcePlace::Device((d, number))
+                }
+                None => SourcePlace::UnplacedVolume(
+                    platform
+                        .enumerate_volumes()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|x| x.id == id)
+                        .map(|x| x.mount_points)
+                        .unwrap_or_default(),
+                ),
+            }
+        }
+        DeviceArg::File(_) => SourcePlace::File,
+    })
+}
+
+/// `p` with `\` as `/`, without a trailing separator, lower-case on Windows (where paths
+/// are case-insensitive), for prefix comparisons of mount points.
+fn path_key(p: &str) -> String {
+    let s = p.replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s
     }
 }
 
-/// The drive letter `dest` is on (it need not exist yet).
-fn dest_letter(dest: &Path) -> Option<char> {
-    use std::path::{Component, Prefix};
-    let abs = std::path::absolute(dest).ok()?;
-    match abs.components().next()? {
-        Component::Prefix(p) => match p.kind() {
-            Prefix::Disk(b) | Prefix::VerbatimDisk(b) => Some((b as char).to_ascii_uppercase()),
-            _ => None,
-        },
-        _ => None,
-    }
+/// Whether the mount point covering `dest` (the longest match among every volume's mount
+/// points) is one of `own`.
+fn under_mount_points(platform: &dyn Platform, dest: &Path, own: &[String]) -> bool {
+    let d = path_key(&dest.to_string_lossy());
+    let covers = |m: &String| {
+        let k = path_key(m);
+        k.is_empty() || d == k || d.starts_with(&format!("{k}/"))
+    };
+    let all: Vec<String> =
+        platform.enumerate_volumes().unwrap_or_default().into_iter().flat_map(|v| v.mount_points).collect();
+    let best = all.iter().filter(|m| covers(m)).max_by_key(|m| path_key(m).len());
+    best.is_some_and(|b| own.iter().any(|o| path_key(o) == path_key(b)))
 }
 
 /// Recovered data must not be written onto the drive it is recovered from: that can overwrite
-/// the very data being recovered.
+/// the very data being recovered. Where `dest` lies comes from `Platform::disk_of_path`; when
+/// the platform cannot tell and the source has mounted volumes, the destination is refused.
 fn check_dest(platform: &dyn Platform, device: &str, dest: &Path) -> Result<(), CliError> {
-    let arg = parse_device(device).map_err(arg_error)?;
-    match dest_letter(dest) {
-        Some(c) if source_letters(platform, &arg).contains(&c) => Err(CliError::Usage(format!(
-            "'{}' is on drive {c}:, the drive being recovered from; choose a destination on another drive",
-            dest.display()
-        ))),
-        _ => Ok(()),
+    let arg = parse_device_on(platform, device).map_err(arg_error)?;
+    let abs = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
+    let what = "destination";
+    let problem = match source_place(platform, &arg)? {
+        SourcePlace::File => None,
+        SourcePlace::Device(place) => {
+            let disks = platform.enumerate_disks().unwrap_or_default();
+            let volumes = platform.enumerate_volumes().unwrap_or_default();
+            let mounts = pm_ops::MountMap::new(&disks, &volumes);
+            let desc = match place {
+                (d, Some(n)) => format!("partition {n} of Disk {d}, the one being recovered from"),
+                (d, None) => format!("Disk {d}, the disk being recovered from"),
+            };
+            pm_ops::path_problem_on(platform, &mounts, &abs, place, what, &desc)
+        }
+        SourcePlace::UnplacedVolume(mounts) => {
+            let place = if under_mount_points(platform, &abs, &mounts) {
+                pm_ops::PathPlace::OnDevice
+            } else if mounts.is_empty() || pm_ops::locate(platform, &abs).is_some() {
+                pm_ops::PathPlace::Elsewhere
+            } else {
+                pm_ops::PathPlace::Unknown
+            };
+            pm_ops::place_problem(place, what, &abs, "the volume being recovered from")
+        }
+    };
+    match problem {
+        Some(m) => Err(CliError::Usage(m)),
+        None => Ok(()),
     }
 }
 
@@ -314,7 +355,7 @@ fn partitions(
     cancel: &CancelToken,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let arg = parse_device(device).map_err(arg_error)?;
+    let arg = parse_device_on(platform, device).map_err(arg_error)?;
     if !matches!(arg, DeviceArg::Disk(_) | DeviceArg::File(_)) {
         return Err(CliError::Usage("partitions are searched for on a whole disk or image file".into()));
     }
@@ -730,6 +771,7 @@ trailer << >>
         use pm_platform::MockPlatform;
         let p = MockPlatform::new();
         p.add_disk(0, MemDevice::new(1 << 20), DiskInfo::default());
+        p.add_disk(3, MemDevice::new(1 << 20), DiskInfo::default());
         let vol = r"\\?\Volume{aaaa}\";
         p.add_volume(
             VolumeInfo { id: VolumeId(vol.into()), mount_points: vec![r"D:\".into()], ..Default::default() },
@@ -737,16 +779,41 @@ trailer << >>
             0,
             4096,
         );
-        // drive letters exist on Windows only (the mount-point equivalent is multi-platform Task D)
-        if cfg!(windows) {
-            assert_eq!(dest_letter(Path::new(r"d:\out")), Some('D'));
-            assert_eq!(dest_letter(Path::new(r"\\server\share\x")), None);
-            assert!(matches!(check_dest(&p, "D:", Path::new(r"D:\recovered")), Err(CliError::Usage(_))));
-            assert!(check_dest(&p, "D:", Path::new(r"E:\recovered")).is_ok());
-            assert!(check_dest(&p, vol, Path::new(r"d:\x")).is_err());
-        }
+        let tmp = std::env::temp_dir();
+        let on_src = tmp.join("pm-recover-src");
+        let on_other = tmp.join("pm-recover-other");
+        p.set_disk_of_path(&on_src, 0, Some(1));
+        p.set_disk_of_path(&on_other, 3, Some(1));
+        let refused = |dev: &str, dest: &Path| matches!(check_dest(&p, dev, dest), Err(CliError::Usage(_)));
+        assert!(refused("disk:0", &on_src.join("out")));
+        assert!(refused("disk:0:1", &on_src.join("out")));
+        assert!(!refused("disk:0:2", &on_src.join("out")), "another partition of the same disk");
+        assert!(!refused("disk:0", &on_other.join("out")));
+        assert!(refused(vol, &on_src.join("x")), "a volume placed on Disk 0");
+        assert!(!refused(vol, &on_other.join("x")));
+        // the platform cannot place the destination: refused only while the source has mounts
+        let unknown = tmp.join("pm-recover-unknown");
+        assert!(refused("disk:0", &unknown), "Disk 0 has a mounted volume");
+        assert!(!refused("disk:3", &unknown), "nothing of Disk 3 is mounted");
+        let msg = check_dest(&p, "disk:0", &unknown).unwrap_err().to_string();
+        assert!(msg.contains("Cannot tell which disk"), "{msg}");
         // a relative destination is resolved against the current directory
-        assert!(check_dest(&p, "disk:0", Path::new("relative")).is_ok());
+        assert!(check_dest(&p, "disk:3", Path::new("relative")).is_ok());
+        // a volume no single disk holds: its own mount points decide
+        let span = r"\\?\Volume{span}\";
+        p.add_spanned_volume(VolumeInfo {
+            id: VolumeId(span.into()),
+            mount_points: vec![tmp.join("pm-span").display().to_string()],
+            ..Default::default()
+        });
+        assert!(refused(span, &tmp.join("pm-span").join("x")));
+        assert!(!refused(span, &on_other.join("x")));
+        if cfg!(windows) {
+            // a drive letter is a mount point the platform places like any other
+            p.set_disk_of_path(r"D:\", 0, Some(1));
+            assert!(refused("D:", Path::new(r"D:\recovered")));
+            assert!(refused("D:", Path::new(r"d:\x")));
+        }
     }
 
     #[test]

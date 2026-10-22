@@ -370,7 +370,8 @@ impl CliError {
     fn is_access_denied(&self) -> bool {
         match self {
             CliError::Runtime(pm_core::Error::Platform { code, msg }) => {
-                *code == 5 || msg.to_ascii_lowercase().contains("access denied")
+                let m = msg.to_ascii_lowercase();
+                denied_code(*code) || m.contains("access denied") || m.contains("permission denied")
             }
             CliError::Runtime(pm_core::Error::Io { source, .. }) => {
                 source.kind() == std::io::ErrorKind::PermissionDenied
@@ -378,6 +379,12 @@ impl CliError {
             _ => false,
         }
     }
+}
+
+/// Whether the OS error `code` means "no rights": `ERROR_ACCESS_DENIED` (5) on Windows,
+/// `EACCES` (13) / `EPERM` (1) on Linux and macOS (where 5 is `EIO`, an I/O error).
+fn denied_code(code: u32) -> bool {
+    (cfg!(windows) && code == 5) || (cfg!(unix) && (code == 13 || code == 1))
 }
 
 impl CliError {
@@ -458,6 +465,23 @@ mod tests {
         });
         assert!(!other.to_string().contains("elevated") && !other.to_string().contains("sudo"));
         assert!(matches!(arg_error(Error::Invalid("x".into())), CliError::Usage(_)));
+    }
+
+    #[test]
+    fn access_denied_codes_follow_the_os() {
+        let hint = "HINT";
+        let plat = |code: u32, msg: &str| CliError::Runtime(Error::Platform { code, msg: msg.into() });
+        // 5 is ERROR_ACCESS_DENIED on Windows but EIO on Linux / macOS
+        assert_eq!(plat(5, "read failed").render(hint).contains(hint), cfg!(windows));
+        // EACCES / EPERM
+        assert_eq!(plat(13, "open /dev/sdb").render(hint).contains(hint), cfg!(unix));
+        assert_eq!(plat(1, "mount").render(hint).contains(hint), cfg!(unix));
+        // the message decides on every OS
+        assert!(plat(0, "open: Permission denied (os error 13)").render(hint).contains(hint));
+        assert!(plat(2, "Access denied").render(hint).contains(hint));
+        assert!(!plat(2, "No such device").render(hint).contains(hint));
+        let io = CliError::Runtime(Error::io(0, 512, std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(io.render(hint).contains(hint));
         assert!(matches!(arg_error(Error::Cancelled), CliError::Runtime(_)));
     }
 }

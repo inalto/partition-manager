@@ -1,14 +1,14 @@
 //! `pm table <device> [--json]`: the parsed partition table of a disk, volume or image file.
 
 use crate::cli::{arg_error, CliError};
-use crate::device_arg::{open_device, parse_device};
+use crate::device_arg::{open_device, parse_device_on};
 use pm_core::{format_size, TableKind, MIB};
 use pm_parttable::{read_table, Table};
 use pm_platform::{OpenMode, Platform};
 use std::io::Write;
 
 pub fn run(platform: &dyn Platform, device: &str, json: bool, out: &mut dyn Write) -> Result<(), CliError> {
-    let arg = parse_device(device).map_err(arg_error)?;
+    let arg = parse_device_on(platform, device).map_err(arg_error)?;
     let mut dev = open_device(platform, &arg, OpenMode::ReadOnly).map_err(|e| match e {
         // a device that does not exist is an argument error; everything else is a runtime failure
         pm_core::Error::NotFound(m) => CliError::Usage(m),

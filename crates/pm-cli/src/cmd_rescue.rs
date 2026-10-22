@@ -4,7 +4,7 @@
 use crate::cli::{arg_error, CliError, RescueArgs};
 use crate::cmd_clone::{existing_canonical, finish, fs_used_map, open_writable, probe_checked, SharedSource};
 use crate::cmd_image::pick_format;
-use crate::device_arg::{open_spec, parse_device, DeviceArg, Identity};
+use crate::device_arg::{open_spec, parse_device_on, DeviceArg, Identity};
 use pm_core::{align_up, format_size, BlockDevice, CancelToken, Error, ProgressReport, ProgressSink};
 use pm_image::{rescue, CreateOpts, ImageFormat, MapFile, RescueOpts};
 use pm_platform::{OpenMode, Platform};
@@ -275,7 +275,7 @@ fn new_image_path(dst: &str) -> Option<PathBuf> {
 /// mapfile exists and parses, and the image has that format). Device destinations and
 /// existing files without `--format` are left to the normal checks.
 fn prepare_destination(platform: &dyn Platform, a: &RescueArgs) -> Result<Option<Created>, CliError> {
-    match parse_device(&a.dst) {
+    match parse_device_on(platform, &a.dst) {
         Ok(DeviceArg::File(p)) => {
             if let Some(fmt) = a.format {
                 check_resume(a, &p, fmt)?;

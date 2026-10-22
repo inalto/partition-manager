@@ -74,7 +74,20 @@ fn dispatch(
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let cli = match Cli::try_parse() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // `/dev/sdb` where a disk index is expected: resolve whole-disk nodes before parsing (only
+    // when such an argument is present and the physical disks are used, so nothing is
+    // enumerated otherwise)
+    let images = args.iter().any(|a| a.to_str().is_some_and(|s| s == "--disk-file" || s.starts_with("--disk-file=")));
+    let mut early: Option<Arc<dyn Platform>> = None;
+    if !images && args.iter().skip(1).any(|a| a.to_str().is_some_and(device_arg::is_dev_node)) {
+        let p = pm_platform::default_platform();
+        if let Ok(disks) = p.enumerate_disks() {
+            device_arg::register_disk_nodes(disks);
+        }
+        early = Some(p);
+    }
+    let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
             let code = if e.use_stderr() { cli::EXIT_USAGE } else { EXIT_OK };
@@ -93,7 +106,7 @@ fn main() {
             }
         }
     } else {
-        pm_platform::default_platform()
+        early.unwrap_or_else(pm_platform::default_platform)
     };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

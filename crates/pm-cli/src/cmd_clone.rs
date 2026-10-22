@@ -3,7 +3,7 @@
 
 use crate::cli::{CliError, CopyMode};
 use crate::cli::arg_error;
-use crate::device_arg::{open_spec, parse_device, resolve_volume, volume_extent, DeviceArg, Identity, Opened};
+use crate::device_arg::{open_spec, parse_device_on, resolve_volume, volume_extent, DeviceArg, Identity, Opened};
 use crate::progress::StderrProgress;
 use pm_core::{format_size, BlockDevice, CancelToken, Error};
 use pm_fs::UsedMap;
@@ -235,7 +235,7 @@ fn open_destination(
     spec: &str,
     probe: &Probed,
 ) -> Result<(Opened, Option<SessionGuard>), CliError> {
-    let arg = parse_device(spec).map_err(arg_error)?;
+    let arg = parse_device_on(platform, spec).map_err(arg_error)?;
     let (disk, part, volume) = match &arg {
         DeviceArg::Disk(i) => (*i, None, None),
         DeviceArg::Partition(parent, n) => match **parent {
@@ -304,7 +304,7 @@ pub fn probe_checked(
     dst_offset: u64,
 ) -> Result<(Opened, Opened), CliError> {
     let src = open_spec(platform, src_spec, OpenMode::ReadOnly)?;
-    if let Ok(DeviceArg::Volume(v)) = parse_device(dst_spec) {
+    if let Ok(DeviceArg::Volume(v)) = parse_device_on(platform, dst_spec) {
         // refused before anything is opened on the destination
         let id = resolve_volume(platform, &v).map_err(|e| match e {
             Error::NotFound(m) => CliError::Usage(m),

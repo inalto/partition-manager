@@ -1,10 +1,11 @@
 //! Parsing and opening of the `<device>` command line argument.
 
 use crate::cli::{arg_error, CliError};
-use pm_core::{BlockDevice, Error, Result, SliceDevice, VolumeId};
+use pm_core::{BlockDevice, DiskInfo, Error, Result, SliceDevice, VolumeId};
 use pm_parttable::read_table;
 use pm_platform::{OpenMode, Platform};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceArg {
@@ -158,8 +159,80 @@ fn is_volume_path(s: &str) -> bool {
 }
 
 /// A device node path (`/dev/sda1`, `/dev/rdisk3s2`) as used on Linux and macOS.
-fn is_dev_node(s: &str) -> bool {
+pub fn is_dev_node(s: &str) -> bool {
     s.strip_prefix("/dev/").is_some_and(|rest| !rest.is_empty() && !rest.ends_with('/'))
+}
+
+/// The other name of a macOS whole disk or slice: `/dev/rdiskN` (raw) and `/dev/diskN`
+/// (buffered) are the same storage. `None` for every other node.
+fn disk_node_twin(node: &str) -> Option<String> {
+    if let Some(rest) = node.strip_prefix("/dev/rdisk") {
+        return rest.starts_with(|c: char| c.is_ascii_digit()).then(|| format!("/dev/disk{rest}"));
+    }
+    let rest = node.strip_prefix("/dev/disk")?;
+    rest.starts_with(|c: char| c.is_ascii_digit()).then(|| format!("/dev/rdisk{rest}"))
+}
+
+/// The index of the disk whose whole-disk node is `node` (`/dev/sdb`, `/dev/nvme0n1`,
+/// `/dev/disk2` or `/dev/rdisk2`), matched against [`DiskInfo::path`]. The macOS raw /
+/// buffered twin matches too, and a symlink (`/dev/disk/by-id/...`) is followed.
+pub fn disk_of_node(disks: &[DiskInfo], node: &str) -> Option<u32> {
+    if !is_dev_node(node) {
+        return None;
+    }
+    let mut names = vec![node.to_string()];
+    if let Ok(real) = std::fs::canonicalize(node) {
+        if let Some(r) = real.to_str() {
+            names.push(r.to_string());
+        }
+    }
+    let twins: Vec<String> = names.iter().filter_map(|n| disk_node_twin(n)).collect();
+    names.extend(twins);
+    disks.iter().find(|d| names.iter().any(|n| *n == d.path)).map(|d| d.index)
+}
+
+/// A whole-disk node, or a whole-disk node followed by `:P`, as `disk:N` / `disk:N:P`.
+/// `None` when `s` names no whole disk of `disks` (a partition node stays a volume).
+pub fn disk_spec_of_node(disks: &[DiskInfo], s: &str) -> Option<DeviceArg> {
+    if let Some(i) = disk_of_node(disks, s) {
+        return Some(DeviceArg::Disk(i));
+    }
+    let (base, num) = s.rsplit_once(':')?;
+    let n = num.parse::<u32>().ok().filter(|n| *n >= 1)?;
+    disk_of_node(disks, base).map(|i| DeviceArg::Partition(Box::new(DeviceArg::Disk(i)), n))
+}
+
+/// Whole-disk nodes of the running system (path, index), registered by `main` before the
+/// command line is parsed so that arguments parsed as a disk index (`pm op ... <disk>`) accept
+/// `/dev/sdb` too. Empty when nothing was registered (no `/dev/...` argument, `--disk-file`).
+static DISK_NODES: OnceLock<Vec<DiskInfo>> = OnceLock::new();
+
+/// Make `disks`' nodes known to [`registered_disk_of_node`] (first call wins).
+pub fn register_disk_nodes(disks: Vec<DiskInfo>) {
+    let _ = DISK_NODES.set(disks);
+}
+
+/// [`disk_of_node`] over the disks registered with [`register_disk_nodes`].
+pub fn registered_disk_of_node(node: &str) -> Option<u32> {
+    disk_of_node(DISK_NODES.get().map_or(&[], |d| d.as_slice()), node)
+}
+
+/// `a` with a whole-disk `/dev` node (optionally `:P`) turned into `disk:N[:P]`, so the
+/// same-device and overlap checks compare it with `disk:N` and its partitions. Volumes that are
+/// not whole disks, and every non-`/dev` argument, are returned unchanged (no enumeration).
+pub fn resolve_disk_node(platform: &dyn Platform, a: DeviceArg) -> Result<DeviceArg> {
+    match &a {
+        DeviceArg::Volume(v) if is_dev_node(v) => {
+            let disks = platform.enumerate_disks()?;
+            Ok(disk_spec_of_node(&disks, v).unwrap_or(a))
+        }
+        _ => Ok(a),
+    }
+}
+
+/// [`parse_device`] followed by [`resolve_disk_node`].
+pub fn parse_device_on(platform: &dyn Platform, s: &str) -> Result<DeviceArg> {
+    resolve_disk_node(platform, parse_device(s)?)
 }
 
 /// The volume path with exactly one trailing backslash, as the platform expects it.
@@ -231,17 +304,19 @@ pub fn parse_device(s: &str) -> Result<DeviceArg> {
         return Ok(DeviceArg::Volume(s.to_string()));
     }
     Err(Error::Invalid(format!(
-        "'{s}' is not a device: use disk:N[:P], a drive letter (D:), a \\\\?\\Volume{{..}}\\ path, a /dev/... node, or an existing image file[:P]"
+        "'{s}' is not a device: use disk:N[:P], a /dev/... node (Linux, macOS; a whole disk also as /dev/NODE:P), a drive letter (D:), a \\\\?\\Volume{{..}}\\ path, or an existing image file[:P]"
     )))
 }
 
-/// Resolve `D:` (via the volumes' mount points) or a `\\?\Volume{..}\` path to a [`VolumeId`].
+/// Resolve `D:` (via the volumes' mount points), a `\\?\Volume{..}\` path or a `/dev/...` node
+/// (in the platform's canonical form) to a [`VolumeId`].
 pub fn resolve_volume(platform: &dyn Platform, s: &str) -> Result<VolumeId> {
     if is_volume_path(s) {
         return Ok(VolumeId(normalize_volume_path(s)));
     }
     if is_dev_node(s) {
-        return Ok(VolumeId(s.to_string()));
+        // `/dev/rdisk2s1` → `/dev/disk2s1` on macOS, as the platform lists it
+        return Ok(platform.canonical_volume_id(&VolumeId(s.to_string())));
     }
     let letter = drive_letter(s)
         .ok_or_else(|| Error::Invalid(format!("'{s}' is not a drive letter or volume path")))?;
@@ -333,7 +408,7 @@ pub fn open_device_with_slice(p: &dyn Platform, a: &DeviceArg, mode: OpenMode) -
 /// Parse and open a `<device>` command line argument. A device that does not exist is an
 /// argument error (exit 1); anything else that goes wrong while opening it is a runtime error.
 pub fn open_spec(platform: &dyn Platform, spec: &str, mode: OpenMode) -> std::result::Result<Opened, CliError> {
-    let arg = parse_device(spec).map_err(arg_error)?;
+    let arg = parse_device_on(platform, spec).map_err(arg_error)?;
     open_device_with_slice(platform, &arg, mode).map_err(|e| match e {
         Error::NotFound(m) => CliError::Usage(m),
         other => CliError::Runtime(other),
@@ -497,5 +572,112 @@ mod tests {
             VolumeId(raw.into())
         );
         assert!(resolve_volume(&plat, "nonsense").is_err());
+    }
+
+    fn disk_at(index: u32, path: &str) -> DiskInfo {
+        DiskInfo { index, path: path.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn whole_disk_nodes_map_to_disk_indexes() {
+        // indexes need not be contiguous (Linux keeps a removed disk's index)
+        let disks = [disk_at(0, "/dev/sda"), disk_at(2, "/dev/sdb"), disk_at(5, "/dev/rdisk2")];
+        assert_eq!(disk_of_node(&disks, "/dev/sdb"), Some(2));
+        assert_eq!(disk_of_node(&disks, "/dev/sda"), Some(0));
+        // macOS: the buffered twin of a raw whole disk, and the raw node itself
+        assert_eq!(disk_of_node(&disks, "/dev/disk2"), Some(5));
+        assert_eq!(disk_of_node(&disks, "/dev/rdisk2"), Some(5));
+        // partitions / slices are volumes, not disks
+        assert_eq!(disk_of_node(&disks, "/dev/sdb1"), None);
+        assert_eq!(disk_of_node(&disks, "/dev/disk2s1"), None);
+        assert_eq!(disk_of_node(&disks, "/dev/disk22"), None);
+        assert_eq!(disk_of_node(&disks, "/dev/disk/by-id/none"), None);
+        assert_eq!(disk_of_node(&disks, "sdb"), None);
+        // NODE:P addresses a partition of the disk
+        assert_eq!(disk_spec_of_node(&disks, "/dev/sdb"), Some(DeviceArg::Disk(2)));
+        assert_eq!(
+            disk_spec_of_node(&disks, "/dev/sdb:3"),
+            Some(DeviceArg::Partition(Box::new(DeviceArg::Disk(2)), 3))
+        );
+        assert_eq!(disk_spec_of_node(&disks, "/dev/sdb:0"), None);
+        assert_eq!(disk_spec_of_node(&disks, "/dev/sdc:1"), None);
+        disk_twin_ok();
+    }
+
+    fn disk_twin_ok() {
+        assert_eq!(disk_node_twin("/dev/rdisk3s2").as_deref(), Some("/dev/disk3s2"));
+        assert_eq!(disk_node_twin("/dev/disk3").as_deref(), Some("/dev/rdisk3"));
+        assert_eq!(disk_node_twin("/dev/disk/by-id/x"), None);
+        assert_eq!(disk_node_twin("/dev/sda"), None);
+    }
+
+    #[test]
+    fn dev_node_arguments_resolve_to_disks_on_the_platform() {
+        let plat = MockPlatform::new();
+        for (i, path) in [(0, "/dev/sda"), (2, "/dev/sdb"), (5, "/dev/nvme0n1")] {
+            plat.add_disk(i, MemDevice::new(1 << 20), DiskInfo { path: path.into(), ..Default::default() });
+        }
+        assert_eq!(parse_device_on(&plat, "/dev/nvme0n1").unwrap(), DeviceArg::Disk(5));
+        assert_eq!(
+            parse_device_on(&plat, "/dev/sdb:1").unwrap(),
+            DeviceArg::Partition(Box::new(DeviceArg::Disk(2)), 1)
+        );
+        // a partition node stays a volume; other syntaxes are untouched
+        assert_eq!(parse_device_on(&plat, "/dev/sdb1").unwrap(), DeviceArg::Volume("/dev/sdb1".into()));
+        assert_eq!(parse_device_on(&plat, "disk:2").unwrap(), DeviceArg::Disk(2));
+        // opened through the node, the device is the disk: the overlap checks see disk:2
+        let by_node = open_spec(&plat, "/dev/sdb", OpenMode::ReadOnly).unwrap();
+        let by_index = open_spec(&plat, "disk:2", OpenMode::ReadOnly).unwrap();
+        assert_eq!(by_node.identity, Identity::Disk(2));
+        assert!(by_node.overlaps(0, 512, &by_index));
+        // registered nodes (main) serve arguments parsed as a disk index
+        register_disk_nodes(plat.enumerate_disks().unwrap());
+        assert_eq!(registered_disk_of_node("/dev/sdb"), Some(2));
+        assert_eq!(registered_disk_of_node("/dev/sdz"), None);
+    }
+
+    /// A platform whose canonical volume ids drop the `r` of macOS raw nodes.
+    struct RawToBuffered(MockPlatform);
+
+    impl Platform for RawToBuffered {
+        fn enumerate_disks(&self) -> Result<Vec<DiskInfo>> { self.0.enumerate_disks() }
+        fn enumerate_volumes(&self) -> Result<Vec<VolumeInfo>> { self.0.enumerate_volumes() }
+        fn open_disk(&self, i: u32, m: OpenMode) -> Result<Box<dyn BlockDevice>> { self.0.open_disk(i, m) }
+        fn open_volume(&self, id: &VolumeId, m: OpenMode) -> Result<Box<dyn BlockDevice>> { self.0.open_volume(id, m) }
+        fn begin_write(&self, d: u32) -> Result<Box<dyn pm_platform::WriteSession>> { self.0.begin_write(d) }
+        fn mount(&self, id: &VolumeId, at: &pm_platform::MountPoint) -> Result<()> { self.0.mount(id, at) }
+        fn unmount(&self, id: &VolumeId, at: &pm_platform::MountPoint) -> Result<()> { self.0.unmount(id, at) }
+        fn set_offline(&self, d: u32, o: bool) -> Result<()> { self.0.set_offline(d, o) }
+        fn rescan(&self, d: u32) -> Result<()> { self.0.rescan(d) }
+        fn format(&self, id: &VolumeId, fs: pm_core::FsKind, l: &str, c: Option<u32>, q: bool, p: &dyn pm_core::ProgressSink) -> Result<()> {
+            self.0.format(id, fs, l, c, q, p)
+        }
+        fn shrink_volume(&self, id: &VolumeId, n: u64) -> Result<()> { self.0.shrink_volume(id, n) }
+        fn extend_volume(&self, id: &VolumeId, n: u64) -> Result<()> { self.0.extend_volume(id, n) }
+        fn smart(&self, d: u32) -> Result<Option<pm_platform::SmartData>> { self.0.smart(d) }
+        fn is_elevated(&self) -> bool { true }
+        fn system_disk(&self) -> Option<u32> { None }
+        fn free_letters(&self) -> Vec<char> { Vec::new() }
+        fn run_tool(&self, t: pm_platform::ExternalTool, a: &[String]) -> Result<String> { self.0.run_tool(t, a) }
+        fn canonical_volume_id(&self, id: &VolumeId) -> VolumeId {
+            VolumeId(id.0.replacen("/dev/rdisk", "/dev/disk", 1))
+        }
+    }
+
+    #[test]
+    fn typed_volume_ids_are_canonicalised_by_the_platform() {
+        let mock = MockPlatform::new();
+        mock.add_disk(2, MemDevice::new(1 << 20), DiskInfo { path: "/dev/rdisk2".into(), ..Default::default() });
+        mock.add_volume(VolumeInfo { id: VolumeId("/dev/disk2s1".into()), ..Default::default() }, 2, 4096, 8192);
+        let plat = RawToBuffered(mock);
+        assert_eq!(resolve_volume(&plat, "/dev/rdisk2s1").unwrap(), VolumeId("/dev/disk2s1".into()));
+        let a = open_spec(&plat, "/dev/rdisk2s1", OpenMode::ReadOnly).unwrap();
+        let b = open_spec(&plat, "/dev/disk2s1", OpenMode::ReadOnly).unwrap();
+        assert_eq!(a.identity, b.identity);
+        assert_eq!(a.disk_extent, Some((2, 4096, 4096 + 8192)));
+        // the whole disk under either name is disk:2, overlapping its slice
+        let disk = open_spec(&plat, "/dev/disk2", OpenMode::ReadOnly).unwrap();
+        assert_eq!(disk.identity, Identity::Disk(2));
+        assert!(disk.overlaps(0, 1 << 20, &a));
     }
 }

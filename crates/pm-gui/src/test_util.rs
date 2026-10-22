@@ -74,3 +74,11 @@ pub fn mbr_disk(index: u32) -> DiskInfo {
 pub fn model_of(disks: Vec<DiskInfo>) -> Model {
     Model { disks, volumes: Vec::new(), system_disk: None, windows_found: Vec::new() }
 }
+
+/// A platform that places every path under `dir` on a disk no test model has (disk 99), so
+/// files written there are on no source or target of the test.
+pub fn platform_placing(dir: &std::path::Path) -> std::sync::Arc<dyn pm_platform::Platform> {
+    let p = pm_platform::MockPlatform::new();
+    p.set_disk_of_path(dir, 99, None);
+    std::sync::Arc::new(p)
+}

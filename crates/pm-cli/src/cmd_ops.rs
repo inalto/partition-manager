@@ -25,11 +25,22 @@ pub struct OpRun {
     pub emit_json: bool,
 }
 
-/// `N` or `disk:N`.
+/// `N`, `disk:N` or (Linux, macOS) the disk's whole-disk node, e.g. `/dev/sdb`.
 pub fn disk_arg(s: &str) -> Result<u32, String> {
+    disk_arg_with(s, crate::device_arg::registered_disk_of_node)
+}
+
+/// [`disk_arg`] with `node_disk` resolving a `/dev/...` node to a disk index.
+fn disk_arg_with(s: &str, node_disk: impl Fn(&str) -> Option<u32>) -> Result<u32, String> {
+    if crate::device_arg::is_dev_node(s) {
+        return node_disk(s).ok_or_else(|| {
+            format!("'{s}' is not a whole disk of this system (see `pm list`; partitions are addressed by number)")
+        });
+    }
     let t = s.get(..5).filter(|p| p.eq_ignore_ascii_case("disk:")).map_or(s, |_| &s[5..]);
-    t.parse::<u32>()
-        .map_err(|_| format!("'{s}' is not a disk: expected its index, e.g. 1 or disk:1"))
+    t.parse::<u32>().map_err(|_| {
+        format!("'{s}' is not a disk: expected its index or node, e.g. 1, disk:1 or /dev/sdb")
+    })
 }
 
 /// A drive letter, or "no letter".
@@ -574,6 +585,10 @@ mod tests {
         assert!(disk_arg("x").is_err());
         assert!(disk_arg("disk:").is_err());
         assert!(disk_arg("-1").is_err());
+        let nodes = |n: &str| (n == "/dev/sdb").then_some(5);
+        assert_eq!(disk_arg_with("/dev/sdb", nodes), Ok(5));
+        assert!(disk_arg_with("/dev/sdb1", nodes).unwrap_err().contains("not a whole disk"));
+        assert_eq!(disk_arg_with("disk:2", nodes), Ok(2));
     }
 
     #[test]

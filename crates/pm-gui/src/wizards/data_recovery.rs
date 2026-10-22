@@ -66,25 +66,18 @@ pub fn deleted_scan_supported(fs: Option<FsKind>) -> bool {
     )
 }
 
-pub use crate::tools::path_letter as dest_letter;
-
-/// Why `dest` cannot receive recovered files from a device holding `source_letters`, if it
-/// cannot: recovered data must never be written onto the drive it is recovered from.
-pub fn dest_problem(dest: &str, source_letters: &[char]) -> Option<String> {
+/// Why `dest` cannot receive recovered files, if it cannot: it must be a full folder path,
+/// and recovered data must never be written onto the device it is recovered from
+/// (`on_source` says why a path is, or may be, on it).
+pub fn dest_problem(dest: &str, on_source: impl FnOnce(&str) -> Option<String>) -> Option<String> {
     let t = dest.trim();
     if t.is_empty() {
         return Some("Choose a destination folder.".into());
     }
-    let p = Path::new(t);
-    if !p.is_absolute() {
-        return Some("Enter a full folder path, e.g. D:\\Recovered.".into());
+    if !Path::new(t).is_absolute() {
+        return Some(format!("Enter a full folder path, e.g. {}.", crate::format_util::example_path("Recovered")));
     }
-    match dest_letter(p) {
-        Some(c) if source_letters.contains(&c) => Some(format!(
-            "'{t}' is on drive {c}:, the drive being recovered from; choose a destination on another drive."
-        )),
-        _ => None,
-    }
+    on_source(t)
 }
 
 /// What was scanned.
@@ -319,6 +312,8 @@ pub struct DataRecoveryWizard {
     search: String,
     category: Option<Category>,
     pub dest: String,
+    /// Where the platform places [`DataRecoveryWizard::dest`] (asked when the text changes).
+    dest_loc: crate::tools::PathLocation,
     restore_task: Option<Task<RestoreSummary>>,
     summary: Option<RestoreSummary>,
     save_path: String,
@@ -342,6 +337,7 @@ impl DataRecoveryWizard {
             search: String::new(),
             category: None,
             dest: String::new(),
+            dest_loc: Default::default(),
             restore_task: None,
             summary: None,
             save_path: String::new(),
@@ -358,15 +354,26 @@ impl DataRecoveryWizard {
         self.summary = None;
     }
 
-    /// The letters of the drive the files come from (the destination must avoid them).
-    fn source_letters(&self, m: &Model) -> Vec<char> {
+    /// The device the files come from (the destination must not be on it).
+    fn source_device(&self) -> Option<Device> {
         match &self.found {
-            Some((_, Some((d, _)))) => d.letters(m),
+            Some((_, Some((d, _)))) => Some(*d),
             _ => match &self.source {
-                Some(Source::Device(d)) => d.letters(m),
-                _ => Vec::new(),
+                Some(Source::Device(d)) => Some(*d),
+                _ => None,
             },
         }
+    }
+
+    /// Why the destination may not receive the files ([`dest_problem`] with the source device).
+    fn dest_check(&self, env: &ToolEnv) -> Option<String> {
+        let source = self.source_device();
+        dest_problem(&self.dest, |t| {
+            let d = source?;
+            let mounts = pm_ops::MountMap::new(&env.live.disks, &env.live.volumes);
+            let located = self.dest_loc.locate(Some(&**env.platform), t);
+            crate::tools::on_device_problem(&mounts, located, t, d, "destination", "the device being recovered from")
+        })
     }
 
     fn start_scan(&mut self, env: &ToolEnv) {
@@ -442,7 +449,7 @@ impl DataRecoveryWizard {
         }
         ui.horizontal(|ui| {
             ui.label("Save session:");
-            ui.add(egui::TextEdit::singleline(&mut self.save_path).desired_width(300.0).hint_text("D:\\scan.json"));
+            ui.add(egui::TextEdit::singleline(&mut self.save_path).desired_width(300.0).hint_text(crate::format_util::example_path("scan.json")));
             let ok = Path::new(self.save_path.trim()).is_absolute() && self.save_task.is_none();
             if ui.add_enabled(ok, egui::Button::new("Save session")).clicked() {
                 self.start_save(env);
@@ -498,7 +505,7 @@ impl DataRecoveryWizard {
         if is_session {
             ui.horizontal(|ui| {
                 ui.label("Session file:");
-                if ui.add(egui::TextEdit::singleline(&mut self.session_path).desired_width(360.0).hint_text("D:\\scan.json")).changed() {
+                if ui.add(egui::TextEdit::singleline(&mut self.session_path).desired_width(360.0).hint_text(crate::format_util::example_path("scan.json"))).changed() {
                     self.source = Some(Source::Session(self.session_path.clone()));
                 }
             });
@@ -652,15 +659,14 @@ impl DataRecoveryWizard {
 
     fn page_dest(&mut self, ui: &mut egui::Ui, env: &ToolEnv) -> Footer {
         ui.label("Restore the checked files into this folder (created if missing):");
-        ui.add(egui::TextEdit::singleline(&mut self.dest).desired_width(420.0).hint_text("D:\\Recovered"));
-        let letters = self.source_letters(env.live);
-        if !letters.is_empty() {
+        ui.add(egui::TextEdit::singleline(&mut self.dest).desired_width(420.0).hint_text(crate::format_util::example_path("Recovered")));
+        if let Some(d) = self.source_device() {
             ui.weak(format!(
-                "Not on {}: writing to the drive being recovered could overwrite the files.",
-                letters.iter().map(|c| format!("{c}:")).collect::<Vec<_>>().join(", ")
+                "Not on {}: writing to the device being recovered could overwrite the files.",
+                d.describe(env.live)
             ));
         }
-        let problem = dest_problem(&self.dest, &letters);
+        let problem = self.dest_check(env);
         Footer { back: true, next: Some(("Restore".into(), problem.is_none())), close: Some("Cancel".into()), problem }
     }
 
@@ -808,20 +814,27 @@ mod tests {
 
     #[test]
     fn destination_must_not_be_on_the_source() {
-        assert!(dest_problem("", &['E']).is_some());
-        assert!(dest_problem("Recovered", &[]).unwrap().contains("full folder path"));
-        // an absolute folder on no source drive is fine on every OS
+        let never = |_: &str| None;
+        assert!(dest_problem("", never).is_some());
+        assert!(dest_problem("Recovered", never).unwrap().contains("full folder path"));
         let ok = std::env::temp_dir().join("Recovered").display().to_string();
-        assert!(dest_problem(&ok, &[]).is_none());
-        // drive letters exist on Windows only (the mount-point equivalent is multi-platform Task D)
-        if cfg!(windows) {
-            let e = dest_problem("e:\\Recovered", &['E']).unwrap();
-            assert!(e.contains("drive E:"), "{e}");
-            assert!(dest_problem("\\\\?\\E:\\Recovered", &['E']).is_some(), "verbatim paths too");
-            assert!(dest_problem("D:\\Recovered", &['E']).is_none());
-            assert!(dest_problem("\\\\server\\share\\x", &['E']).is_none());
-            assert_eq!(dest_letter(Path::new("c:\\x")), Some('C'));
-        }
+        assert!(dest_problem(&ok, never).is_none());
+        assert_eq!(dest_problem(&ok, |t| Some(format!("on source: {t}"))), Some(format!("on source: {ok}")));
+        // in the wizard: the platform places the folder
+        use crate::tools::test_env::{model, platform};
+        let (m, p) = (model(), platform());
+        let env = ToolEnv { platform: &p, live: &m, pending: &[] };
+        let mut w = DataRecoveryWizard::new(Some(Device::Partition(1, 3)));
+        w.source = Some(Source::Device(Device::Partition(1, 3)));
+        w.dest = ok.clone();
+        assert_eq!(w.dest_check(&env), None, "the temporary folder is on a scratch disk");
+        // a folder the platform cannot place, while the source partition is mounted (E:)
+        let elsewhere = if cfg!(windows) { r"Q:\Recovered" } else { "/nonexistent-pm/Recovered" };
+        w.dest = elsewhere.into();
+        assert!(w.dest_check(&env).unwrap().contains("Cannot tell"));
+        // a source with nothing mounted: no path can be on it
+        w.source = Some(Source::Device(Device::Partition(1, 1)));
+        assert_eq!(w.dest_check(&env), None);
     }
 
     #[test]
@@ -945,7 +958,8 @@ trailer << >>
         w.source = Some(Source::Session(String::new()));
         w.page = 0;
         frame(&mut w, &env);
-        // the destination may not be on E:, where partition 3 is mounted
-        assert_eq!(w.source_letters(&m), ['E']);
+        // the destination may not be on partition 3 of Disk 1, the scanned device
+        w.source = Some(Source::Device(Device::Partition(1, 3)));
+        assert_eq!(w.source_device(), Some(Device::Partition(1, 3)));
     }
 }

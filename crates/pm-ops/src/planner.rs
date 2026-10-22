@@ -91,14 +91,46 @@ fn guard_container(d: &DiskInfo, p: &PartitionInfo, action: &str) -> Result<()> 
     Ok(())
 }
 
+/// Operations that rewrite the partition table (create, delete, resize/move, align, clone or
+/// restore into free space) need an MBR or GPT disk.
+///
+/// A `TableKind::Unknown` disk is one whose table the platform could not read (Linux/macOS
+/// without root): its partitions come from the OS (sysfs / `diskutil`), and on macOS their
+/// starts are only approximate, so nothing may be written from them.
 fn require_table(d: &DiskInfo) -> Result<()> {
     match d.table {
         TableKind::Mbr | TableKind::Gpt => Ok(()),
-        _ => invalid(format!(
+        TableKind::Unknown => invalid(format!(
+            "The partition table of Disk {} could not be read, so its partition offsets are not \
+             exact; reload the disk list with the rights to read the disk",
+            d.index
+        )),
+        TableKind::None => invalid(format!(
             "Disk {} is not initialized (it has no partition table)",
             d.index
         )),
     }
+}
+
+/// Reading or overwriting the data of an existing partition (wipe it, image it, clone it)
+/// needs its exact byte range.
+///
+/// Ruling (multi-platform Task D): the range is exact on an MBR or GPT disk, and on a disk
+/// without a partition table (`TableKind::None`) whose only partition is the whole-disk
+/// filesystem the platform reported at offset 0 covering the entire disk (a "superfloppy" USB
+/// stick, a WSL virtual disk; Linux reports it as such a pseudo-partition, Windows reports a
+/// superfloppy as an MBR disk with one partition at offset 0). Every other layout, in
+/// particular a `TableKind::Unknown` disk with approximate starts, is refused like
+/// [`require_table`].
+fn require_exact_range(d: &DiskInfo, p: &PartitionInfo) -> Result<()> {
+    let whole_disk = d.table == TableKind::None
+        && d.partitions.len() == 1
+        && p.start == 0
+        && p.len == d.size;
+    if whole_disk {
+        return Ok(());
+    }
+    require_table(d)
 }
 
 fn ptype_fits(kind: TableKind, t: PartitionType) -> bool {
@@ -271,6 +303,7 @@ impl Planner {
             Operation::DeletePartition { disk, number } => {
                 let p = part_ref(&m, *disk, *number)?.clone();
                 guard_windows(&m, *disk, &p, "delete")?;
+                require_table(disk_ref(&m, *disk)?)?;
                 let d = disk_mut(&mut m, *disk)?;
                 if is_container(d.table, &p) && d.partitions.iter().any(|q| q.logical) {
                     return invalid(format!(
@@ -364,6 +397,7 @@ impl Planner {
                 let p = part_ref(&m, *disk, *number)?.clone();
                 guard_windows(&m, *disk, &p, "wipe")?;
                 guard_container(disk_ref(&m, *disk)?, &p, "wipe")?;
+                require_exact_range(disk_ref(&m, *disk)?, &p)?;
                 let q = part_mut(&mut m, *disk, *number)?;
                 q.used = Some(0);
                 q.fs = None;
@@ -406,7 +440,8 @@ impl Planner {
                 check_image_path(path, &format!("Disk {disk}"))?;
             }
             Operation::ImagePartition { disk, number, path, .. } => {
-                part_ref(&m, *disk, *number)?;
+                let p = part_ref(&m, *disk, *number)?;
+                require_exact_range(disk_ref(&m, *disk)?, p)?;
                 check_image_path(path, &format!("partition {number} on Disk {disk}"))?;
             }
             Operation::RestoreImage { path, dst_disk, dst_start } => {
@@ -556,6 +591,7 @@ fn create(
 
 fn resize_move(m: &mut Model, disk: u32, number: u32, new_start: u64, new_len: u64) -> Result<()> {
     let p = part_ref(m, disk, number)?.clone();
+    require_table(disk_ref(m, disk)?)?;
     let size = disk_ref(m, disk)?.size;
     let moving = new_start != p.start;
     if moving && m.is_windows_partition(disk, &p) {
@@ -822,6 +858,7 @@ fn clone_partition(
 ) -> Result<()> {
     let src = part_ref(m, src_disk, src_number)?.clone();
     guard_container(disk_ref(m, src_disk)?, &src, "clone")?;
+    require_exact_range(disk_ref(m, src_disk)?, &src)?;
     let d = disk_ref(m, dst_disk)?;
     require_table(d)?;
     let ss = (d.sector_size.max(512)) as u64;
