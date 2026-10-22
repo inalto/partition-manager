@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// Directories searched after `PATH`.
+/// System directories: searched after `PATH` normally, and first when running as root.
 const SYSTEM_DIRS: [&str; 6] = ["/sbin", "/usr/sbin", "/bin", "/usr/bin", "/usr/local/sbin", "/usr/local/bin"];
 
 fn is_executable(p: &Path) -> bool {
@@ -19,21 +19,52 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Full path of `tool`: a name containing `/` is taken as is, otherwise the first executable
-/// match on `PATH`, then in `/sbin`, `/usr/sbin` and the other system directories.
-pub fn find_tool(tool: &str) -> Option<PathBuf> {
+/// Owned by root and writable by nobody else (no group / world write bit).
+fn root_controlled(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0)
+}
+
+/// Whether root may run `bin` found in the `PATH` directory `dir`: both must be controlled by
+/// root alone, otherwise another user could plant a `mkfs.vfat` that root then runs.
+pub fn trusted_for_root(dir: &Path, bin: &Path) -> bool {
+    root_controlled(dir) && root_controlled(bin)
+}
+
+/// [`find_tool`] over explicit `PATH` directories. As root the system directories come first
+/// and a `PATH` match is accepted only when [`trusted_for_root`] (a `PATH` kept through
+/// `sudo -E`, `su -m` or a distro without `secure_path` cannot redirect root to a user's
+/// binary); otherwise `PATH` comes first.
+pub fn find_tool_in(tool: &str, path_dirs: &[PathBuf], as_root: bool) -> Option<PathBuf> {
     if tool.contains('/') {
         let p = PathBuf::from(tool);
-        return is_executable(&p).then_some(p);
+        return (is_executable(&p) && (!as_root || p.parent().is_some_and(|d| trusted_for_root(d, &p)))).then_some(p);
     }
+    let system = SYSTEM_DIRS.iter().map(PathBuf::from).map(|d| d.join(tool)).find(|p| is_executable(p));
+    let from_path = || {
+        path_dirs
+            .iter()
+            .filter(|d| d.is_absolute())
+            .map(|d| (d, d.join(tool)))
+            .find(|(d, p)| is_executable(p) && (!as_root || trusted_for_root(d, p)))
+            .map(|(_, p)| p)
+    };
+    if as_root {
+        system.or_else(from_path)
+    } else {
+        from_path().or(system)
+    }
+}
+
+/// Full path of `tool`: a name containing `/` is taken as is, otherwise the first executable
+/// match on `PATH`, then in `/sbin`, `/usr/sbin` and the other system directories — as root,
+/// the system directories first and only root-controlled `PATH` entries (see
+/// [`find_tool_in`]).
+pub fn find_tool(tool: &str) -> Option<PathBuf> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|v| std::env::split_paths(&v).filter(|d| d.is_absolute()).collect())
+        .map(|v| std::env::split_paths(&v).collect())
         .unwrap_or_default();
-    path_dirs
-        .into_iter()
-        .chain(SYSTEM_DIRS.iter().map(PathBuf::from))
-        .map(|d| d.join(tool))
-        .find(|p| is_executable(p))
+    find_tool_in(tool, &path_dirs, super::is_root())
 }
 
 /// Whether `tool` is installed (see [`find_tool`]).
@@ -100,6 +131,35 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(find_tool("/nonexistent/sh").is_none());
+    }
+
+    #[test]
+    fn root_prefers_system_dirs_and_rejects_writable_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().to_path_buf();
+        for name in ["sh", "pm-only-here"] {
+            let p = dir.join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // a group/world-writable directory is never trusted, whoever owns it
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = vec![dir.clone()];
+        // as a normal user PATH wins
+        assert_eq!(find_tool_in("sh", &path, false), Some(dir.join("sh")));
+        assert_eq!(find_tool_in("pm-only-here", &path, false), Some(dir.join("pm-only-here")));
+        // as root the system copy wins and the untrusted PATH entry is ignored
+        let sys_sh = find_tool_in("sh", &path, true).unwrap();
+        assert!(SYSTEM_DIRS.iter().any(|d| sys_sh.starts_with(d)), "{}", sys_sh.display());
+        assert_eq!(find_tool_in("pm-only-here", &path, true), None);
+        assert_eq!(find_tool_in(&dir.join("pm-only-here").to_string_lossy(), &[], true), None);
+        assert!(!trusted_for_root(&dir, &dir.join("sh")));
+        // root-owned, non-writable system locations are trusted
+        let bin = Path::new("/bin");
+        if let Some(sh) = ["/bin/sh", "/usr/bin/sh"].iter().map(Path::new).find(|p| p.exists()) {
+            assert!(trusted_for_root(sh.parent().unwrap_or(bin), sh));
+        }
     }
 
     #[test]

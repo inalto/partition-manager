@@ -46,6 +46,8 @@ pub const BLKRRPART: u32 = blk_io(95);
 pub const BLKSSZGET: u32 = blk_io(104);
 pub const BLKPBSZGET: u32 = blk_io(123);
 pub const BLKGETSIZE64: u32 = blk_ior(114, std::mem::size_of::<usize>());
+/// `_IOR(0x12, 128, __u64)`, Linux 5.15+.
+pub const BLKGETDISKSEQ: u32 = blk_ior(128, 8);
 
 /// `ioctl(fd, req, &mut out)` for a request that writes a `T`.
 fn ioctl_out<T: Copy + Default>(fd: BorrowedFd<'_>, req: u32) -> io::Result<T> {
@@ -75,6 +77,12 @@ fn ioctl_none(fd: BorrowedFd<'_>, req: u32) -> io::Result<()> {
 /// Device size in bytes.
 pub fn size_bytes(fd: BorrowedFd<'_>) -> io::Result<u64> {
     ioctl_out::<u64>(fd, BLKGETSIZE64)
+}
+
+/// The disk sequence number: unique per attached medium since boot (Linux 5.15+; `ENOTTY`
+/// before), so a different disk under the same name is recognised.
+pub fn diskseq(fd: BorrowedFd<'_>) -> io::Result<u64> {
+    ioctl_out::<u64>(fd, BLKGETDISKSEQ)
 }
 
 /// Logical sector size.
@@ -180,6 +188,7 @@ mod tests {
             assert_eq!(BLKRRPART, 0x125F);
             assert_eq!(BLKROGET, 0x125E);
             assert_eq!(BLKGETSIZE64, 0x8008_1272);
+            assert_eq!(BLKGETDISKSEQ, 0x8008_1280);
         }
     }
 

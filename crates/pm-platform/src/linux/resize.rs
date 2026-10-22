@@ -35,20 +35,32 @@ pub fn resize_steps(fs: FsKind, dev: &str, new_len: u64) -> Result<Vec<Step>> {
     }
 }
 
+/// The error for a failed step: an NTFS volume `ntfsresize` refuses because it is marked dirty
+/// (scheduled for a consistency check) gets an actionable message.
+pub fn step_error(tool: &str, code: Option<i32>, text: &str) -> Error {
+    let lower = text.to_ascii_lowercase();
+    if tool == "ntfsresize" && (lower.contains("scheduled for check") || lower.contains("dirty")) {
+        return Error::Invalid(format!(
+            "the NTFS volume is marked dirty (scheduled for a consistency check): run `chkdsk /f`              on it in Windows (or `ntfsfix -d` here) and retry. ntfsresize said: {text}"
+        ));
+    }
+    Error::Platform { code: code.map_or(u32::MAX, |c| c as u32), msg: format!("{tool} failed: {text}") }
+}
+
 fn run_step(s: &Step) -> Result<()> {
     let out = cmd::output(s.tool, &s.args)?;
     match out.status.code() {
         Some(c) if s.ok_codes.contains(&c) => Ok(()),
-        code => Err(Error::Platform {
-            code: code.map_or(u32::MAX, |c| c as u32),
-            msg: format!("{} failed: {}", s.tool, cmd::failure_text(&out)),
-        }),
+        code => Err(step_error(s.tool, code, &cmd::failure_text(&out))),
     }
 }
 
 /// Resize the filesystem of volume `id` to `new_len` bytes (shrink or grow).
-pub fn resize(id: &VolumeId, new_len: u64) -> Result<()> {
-    let dev = ready_node(id)?;
+/// `start` is where the last enumeration placed the volume (checked against the kernel; the
+/// length is not, since growing the partition first is the normal way to extend).
+pub fn resize(id: &VolumeId, start: Option<u64>, new_len: u64) -> Result<()> {
+    let dev = ready_node(id, start.map(|s| (s, None)))?;
+    let dev = dev.as_str();
     ensure_unmounted(dev)?;
     let fs = detect_fs(dev).ok_or_else(|| Error::Unsupported(format!("no recognizable filesystem on {dev}")))?;
     for s in resize_steps(fs, dev, new_len)? {
@@ -73,6 +85,17 @@ mod tests {
         assert_eq!((s[1].tool, s[1].args.join(" ")), ("resize2fs", "/dev/sdb3 2097152s".to_string()));
         assert!(matches!(resize_steps(FsKind::Xfs, "/dev/x", 1), Err(Error::Unsupported(_))));
         assert!(matches!(resize_steps(FsKind::Fat32, "/dev/x", 1), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn dirty_ntfs_gets_a_clear_message() {
+        let text = "Volume is scheduled for check.
+Run chkdsk /f and please try again, or see option -f.";
+        match step_error("ntfsresize", Some(1), text) {
+            Error::Invalid(m) => assert!(m.contains("marked dirty") && m.contains("chkdsk /f"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(step_error("resize2fs", Some(1), "dirty"), Error::Platform { code: 1, .. }));
     }
 
     #[test]

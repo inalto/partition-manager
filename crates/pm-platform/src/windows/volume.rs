@@ -79,7 +79,14 @@ pub fn volume_of_path<'a>(path: &str, volumes: &'a [VolumeInfo]) -> Option<&'a V
     let key = mount_key(path);
     volumes
         .iter()
-        .flat_map(|v| v.mount_points.iter().map(move |m| (mount_key(m), v)))
+        .flat_map(|v| {
+            // the volume's own `\\?\Volume{GUID}\` name too: `canonicalize` gives that form
+            // for a path on a volume without a drive letter
+            v.mount_points
+                .iter()
+                .chain(std::iter::once(&v.id.0))
+                .map(move |m| (mount_key(m), v))
+        })
         .filter(|(m, _)| key.starts_with(m.as_str()))
         .max_by_key(|(m, _)| m.len())
         .map(|(_, v)| v)
@@ -121,5 +128,10 @@ mod tests {
         assert_eq!(of(r"C:\mnt\e\x"), Some("e"));
         assert_eq!(of(r"F:\x"), None);
         assert_eq!(of(r"\\?\UNC\server\share\x"), None);
+        // a volume without a mount point, reached through its GUID path
+        let vols = [vol(r"\\?\Volume{AbC-1}\", &[]), vol("c", &[r"C:\"])];
+        let of = |p: &str| volume_of_path(p, &vols).map(|v| v.id.0.as_str());
+        assert_eq!(of(r"\\?\Volume{abc-1}\dir\f.img"), Some(r"\\?\Volume{AbC-1}\"));
+        assert_eq!(of(r"\\?\Volume{abc-10}\f"), None, "whole components only");
     }
 }

@@ -149,12 +149,106 @@ fn partitions(dir: &Path) -> Vec<PartitionInfo> {
     parts
 }
 
+/// udev's device database.
+pub const UDEV_DATA: &str = "/run/udev/data";
+
+/// The unit serial number from a SCSI VPD page 0x80 (`device/vpd_pg80`): byte 1 is the page
+/// code, bytes 2..4 the big-endian length, then the ASCII serial.
+pub fn parse_vpd_pg80(page: &[u8]) -> Option<String> {
+    if page.len() < 4 || page[1] != 0x80 {
+        return None;
+    }
+    let len = u16::from_be_bytes([page[2], page[3]]) as usize;
+    let raw = page.get(4..4 + len).unwrap_or(&page[4..]);
+    let s: String = raw.iter().filter(|b| b.is_ascii_graphic() || **b == b' ').map(|&b| b as char).collect();
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// `E:<key>=<value>` from a udev database record.
+fn udev_property(record: &str, key: &str) -> Option<String> {
+    record.lines().find_map(|l| {
+        let (k, v) = l.strip_prefix("E:")?.split_once('=')?;
+        (k == key && !v.trim().is_empty()).then(|| v.trim().to_string())
+    })
+}
+
+/// The disk's serial number, so the same disk is recognised across enumerations even when
+/// the kernel exposes no `serial` attribute (SATA, USB): udev's `ID_SERIAL_SHORT`
+/// (`<udev>/b<major>:<minor>`), then `device/serial` (NVMe, MMC), `serial` (virtio),
+/// `device/wwid` and the SCSI VPD page 0x80.
+pub fn serial(dir: &Path, udev: &Path) -> Option<String> {
+    let nonempty = |s: Option<String>| s.filter(|s| !s.is_empty());
+    let from_udev = read_trimmed(&dir.join("dev"))
+        .and_then(|majmin| std::fs::read_to_string(udev.join(format!("b{majmin}"))).ok())
+        .and_then(|rec| udev_property(&rec, "ID_SERIAL_SHORT"));
+    nonempty(from_udev)
+        .or_else(|| nonempty(read_trimmed(&dir.join("device/serial"))))
+        .or_else(|| nonempty(read_trimmed(&dir.join("serial"))))
+        .or_else(|| nonempty(read_trimmed(&dir.join("device/wwid"))))
+        .or_else(|| std::fs::read(dir.join("device/vpd_pg80")).ok().and_then(|p| parse_vpd_pg80(&p)))
+}
+
+/// What a device node may be used as for volume operations (mount, format, resize, open).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    /// A partition of the managed disk `disk`.
+    Partition { disk: String },
+    /// A managed disk without kernel partitions (a filesystem on the whole disk).
+    WholeDisk,
+}
+
+fn has_kernel_partitions(disk_dir: &Path) -> bool {
+    std::fs::read_dir(disk_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).any(|e| e.path().join("partition").exists()))
+        .unwrap_or(false)
+}
+
+/// Classify the block device `name` through `<class>/<name>` (`/sys/class/block`) against the
+/// managed disks under `block_root` (`/sys/block`). Refused: unknown devices, partitions of
+/// unmanaged devices, device-mapper / md / zram / optical / unattached loop nodes, and a whole
+/// disk that has partitions (a volume operation on it would overwrite the partition table).
+pub fn classify_node(class: &Path, block_root: &Path, name: &str) -> std::result::Result<NodeKind, String> {
+    let entry = class.join(name);
+    if !entry.exists() {
+        return Err(format!("/dev/{name} is not a block device known to the kernel"));
+    }
+    let managed = |disk: &str| block_root.join(disk).exists() && is_managed(disk, &block_root.join(disk));
+    if entry.join("partition").exists() {
+        let canonical = std::fs::canonicalize(&entry).map_err(|e| format!("/dev/{name}: {e}"))?;
+        let disk = canonical
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        return if managed(&disk) {
+            Ok(NodeKind::Partition { disk })
+        } else {
+            Err(format!("/dev/{name} is a partition of /dev/{disk}, which this program does not manage"))
+        };
+    }
+    if !managed(name) {
+        return Err(format!("/dev/{name} is not a disk or partition this program manages"));
+    }
+    if has_kernel_partitions(&block_root.join(name)) {
+        return Err(format!(
+            "/dev/{name} is a whole disk with partitions: use one of its partitions"
+        ));
+    }
+    Ok(NodeKind::WholeDisk)
+}
+
+/// The disk sequence number (`<root>/<name>/diskseq`, Linux 5.15+).
+pub fn diskseq(root: &Path, name: &str) -> Option<u64> {
+    read_u64(&root.join(name).join("diskseq"))
+}
+
 fn canonical_string(p: &Path) -> String {
     std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// One disk from `<root>/<name>`.
-fn disk(root: &Path, name: &str, index: u32) -> Option<DiskInfo> {
+fn disk(root: &Path, udev: &Path, name: &str, index: u32) -> Option<DiskInfo> {
     let dir: PathBuf = root.join(name);
     let size = read_u64(&dir.join("size"))?.saturating_mul(SYSFS_SECTOR);
     if size == 0 {
@@ -164,9 +258,7 @@ fn disk(root: &Path, name: &str, index: u32) -> Option<DiskInfo> {
     let logical = read_u64(&q.join("logical_block_size")).filter(|&v| v > 0).unwrap_or(512) as u32;
     let physical = read_u64(&q.join("physical_block_size")).filter(|&v| v > 0).unwrap_or(logical as u64) as u32;
     let device_path = format!("{} {}", canonical_string(&dir), canonical_string(&dir.join("device")));
-    let serial = read_trimmed(&dir.join("device/serial"))
-        .or_else(|| read_trimmed(&dir.join("serial")))
-        .unwrap_or_default();
+    let serial = serial(&dir, udev).unwrap_or_default();
     let mut d = DiskInfo {
         index,
         path: format!("/dev/{name}"),
@@ -189,9 +281,14 @@ fn disk(root: &Path, name: &str, index: u32) -> Option<DiskInfo> {
 /// list. Table kind, partition types and filesystems are not known here (see
 /// [`super::LinuxPlatform`], which reads the device); partitions come from sysfs.
 pub fn parse_block_dir(root: &Path) -> Vec<DiskInfo> {
+    parse_block_dir_with(root, Path::new(UDEV_DATA))
+}
+
+/// [`parse_block_dir`] with the udev database in `udev` instead of `/run/udev/data`.
+pub fn parse_block_dir_with(root: &Path, udev: &Path) -> Vec<DiskInfo> {
     disk_names(root)
         .iter()
-        .filter_map(|n| disk(root, n, 0))
+        .filter_map(|n| disk(root, udev, n, 0))
         .enumerate()
         .map(|(i, mut d)| {
             d.index = i as u32;

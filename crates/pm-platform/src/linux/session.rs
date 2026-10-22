@@ -2,41 +2,87 @@
 //!
 //! `begin_write`:
 //! 1. refuse (`Error::Busy`) when a partition of the disk is held by device-mapper / md
-//!    (`holders/`) or is an active swap area;
-//! 2. unmount every filesystem of the disk listed in `/proc/mounts`, deepest mount point
-//!    first. On the FIRST failure everything already unmounted is mounted again and the
-//!    session is refused with `Error::Busy` — a failed `begin_write` never leaves a filesystem
-//!    unmounted ([`unmount_all`]);
+//!    (`holders/`) or is an active swap area, or when one of the disk's mounts could not be
+//!    restored faithfully: a bind mount or btrfs subvolume (its root is not `/`) or a mount
+//!    hidden under a later mount ([`mount_conflicts`]);
+//! 2. unmount every filesystem of the disk (`/proc/self/mountinfo`), deepest mount point
+//!    first. On the FIRST failure everything already unmounted is mounted again — same device,
+//!    type, per-mount flags and filesystem options, mount-point directory recreated if needed —
+//!    and the session is refused with `Error::Busy`: a failed `begin_write` never leaves a
+//!    filesystem unmounted ([`unmount_all`]);
 //! 3. open the disk `O_RDWR | O_EXCL` (the kernel refuses while anything still mounts or
 //!    claims it, e.g. a mount in another namespace) and take `flock(LOCK_EX | LOCK_NB)` (the
 //!    lock udev and `systemd-repart` honour), retrying for ~2 s because udev holds the lock
-//!    briefly while it probes. Failure: re-mount, `Error::Busy`.
+//!    briefly while it probes; then check that the opened disk is still the one the caller
+//!    enumerated (the `verify` callback: disk sequence number, or name + size). Failure:
+//!    re-mount, error.
 //!
 //! `commit_table` writes the table, `fsync`s and re-reads it with `BLKRRPART` (`EBUSY` retried
-//! 3 times 300 ms apart, then `partprobe`). `finish` (and `Drop`) `fsync`, unlock, close and
-//! re-read the table once more (holding the lock, so udev does not re-read it a second time
-//! behind our back), then wait for udev (`udevadm settle`). Filesystems unmounted by the
-//! session are deliberately NOT mounted again after a successful session: the layout may have
-//! changed underneath them; a refresh shows them unmounted and the user mounts what they want.
+//! 3 times 300 ms apart, then `partprobe`). `finish` (and `Drop`) `fsync`, unlock, close and,
+//! when something was written, re-read the table once more (holding the lock, so udev does not
+//! re-read it a second time behind our back), then wait for udev (`udevadm settle`) and mount
+//! the unmounted filesystems again: all of them when the session wrote nothing, otherwise those
+//! whose partition node still exists with the same start and length (like Windows, which
+//! remounts the volumes it finds after the disk comes back).
 
 use super::ioctl;
-use super::mounts::MountEntry;
+use super::mounts::{mount_conflicts, MountEntry};
 use crate::posix::{cmd, os_error, FdDevice};
 use crate::traits::WriteSession;
-use pm_core::{BlockDevice, Error, Result};
+use pm_core::{BlockDevice, DiskInfo, Error, Result};
 use pm_parttable::{write_table, Table};
 use std::io;
+use std::os::fd::BorrowedFd;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 const REREAD_ATTEMPTS: u32 = 3;
 const REREAD_DELAY: Duration = Duration::from_millis(300);
 
 /// Unmounting and mounting, injectable so the rollback logic can be unit-tested.
-pub trait Mounter {
+pub trait Mounter: Send + Sync {
     fn unmount(&self, mount_point: &str) -> io::Result<()>;
-    /// Mount `e.device` at `e.mount_point` again with `e.fstype` (read-only if it was).
+    /// Mount `e.device` at `e.mount_point` again as it was: `e.fstype`, the per-mount flags
+    /// of `e.options` and the filesystem options of `e.super_options`.
     fn remount(&self, e: &MountEntry) -> io::Result<()>;
+}
+
+/// `MS_*` flags for the per-mount options of a mountinfo line.
+pub fn vfs_flags(options: &str) -> libc::c_ulong {
+    options.split(',').fold(0, |f, o| {
+        f | match o {
+            "ro" => libc::MS_RDONLY,
+            "nosuid" => libc::MS_NOSUID,
+            "nodev" => libc::MS_NODEV,
+            "noexec" => libc::MS_NOEXEC,
+            "noatime" => libc::MS_NOATIME,
+            "nodiratime" => libc::MS_NODIRATIME,
+            "relatime" => libc::MS_RELATIME,
+            "strictatime" => libc::MS_STRICTATIME,
+            "sync" => libc::MS_SYNCHRONOUS,
+            "dirsync" => libc::MS_DIRSYNC,
+            _ => 0,
+        }
+    })
+}
+
+/// The filesystem options to pass as `mount(2)` data: the superblock options without the
+/// read-only / read-write state (carried by the flags) and SELinux's `seclabel` marker.
+pub fn fs_data(super_options: &str) -> String {
+    super_options
+        .split(',')
+        .filter(|o| !o.is_empty() && !matches!(*o, "rw" | "ro" | "seclabel"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `-o` for the `mount` command: per-mount options followed by the filesystem options.
+pub fn command_options(e: &MountEntry) -> String {
+    let mut v: Vec<&str> = e.options.split(',').filter(|o| !o.is_empty()).collect();
+    let data = fs_data(&e.super_options);
+    v.extend(data.split(',').filter(|o| !o.is_empty()));
+    v.join(",")
 }
 
 /// The real system calls (`umount2`, `mount(2)`), with the `mount` command as a fallback for
@@ -49,20 +95,34 @@ impl Mounter for SystemMounter {
     }
 
     fn remount(&self, e: &MountEntry) -> io::Result<()> {
-        let flags = if e.read_only() { libc::MS_RDONLY } else { 0 };
-        let first = match ioctl::mount(&e.device, &e.mount_point, &e.fstype, flags, None) {
+        // a desktop automounter may have removed its directory under /media
+        if !Path::new(&e.mount_point).exists() {
+            std::fs::create_dir_all(&e.mount_point)?;
+        }
+        let data = fs_data(&e.super_options);
+        let data = (!data.is_empty()).then_some(data.as_str());
+        let first = match ioctl::mount(&e.device, &e.mount_point, &e.fstype, vfs_flags(&e.options), data) {
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
-        let mut args: Vec<&str> = Vec::new();
-        if !e.fstype.starts_with("fuse") {
-            args.extend(["-t", e.fstype.as_str()]);
+        let opts = command_options(e);
+        let attempt = |opts: &str| {
+            let mut args: Vec<&str> = Vec::new();
+            if !e.fstype.starts_with("fuse") {
+                args.extend(["-t", e.fstype.as_str()]);
+            }
+            if !opts.is_empty() {
+                args.extend(["-o", opts]);
+            }
+            args.extend([e.device.as_str(), e.mount_point.as_str()]);
+            cmd::run("mount", &args)
+        };
+        let mut result = attempt(&opts);
+        if result.is_err() && e.fstype.starts_with("fuse") {
+            // FUSE reports options of its own (user_id=, blksize=) the helper may not accept
+            result = attempt(&e.options);
         }
-        if e.read_only() {
-            args.extend(["-o", "ro"]);
-        }
-        args.extend([e.device.as_str(), e.mount_point.as_str()]);
-        match cmd::run("mount", &args) {
+        match result {
             Ok(_) => Ok(()),
             Err(cmd_err) => {
                 log::warn!("re-mount {} at {}: {first}; mount command: {cmd_err}", e.device, e.mount_point);
@@ -151,7 +211,7 @@ pub fn users_of_disk(sys_disk_dir: &Path, nodes: &[String], swaps: &[String]) ->
 /// Re-read the partition table of the open disk: `BLKRRPART`, `EBUSY` retried, then
 /// `partprobe`. A loop device attached without partition scanning (`losetup` without `-P`)
 /// rejects the request with `EINVAL`; that is logged, not an error.
-pub fn reread(fd: std::os::fd::BorrowedFd<'_>, path: &str) -> Result<()> {
+pub fn reread(fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     let mut last = None;
     for attempt in 0..REREAD_ATTEMPTS {
         match ioctl::reread_partitions(fd) {
@@ -229,15 +289,26 @@ fn open_exclusive(path: &str) -> Result<FdDevice> {
     }
 }
 
-/// Start a write session on disk `index` (`d` is its current description, `sys_disk_dir` its
-/// `/sys/block/<dev>` directory); see the module documentation.
+/// A filesystem the session unmounted, with the byte range of its partition (`None` for a
+/// filesystem on the whole disk).
+#[derive(Clone, Debug)]
+pub struct Unmounted {
+    pub entry: MountEntry,
+    pub extent: Option<(u64, u64)>,
+}
+
+/// Start a write session on disk `index` (`d` is its current description with the kernel's
+/// partitions, `sys_disk_dir` its `/sys/block/<dev>` directory, `mounts` the mount table in
+/// kernel order); `verify` checks that the opened disk is the one the caller enumerated. See
+/// the module documentation.
 pub fn begin_write(
     index: u32,
-    d: &pm_core::DiskInfo,
+    d: &DiskInfo,
     sys_disk_dir: &Path,
     mounts: &[MountEntry],
     swaps: &[String],
-    mounter: &dyn Mounter,
+    mounter: Arc<dyn Mounter>,
+    verify: &dyn Fn(BorrowedFd<'_>) -> Result<()>,
 ) -> Result<Box<dyn WriteSession>> {
     let mut nodes = vec![d.path.clone()];
     nodes.extend(d.partitions.iter().filter_map(|p| p.volume.as_ref().map(|v| v.0.clone())));
@@ -246,14 +317,32 @@ pub fn begin_write(
         return Err(Error::Busy(users.join("; ")));
     }
     let mine: Vec<MountEntry> = mounts.iter().filter(|e| nodes.contains(&e.device)).cloned().collect();
-    let unmounted = unmount_all(mounter, &mine)?;
+    let conflicts = mount_conflicts(&mine, mounts);
+    if !conflicts.is_empty() {
+        return Err(Error::Busy(conflicts.join("; ")));
+    }
+    let unmounted = unmount_all(&*mounter, &mine)?;
     if !unmounted.is_empty() {
         udev_settle(); // unmounting makes udev probe the partitions (and lock the disk)
     }
-    match open_exclusive(&d.path) {
-        Ok(dev) => Ok(Box::new(LinuxWriteSession::new(index, dev))),
+    let opened = open_exclusive(&d.path).and_then(|dev| verify(dev.fd()).map(|()| dev));
+    match opened {
+        Ok(dev) => {
+            let unmounted = unmounted
+                .into_iter()
+                .map(|entry| {
+                    let extent = d
+                        .partitions
+                        .iter()
+                        .find(|p| p.volume.as_ref().is_some_and(|v| v.0 == entry.device))
+                        .map(|p| (p.start, p.len));
+                    Unmounted { entry, extent }
+                })
+                .collect();
+            Ok(Box::new(LinuxWriteSession::new(index, dev, unmounted, mounter)))
+        }
         Err(e) => {
-            let failed = remount_all(mounter, &unmounted);
+            let failed = remount_all(&*mounter, &unmounted);
             Err(match e {
                 Error::Busy(msg) => busy(msg, unmounted.len(), failed),
                 other if failed.is_empty() => other,
@@ -263,20 +352,62 @@ pub fn begin_write(
     }
 }
 
+/// The session's device: records whether anything was written.
+struct Tracked {
+    dev: FdDevice,
+    wrote: bool,
+}
+
+impl BlockDevice for Tracked {
+    fn len(&self) -> u64 {
+        self.dev.len()
+    }
+    fn sector_size(&self) -> u32 {
+        self.dev.sector_size()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.dev.read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.wrote = true;
+        self.dev.write_at(offset, buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.dev.flush()
+    }
+    fn is_read_only(&self) -> bool {
+        self.dev.is_read_only()
+    }
+}
+
+/// Whether partition node `node` still exists with byte range `extent`.
+fn still_there(node: &str, extent: (u64, u64)) -> bool {
+    Path::new(node).exists() && super::mount::kernel_extent(node.trim_start_matches("/dev/")) == Some(extent)
+}
+
 /// Write session on one Linux disk; see the module documentation.
 pub struct LinuxWriteSession {
     disk: u32,
     path: String,
-    device: Option<FdDevice>,
+    device: Option<Tracked>,
+    unmounted: Vec<Unmounted>,
+    mounter: Arc<dyn Mounter>,
 }
 
 impl LinuxWriteSession {
-    /// Wrap an opened, locked disk.
-    pub fn new(disk: u32, device: FdDevice) -> Self {
-        LinuxWriteSession { disk, path: device.path().to_string(), device: Some(device) }
+    /// Wrap an opened, locked disk; `unmounted` (in unmount order) is mounted again at the end.
+    pub fn new(disk: u32, device: FdDevice, unmounted: Vec<Unmounted>, mounter: Arc<dyn Mounter>) -> Self {
+        LinuxWriteSession {
+            disk,
+            path: device.path().to_string(),
+            device: Some(Tracked { dev: device, wrote: false }),
+            unmounted,
+            mounter,
+        }
     }
 
-    /// fsync, unlock, close, re-read the table. Every step runs; the first error is returned.
+    /// fsync, unlock, close, re-read the table, mount again. Every step runs; the first error
+    /// is returned.
     ///
     /// The lock is handed over to a read-only descriptor before the writable one is closed:
     /// closing a written disk makes udev re-read its partition table on its own (removing and
@@ -284,7 +415,7 @@ impl LinuxWriteSession {
     /// that while the disk is locked and only sends change events. The table is then re-read
     /// once, here; after the lock is released udev's queue is drained (`udevadm settle`).
     fn restore(&mut self) -> Result<()> {
-        let Some(dev) = self.device.take() else { return Ok(()) };
+        let Some(Tracked { dev, wrote }) = self.device.take() else { return Ok(()) };
         let mut first: Option<Error> = None;
         if let Err(e) = dev.sync() {
             first.get_or_insert(os_error(&e, &format!("fsync {}", self.path)));
@@ -301,15 +432,43 @@ impl LinuxWriteSession {
         drop(dev);
         match ro {
             Ok(ro) => {
-                if let Err(e) = reread(ro.fd(), &self.path) {
-                    first.get_or_insert(e);
+                if wrote {
+                    if let Err(e) = reread(ro.fd(), &self.path) {
+                        first.get_or_insert(e);
+                    }
                 }
                 // release the lock first: udev processes a locked disk's events only after it
                 drop(ro);
-                udev_settle();
+                if wrote || !self.unmounted.is_empty() {
+                    udev_settle();
+                }
             }
             Err(e) => {
                 first.get_or_insert(e);
+            }
+        }
+
+        let unmounted = std::mem::take(&mut self.unmounted);
+        if !wrote {
+            let entries: Vec<MountEntry> = unmounted.into_iter().map(|u| u.entry).collect();
+            let failed = remount_all(&*self.mounter, &entries);
+            if !failed.is_empty() {
+                first.get_or_insert(Error::Busy(format!(
+                    "the write session on {} wrote nothing, but could NOT mount again: {}",
+                    self.path,
+                    failed.join(", ")
+                )));
+            }
+        } else {
+            let (keep, gone): (Vec<Unmounted>, Vec<Unmounted>) = unmounted
+                .into_iter()
+                .partition(|u| u.extent.is_some_and(|x| still_there(&u.entry.device, x)));
+            for u in &gone {
+                log::info!("{} not mounted again at {}: its partition changed", u.entry.device, u.entry.mount_point);
+            }
+            let entries: Vec<MountEntry> = keep.into_iter().map(|u| u.entry).collect();
+            for f in remount_all(&*self.mounter, &entries) {
+                log::warn!("after writing {}: could not mount again {f}", self.path);
             }
         }
         first.map_or(Ok(()), Err)
@@ -330,7 +489,7 @@ impl WriteSession for LinuxWriteSession {
         write_table(dev, t)?;
         dev.flush()?;
         // no udev_settle here: udev waits for the disk lock this session holds
-        reread(dev.fd(), &self.path)
+        reread(dev.dev.fd(), &self.path)
     }
 
     fn finish(mut self: Box<Self>) -> Result<()> {
@@ -349,7 +508,7 @@ impl Drop for LinuxWriteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     /// Records calls; unmounting a mount point listed in `busy` fails with EBUSY, re-mounting
     /// one listed in `stuck` fails with EIO.
@@ -357,12 +516,18 @@ mod tests {
     struct MockMounter {
         busy: Vec<&'static str>,
         stuck: Vec<&'static str>,
-        log: RefCell<Vec<String>>,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl MockMounter {
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
     }
 
     impl Mounter for MockMounter {
         fn unmount(&self, mp: &str) -> io::Result<()> {
-            self.log.borrow_mut().push(format!("umount {mp}"));
+            self.log.lock().unwrap().push(format!("umount {mp}"));
             if self.busy.contains(&mp) {
                 Err(io::Error::from_raw_os_error(libc::EBUSY))
             } else {
@@ -370,7 +535,7 @@ mod tests {
             }
         }
         fn remount(&self, e: &MountEntry) -> io::Result<()> {
-            self.log.borrow_mut().push(format!("mount {} {} {}", e.device, e.mount_point, e.fstype));
+            self.log.lock().unwrap().push(format!("mount {} {} {}", e.device, e.mount_point, e.fstype));
             if self.stuck.contains(&e.mount_point.as_str()) {
                 Err(io::Error::from_raw_os_error(libc::EIO))
             } else {
@@ -380,7 +545,18 @@ mod tests {
     }
 
     fn entry(dev: &str, mp: &str, fstype: &str) -> MountEntry {
-        MountEntry { device: dev.into(), mount_point: mp.into(), fstype: fstype.into(), options: "rw".into() }
+        MountEntry {
+            device: dev.into(),
+            mount_point: mp.into(),
+            fstype: fstype.into(),
+            options: "rw".into(),
+            root: "/".into(),
+            ..Default::default()
+        }
+    }
+
+    fn ok_verify(_: BorrowedFd<'_>) -> Result<()> {
+        Ok(())
     }
 
     #[test]
@@ -389,7 +565,7 @@ mod tests {
         let mounts = [entry("/dev/loop0p1", "/mnt/a", "vfat"), entry("/dev/loop0p2", "/mnt/a/b", "ext4")];
         let done = unmount_all(&m, &mounts).unwrap();
         assert_eq!(done.len(), 2);
-        assert_eq!(*m.log.borrow(), ["umount /mnt/a/b", "umount /mnt/a"]);
+        assert_eq!(m.log(), ["umount /mnt/a/b", "umount /mnt/a"]);
     }
 
     #[test]
@@ -405,7 +581,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            *m.log.borrow(),
+            m.log(),
             ["umount /mnt/p1", "umount /mnt/p2", "mount /dev/loop0p1 /mnt/p1 vfat"],
             "nothing is left unmounted"
         );
@@ -416,7 +592,7 @@ mod tests {
         let m = MockMounter { busy: vec!["/mnt/p1"], ..Default::default() };
         let mounts = [entry("/dev/sdb1", "/mnt/p1", "vfat"), entry("/dev/sdb2", "/mnt/p2", "ext4")];
         assert!(matches!(unmount_all(&m, &mounts), Err(Error::Busy(_))));
-        assert_eq!(*m.log.borrow(), ["umount /mnt/p1"]);
+        assert_eq!(m.log(), ["umount /mnt/p1"]);
 
         let m = MockMounter { busy: vec!["/mnt/p3"], stuck: vec!["/mnt/p1"], ..Default::default() };
         let mounts = [
@@ -429,20 +605,37 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // re-mounted in reverse unmount order
-        assert_eq!(m.log.borrow()[3..], ["mount /dev/sdb2 /mnt/p2 ext4", "mount /dev/sdb1 /mnt/p1 vfat"]);
+        assert_eq!(m.log()[3..], ["mount /dev/sdb2 /mnt/p2 ext4", "mount /dev/sdb1 /mnt/p1 vfat"]);
     }
 
     #[test]
-    fn failure_to_open_after_unmounting_remounts() {
-        // the "disk" is a regular file; a first session holds the flock, so the second one
-        // unmounts, fails to lock, and must mount everything again
-        let t = tempfile::tempdir().unwrap();
+    fn remount_options_are_the_original_ones() {
+        let flags = vfs_flags("ro,nosuid,nodev,noexec,relatime");
+        assert_eq!(
+            flags,
+            libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RELATIME
+        );
+        assert_eq!(vfs_flags("rw,noatime,sync,dirsync"), libc::MS_NOATIME | libc::MS_SYNCHRONOUS | libc::MS_DIRSYNC);
+        assert_eq!(fs_data("rw,fmask=0022,dmask=0022,codepage=437,seclabel"), "fmask=0022,dmask=0022,codepage=437");
+        assert_eq!(fs_data("rw"), "");
+        let e = MountEntry {
+            options: "rw,nosuid,nodev,relatime".into(),
+            super_options: "rw,uid=1000,errors=remount-ro".into(),
+            ..entry("/dev/sdb1", "/media/u/X", "vfat")
+        };
+        assert_eq!(command_options(&e), "rw,nosuid,nodev,relatime,uid=1000,errors=remount-ro");
+    }
+
+    /// A regular file standing in for the disk, with one "partition" node `<file>1`.
+    fn file_disk(t: &tempfile::TempDir) -> (String, DiskInfo, std::path::PathBuf) {
         let img = t.path().join("disk.img");
         std::fs::write(&img, vec![0u8; 1 << 20]).unwrap();
         let path = img.to_string_lossy().into_owned();
-        let d = pm_core::DiskInfo {
+        let d = DiskInfo {
             path: path.clone(),
             partitions: vec![pm_core::PartitionInfo {
+                start: 4096,
+                len: 8192,
                 volume: Some(pm_core::VolumeId(format!("{path}1"))),
                 ..Default::default()
             }],
@@ -450,15 +643,24 @@ mod tests {
         };
         let sys = t.path().join("sys-disk");
         std::fs::create_dir_all(&sys).unwrap();
+        (path, d, sys)
+    }
+
+    #[test]
+    fn failure_to_open_after_unmounting_remounts() {
+        // a first session holds the flock, so the second one unmounts, fails to lock, and
+        // must mount everything again
+        let t = tempfile::tempdir().unwrap();
+        let (path, d, sys) = file_disk(&t);
         let mounts = [entry(&format!("{path}1"), "/mnt/x", "vfat"), entry("/dev/other1", "/mnt/y", "ext4")];
 
-        let m = MockMounter::default();
-        let first = begin_write(3, &d, &sys, &mounts, &[], &m).unwrap();
+        let m = Arc::new(MockMounter::default());
+        let first = begin_write(3, &d, &sys, &mounts, &[], m.clone(), &ok_verify).unwrap();
         assert_eq!(first.disk(), 3);
-        assert_eq!(*m.log.borrow(), ["umount /mnt/x"], "only the disk's own mounts");
+        assert_eq!(m.log(), ["umount /mnt/x"], "only the disk's own mounts");
 
-        let m2 = MockMounter::default();
-        match begin_write(3, &d, &sys, &mounts, &[], &m2) {
+        let m2 = Arc::new(MockMounter::default());
+        match begin_write(3, &d, &sys, &mounts, &[], m2.clone(), &ok_verify) {
             Err(Error::Busy(msg)) => {
                 assert!(msg.contains("locked by another program"), "{msg}");
                 assert!(msg.contains("mounted again"), "{msg}");
@@ -466,13 +668,63 @@ mod tests {
             Err(other) => panic!("{other:?}"),
             Ok(_) => panic!("second session on a locked disk"),
         }
-        assert_eq!(*m2.log.borrow(), [format!("umount /mnt/x"), format!("mount {path}1 /mnt/x vfat")]);
-        drop(first); // BLKRRPART on a regular file fails: logged by Drop
+        assert_eq!(m2.log(), [format!("umount /mnt/x"), format!("mount {path}1 /mnt/x vfat")]);
+        // the first session wrote nothing: dropping it mounts its filesystem again
+        drop(first);
+        assert_eq!(m.log(), [format!("umount /mnt/x"), format!("mount {path}1 /mnt/x vfat")]);
         // swap / holders refuse before anything is unmounted
-        let m3 = MockMounter::default();
-        let refused = begin_write(3, &d, &sys, &mounts, &[format!("{path}1")], &m3);
+        let m3 = Arc::new(MockMounter::default());
+        let refused = begin_write(3, &d, &sys, &mounts, &[format!("{path}1")], m3.clone(), &ok_verify);
         assert!(matches!(refused, Err(Error::Busy(msg)) if msg.contains("swap")));
-        assert!(m3.log.borrow().is_empty());
+        assert!(m3.log().is_empty());
+    }
+
+    #[test]
+    fn a_different_disk_behind_the_name_is_refused_and_rolled_back() {
+        // I1: the verify callback (disk sequence number / size) says the opened disk is not the
+        // enumerated one
+        let t = tempfile::tempdir().unwrap();
+        let (path, d, sys) = file_disk(&t);
+        let mounts = [entry(&format!("{path}1"), "/mnt/x", "vfat")];
+        let m = Arc::new(MockMounter::default());
+        let changed = |_: BorrowedFd<'_>| -> Result<()> {
+            Err(Error::Invalid("disk 3 changed since the disk list was read: refresh and retry".into()))
+        };
+        match begin_write(3, &d, &sys, &mounts, &[], m.clone(), &changed) {
+            Err(Error::Invalid(msg)) => assert!(msg.contains("refresh and retry"), "{msg}"),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("session on a changed disk"),
+        }
+        assert_eq!(m.log(), [format!("umount /mnt/x"), format!("mount {path}1 /mnt/x vfat")]);
+        // and the lock was released with the descriptor: a correct disk opens fine
+        assert!(begin_write(3, &d, &sys, &[], &[], m, &ok_verify).is_ok());
+    }
+
+    #[test]
+    fn a_written_session_does_not_remount_a_vanished_partition() {
+        let t = tempfile::tempdir().unwrap();
+        let (path, d, sys) = file_disk(&t);
+        let mounts = [entry(&format!("{path}1"), "/mnt/x", "vfat")];
+        let m = Arc::new(MockMounter::default());
+        let mut s = begin_write(3, &d, &sys, &mounts, &[], m.clone(), &ok_verify).unwrap();
+        s.device().write_at(0, b"x").unwrap();
+        assert!(s.finish().is_err(), "BLKRRPART on a regular file fails");
+        // `<file>1` is no partition node: not mounted again after the write
+        assert_eq!(m.log(), ["umount /mnt/x"]);
+    }
+
+    #[test]
+    fn bind_mounts_and_subvolumes_refuse_before_unmounting() {
+        let t = tempfile::tempdir().unwrap();
+        let (path, d, sys) = file_disk(&t);
+        let sub = MountEntry { root: "/@home".into(), ..entry(&format!("{path}1"), "/home", "btrfs") };
+        let m = Arc::new(MockMounter::default());
+        match begin_write(3, &d, &sys, &[entry(&format!("{path}1"), "/mnt/x", "btrfs"), sub], &[], m.clone(), &ok_verify) {
+            Err(Error::Busy(msg)) => assert!(msg.contains("bind mount or subvolume"), "{msg}"),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("session over a subvolume mount"),
+        }
+        assert!(m.log().is_empty(), "nothing unmounted");
     }
 
     #[test]

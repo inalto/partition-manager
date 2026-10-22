@@ -1,23 +1,39 @@
-//! `/proc/mounts` and `/proc/swaps`: which filesystems are mounted where.
+//! `/proc/self/mountinfo`, `/proc/mounts` and `/proc/swaps`: which filesystems are mounted
+//! where, and how.
 
 use pm_core::FsKind;
+use std::collections::HashMap;
 use std::path::Path;
 
-/// One line of `/proc/mounts`.
+/// One mount, from `/proc/self/mountinfo` (or `/proc/mounts`, which lacks the ids, the root
+/// and the superblock options).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MountEntry {
     /// Mounted device (`/dev/sda1`) or a pseudo source (`proc`, `overlay`, `none`).
     pub device: String,
     pub mount_point: String,
     pub fstype: String,
-    /// Mount options (`rw,relatime,...`).
+    /// Per-mount (VFS) options: `rw,nosuid,nodev,relatime`.
     pub options: String,
+    /// Superblock (filesystem) options: `rw,fmask=0022,errors=remount-ro`.
+    pub super_options: String,
+    /// Mount id and parent mount id (0 when unknown).
+    pub id: u32,
+    pub parent: u32,
+    /// Directory of the filesystem mounted here: `/` for an ordinary mount, a subdirectory
+    /// for a bind mount, `/@home` for a btrfs subvolume. Empty when unknown.
+    pub root: String,
 }
 
 impl MountEntry {
-    /// Mounted read-only (`ro` among the options).
+    /// Mounted read-only (`ro` among the per-mount options).
     pub fn read_only(&self) -> bool {
         self.options.split(',').any(|o| o == "ro")
+    }
+
+    /// Mounts a subtree of its filesystem (bind mount of a directory, btrfs subvolume).
+    pub fn is_partial(&self) -> bool {
+        !self.root.is_empty() && self.root != "/"
     }
 }
 
@@ -28,7 +44,7 @@ pub fn unescape(field: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+        if b[i] == b'\\' &&i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
             let v = (b[i + 1] - b'0') as u32 * 64 + (b[i + 2] - b'0') as u32 * 8 + (b[i + 3] - b'0') as u32;
             if let Ok(byte) = u8::try_from(v) {
                 out.push(byte);
@@ -52,9 +68,89 @@ pub fn parse_proc_mounts(text: &str) -> Vec<MountEntry> {
             let mount_point = unescape(f.next()?);
             let fstype = unescape(f.next()?);
             let options = f.next().map(unescape).unwrap_or_default();
-            Some(MountEntry { device, mount_point, fstype, options })
+            Some(MountEntry { device, mount_point, fstype, options, ..Default::default() })
         })
         .collect()
+}
+
+/// Parse the text of `/proc/self/mountinfo`:
+/// `id parent major:minor root mount_point vfs_options [optional fields...] - fstype source super_options`.
+/// Malformed lines are skipped.
+pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let mut l = left.split_whitespace();
+            let id = l.next()?.parse().ok()?;
+            let parent = l.next()?.parse().ok()?;
+            let _dev = l.next()?;
+            let root = unescape(l.next()?);
+            let mount_point = unescape(l.next()?);
+            let options = unescape(l.next()?);
+            let mut r = right.split_whitespace();
+            let fstype = unescape(r.next()?);
+            let device = unescape(r.next()?);
+            let super_options = r.next().map(unescape).unwrap_or_default();
+            Some(MountEntry { device, mount_point, fstype, options, super_options, id, parent, root })
+        })
+        .collect()
+}
+
+/// Why each of `mine` (mounts of the disk about to be written) cannot be unmounted and
+/// re-mounted faithfully: a bind mount or subvolume (its root is not `/`), or a mount hidden
+/// under a later mount on the same or a parent directory. Empty when all are plain.
+/// `all` is the whole mount table in kernel order.
+pub fn mount_conflicts(mine: &[MountEntry], all: &[MountEntry]) -> Vec<String> {
+    let parent_of: HashMap<u32, u32> = all.iter().filter(|e| e.id != 0).map(|e| (e.id, e.parent)).collect();
+    // whether mount `a` is `e` itself or one of its ancestors in the mount tree
+    let is_ancestor = |a: u32, e: &MountEntry| {
+        let mut cur = e.id;
+        for _ in 0..all.len() + 1 {
+            if cur == a {
+                return true;
+            }
+            match parent_of.get(&cur) {
+                Some(&p) if p != cur => cur = p,
+                _ => return false,
+            }
+        }
+        false
+    };
+    let mut out = Vec::new();
+    for e in mine {
+        if e.is_partial() {
+            out.push(format!(
+                "{} on {} mounts only {} of the filesystem (bind mount or subvolume): unmount it yourself first",
+                e.device, e.mount_point, e.root
+            ));
+            continue;
+        }
+        let pos = all.iter().position(|a| a == e);
+        let covered = all.iter().enumerate().any(|(i, f)| {
+            f != e
+                && pos.is_some_and(|p| i > p)
+                && is_under(&e.mount_point, &f.mount_point)
+                && !(f.id != 0 && e.id != 0 && is_ancestor(f.id, e))
+        });
+        if covered {
+            out.push(format!(
+                "{} on {} is hidden under a later mount: unmount it yourself first",
+                e.device, e.mount_point
+            ));
+        }
+    }
+    out
+}
+
+/// The device node of the block device holding `path`, from its `st_dev`
+/// (`/sys/dev/block/M:m`). `None` for filesystems with anonymous device numbers (btrfs
+/// subvolumes, overlay, tmpfs, ...).
+pub fn node_of_st_dev(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = path.ancestors().find_map(|a| std::fs::metadata(a).ok())?;
+    let (major, minor) = super::ioctl::major_minor(meta.dev());
+    let sys = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    Some(format!("/dev/{}", sys.file_name()?.to_string_lossy()))
 }
 
 /// Active swap devices and files from the text of `/proc/swaps` (header line skipped).
@@ -65,18 +161,27 @@ pub fn parse_proc_swaps(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Current mounts of this process's mount namespace, with device symlinks
-/// (`/dev/disk/by-uuid/...`, `/dev/root`) resolved to the device node.
+/// Current mounts of this process's mount namespace (`/proc/self/mountinfo`, falling back to
+/// `/proc/mounts`), with device symlinks (`/dev/disk/by-uuid/...`) resolved to the device node
+/// and `/dev/root` resolved through the `st_dev` of its mount point.
 pub fn read_mounts() -> Vec<MountEntry> {
-    let text = std::fs::read_to_string("/proc/self/mounts")
-        .or_else(|_| std::fs::read_to_string("/proc/mounts"))
-        .unwrap_or_else(|e| {
-            log::warn!("cannot read /proc/mounts: {e}");
-            String::new()
-        });
-    let mut v = parse_proc_mounts(&text);
+    let mut v = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(t) => parse_mountinfo(&t),
+        Err(e) => {
+            log::debug!("cannot read /proc/self/mountinfo: {e}");
+            let text = std::fs::read_to_string("/proc/mounts").unwrap_or_else(|e| {
+                log::warn!("cannot read /proc/mounts: {e}");
+                String::new()
+            });
+            parse_proc_mounts(&text)
+        }
+    };
     for e in &mut v {
-        e.device = canonical_device(&e.device);
+        e.device = if e.device == "/dev/root" {
+            node_of_st_dev(Path::new(&e.mount_point)).unwrap_or_else(|| e.device.clone())
+        } else {
+            canonical_device(&e.device)
+        };
     }
     v
 }

@@ -78,6 +78,10 @@ pub fn mkfs_command(
             // the hidden-sectors field of the boot sector: Windows refuses to boot / mount
             // some volumes when it is wrong, and mkfs.ntfs cannot always find it itself
             push(&["-p", &at.start_sector.to_string()]);
+            if at.start_sector == 0 {
+                // a whole disk: mkfs.ntfs refuses a non-partition device without -F
+                push(&["-F"]);
+            }
             "mkfs.ntfs"
         }
         FsKind::Ext2 | FsKind::Ext3 | FsKind::Ext4 => {
@@ -162,13 +166,15 @@ fn report(progress: &dyn ProgressSink, done: u64) {
 /// Format volume `id` (an unmounted partition node).
 pub fn format(
     id: &VolumeId,
+    expected: Option<(u64, Option<u64>)>,
     fs: FsKind,
     label: &str,
     cluster: Option<u32>,
     quick: bool,
     progress: &dyn ProgressSink,
 ) -> Result<()> {
-    let dev = ready_node(id)?;
+    let dev = ready_node(id, expected)?;
+    let dev = dev.as_str();
     ensure_unmounted(dev)?;
     let (tool, args) = mkfs_command(fs, label, cluster, quick, dev, placement(dev))?;
     report(progress, 0);
@@ -209,5 +215,9 @@ mod tests {
         let at = Placement { sector_size: 4096, start_sector: 256 };
         let (_, a) = mkfs_command(FsKind::Fat32, "", Some(32768), true, "/dev/nvme0n1p1", at).unwrap();
         assert_eq!(a, ["-F", "32", "-s", "8", "/dev/nvme0n1p1"]);
+        // NTFS on a whole disk (start 0) needs -F
+        let whole = Placement { sector_size: 512, start_sector: 0 };
+        let (_, a) = mkfs_command(FsKind::Ntfs, "", None, true, "/dev/sdc", whole).unwrap();
+        assert_eq!(a, ["-Q", "-s", "512", "-p", "0", "-F", "/dev/sdc"]);
     }
 }

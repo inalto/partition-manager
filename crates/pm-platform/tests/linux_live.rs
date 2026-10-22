@@ -132,19 +132,51 @@ fn loop_device_end_to_end() {
     assert_eq!((v.disk, v.start, v.len), (Some(index), MIB, 48 * MIB));
     assert!(v.total > 0 && v.free <= v.total);
     assert!(matches!(p.format(&v1, FsKind::Fat32, "X", None, true, &NullProgress), Err(pm_core::Error::Busy(_))));
+    // the whole partitioned disk is never a volume
+    let whole = VolumeId(node.clone());
+    assert!(matches!(p.format(&whole, FsKind::Fat32, "X", None, true, &NullProgress), Err(pm_core::Error::Invalid(_))));
+    assert!(matches!(p.open_volume(&whole, OpenMode::ReadOnly), Err(pm_core::Error::Invalid(_))));
 
     // Review Focus 1: p2 busy (a file open on it) -> begin_write refuses and p1, already
     // unmounted, is mounted again
     let busy = std::fs::File::create(m2.path().join("busy.txt")).unwrap();
     match p.begin_write(index) {
-        Err(pm_core::Error::Busy(msg)) => eprintln!("begin_write refused as expected: {msg}"),
+        Err(pm_core::Error::Busy(msg)) => {
+            eprintln!("begin_write refused as expected: {msg}");
+            assert!(msg.contains("already unmounted were mounted again"), "{msg}");
+        }
         Err(e) => panic!("expected Busy, got {e}"),
         Ok(_) => panic!("begin_write succeeded while p2 is busy"),
     }
     assert_eq!(mounted_at(&p1).len(), 1, "p1 mounted again after the refused session");
     assert_eq!(mounted_at(&p2).len(), 1, "p2 still mounted");
     assert_eq!(std::fs::read(m1.path().join("hello.txt")).unwrap(), b"hello from pm");
+    // the original mount options came back too
+    let opts = |dev: &str| {
+        pm_platform::linux::parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap())
+            .into_iter()
+            .find(|e| e.device == dev)
+            .map(|e| e.options)
+            .unwrap()
+    };
+    let p1_options = opts(&p1);
+    assert!(p1_options.contains("nosuid") && p1_options.contains("nodev"), "{p1_options}");
     drop(busy);
+
+    // a session that writes nothing mounts everything it unmounted again
+    let s = p.begin_write(index).expect("begin_write with both mounted");
+    assert!(mounted_at(&p1).is_empty() && mounted_at(&p2).is_empty(), "unmounted during the session");
+    drop(s);
+    assert_eq!(mounted_at(&p1).len(), 1, "p1 mounted again after a session without writes");
+    assert_eq!(mounted_at(&p2).len(), 1, "p2 mounted again after a session without writes");
+    assert_eq!(opts(&p1), p1_options);
+    // a session that rewrites the same layout mounts the unchanged partitions again
+    let mut s = p.begin_write(index).expect("begin_write for a rewrite");
+    s.commit_table(&t).expect("rewrite the same table");
+    s.finish().expect("finish after the rewrite");
+    assert_eq!(mounted_at(&p1).len(), 1, "p1 mounted again after an unchanged layout");
+    assert_eq!(mounted_at(&p2).len(), 1, "p2 mounted again after an unchanged layout");
+    assert_eq!(std::fs::read(m1.path().join("hello.txt")).unwrap(), b"hello from pm");
 
     p.unmount(&v1, &at1).expect("unmount p1");
     p.unmount(&v2, &at2).expect("unmount p2");
