@@ -332,7 +332,7 @@ fn mount_unmount_format_through_diskutil() {
     let r = FixtureRunner::default();
     let id = VolumeId("/dev/disk2s1".into());
     mount::mount(&r, &id, &MountPoint::Folder("/Volumes/x".into())).unwrap();
-    mount::unmount(&r, &VolumeId("/dev/rdisk2s1".into()), &MountPoint::Folder("/Volumes/x".into())).unwrap();
+    mount::unmount(&r, &VolumeId("/dev/rdisk2s1".into()), &MountPoint::Folder("/Volumes/STICK/".into())).unwrap();
     format::format(&r, &id, FsKind::ExFat, "BACKUP", Some(131_072), false).unwrap();
     format::format(&r, &id, FsKind::Fat32, "", None, true).unwrap();
     format::format(&r, &id, FsKind::HfsPlus, "", None, true).unwrap();
@@ -771,4 +771,36 @@ fn slices_are_mounted_again_where_they_were() {
         Err(Error::Busy(m)) => assert!(m.contains("could NOT mount again: disk2s1"), "{m}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn unmount_checks_the_mount_point() {
+    let id = VolumeId("/dev/disk2s1".into());
+    // the folder is not where the slice is mounted: nothing is unmounted
+    let r = FixtureRunner::default();
+    match mount::unmount(&r, &id, &MountPoint::Folder("/tmp/pm-mnt".into())) {
+        Err(Error::NotFound(m)) => {
+            assert_eq!(m, "disk2s1 is not mounted at /tmp/pm-mnt (it is mounted at /Volumes/STICK)")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(r.calls(), [info_call("disk2s1"), info_call("disk2")]);
+
+    // the right folder (trailing slash ignored): checks, then the unmount
+    let r = FixtureRunner::default();
+    mount::unmount(&r, &id, &MountPoint::Folder("/Volumes/STICK".into())).unwrap();
+    assert_eq!(
+        r.calls(),
+        [info_call("disk2s1"), info_call("disk2"), vec!["unmount".to_string(), "disk2s1".to_string()]]
+    );
+
+    // an unmounted slice
+    let r = FixtureRunner::default();
+    match mount::unmount(&r, &VolumeId("/dev/disk3s2".into()), &MountPoint::Folder("/Volumes/DATA".into())) {
+        Err(Error::NotFound(m)) => assert_eq!(m, "disk3s2 is not mounted"),
+        other => panic!("{other:?}"),
+    }
+    // letters stay unsupported
+    assert!(matches!(mount::unmount(&r, &id, &MountPoint::Letter('E')), Err(Error::Unsupported(_))));
+    assert!(r.commands().is_empty());
 }

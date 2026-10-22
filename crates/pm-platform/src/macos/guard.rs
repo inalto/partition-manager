@@ -24,6 +24,11 @@ pub fn physical_whole_disk(runner: &dyn DiskutilRunner, ident: &str) -> Result<D
 /// disk. Whole disks (`/dev/disk2`) and non-disk ids are `Error::NotFound`; volumes of a
 /// synthesized APFS container (`disk1s1`) are `Error::Invalid`.
 pub fn checked_slice(runner: &dyn DiskutilRunner, id: &VolumeId) -> Result<String> {
+    checked_slice_info(runner, id).map(|(slice, _)| slice)
+}
+
+/// [`checked_slice`], also returning the slice's `diskutil info`.
+pub fn checked_slice_info(runner: &dyn DiskutilRunner, id: &VolumeId) -> Result<(String, DeviceInfo)> {
     let slice = volume_identifier(&id.0)
         .ok_or_else(|| Error::NotFound(format!("{} is not a slice of a macOS disk (diskNsM)", id.0)))?;
     let Some((disk, Some(_))) = parse_identifier(&slice) else {
@@ -33,7 +38,7 @@ pub fn checked_slice(runner: &dyn DiskutilRunner, id: &VolumeId) -> Result<Strin
     if info.whole_disk || info.is_apfs_synthesized() {
         return Err(Error::Invalid(format!("{slice} is not a partition of a physical disk")));
     }
-    let parent = if info.parent_whole_disk.is_empty() { format!("disk{disk}") } else { info.parent_whole_disk };
+    let parent = if info.parent_whole_disk.is_empty() { format!("disk{disk}") } else { info.parent_whole_disk.clone() };
     if parse_identifier(&parent) != Some((disk, None)) {
         return Err(Error::Invalid(format!("{slice} belongs to {parent}, not disk{disk}")));
     }
@@ -41,5 +46,5 @@ pub fn checked_slice(runner: &dyn DiskutilRunner, id: &VolumeId) -> Result<Strin
         Error::Invalid(m) => Error::Invalid(format!("{slice}: {m}")),
         other => other,
     })?;
-    Ok(slice)
+    Ok((slice, info))
 }
