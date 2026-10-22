@@ -82,33 +82,38 @@ The release binaries land in `target\release\`: `pm.exe` and `partition-manager.
 
 There are two ways to get a linker on Windows.
 
-### Route A: GNU toolchain with a portable MinGW (what this repository is configured for)
-
-This is the route for a machine without Visual Studio Build Tools. The repository pins
-`stable-x86_64-pc-windows-gnu` in `rust-toolchain.toml`, and `.cargo/config.toml` points the
-linker and `dlltool` at a portable WinLibs MinGW-w64:
-
-```powershell
-winget install --id BrechtSanders.WinLibs.POSIX.UCRT --scope user
-```
-
-`.cargo/config.toml` then selects (adjust the user name if yours differs):
-
-```toml
-[target.x86_64-pc-windows-gnu]
-linker = "C:/Users/alain/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gcc.exe"
-rustflags = ["-C", "dlltool=C:/Users/alain/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/dlltool.exe"]
-```
-
-Because the linker path is explicit, the same `cargo build --release` also works from Git Bash.
-The first build will install the pinned toolchain through rustup if it is missing.
-
-### Route B: MSVC
+### Route A: MSVC (default for a fresh clone)
 
 1. Install **Visual Studio Build Tools** with the **Desktop development with C++** workload
    and a **Windows SDK**.
-2. Delete `.cargo\config.toml` and `rust-toolchain.toml` (they only exist for Route A).
-3. Build with the default `msvc` toolchain: `cargo build --release`.
+2. Build with the default `stable-x86_64-pc-windows-msvc` toolchain: `cargo build --release`.
+
+Nothing in the repository pins a toolchain, so this is what a fresh clone uses.
+
+### Route B: GNU toolchain with a portable MinGW (no Visual Studio needed)
+
+For a machine without Visual Studio Build Tools. Install a portable WinLibs MinGW-w64 in user
+scope, then copy the two example files and adjust the paths to your user name:
+
+```powershell
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT --scope user
+Copy-Item .cargo\config.example.toml .cargo\config.toml
+Copy-Item rust-toolchain.example.toml rust-toolchain.toml
+```
+
+`rust-toolchain.toml` pins `stable-x86_64-pc-windows-gnu` and `.cargo/config.toml` points the
+linker and `dlltool` at the MinGW directory, for example:
+
+```toml
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/<you>/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gcc.exe"
+rustflags = ["-C", "dlltool=C:/Users/<you>/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/dlltool.exe"]
+```
+
+Both files are git-ignored, so they never leak a local path into the repository. Because the
+linker path is explicit, the same `cargo build --release` also works from Git Bash. The first
+build installs the pinned toolchain through rustup if it is missing. (Rust's bundled GNU
+`dlltool` lacks an assembler, which is why a real MinGW is needed for `windows-sys`.)
 
 The elevation manifest is embedded with `embed-resource` under MSVC, and with `windres` from
 the MinGW directory under GNU; either way only in release builds (`PM_GUI_MANIFEST=1` forces
@@ -361,7 +366,7 @@ Tests that touch real Windows volumes or disks are marked `#[ignore]`; run them 
 
 ## License
 
-MIT (see `license = "MIT"` in `Cargo.toml`). There is no separate `LICENSE` file yet.
+MIT (see `license = "MIT"` in `Cargo.toml`). See the `LICENSE` file.
 
 ## Credits
 

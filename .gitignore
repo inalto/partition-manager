@@ -8,3 +8,7 @@
 *.map
 /dist/
 
+
+# machine-specific build configuration (copy from the .example files)
+/.cargo/config.toml
+/rust-toolchain.toml

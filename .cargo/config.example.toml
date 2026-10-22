@@ -1,0 +1,9 @@
+# Example machine-specific config: copy to .cargo/config.toml and adjust the paths.
+# Only needed when building with the GNU toolchain (no MSVC Build Tools); we use the GNU
+# toolchain and the portable WinLibs MinGW-w64 installed via
+#   winget install --id BrechtSanders.WinLibs.POSIX.UCRT --scope user
+# If you install Visual Studio Build Tools, delete this file and rust-toolchain.toml.
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/<you>/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gcc.exe"
+rustflags = ["-C", "dlltool=C:/Users/<you>/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/dlltool.exe"]
+
