@@ -178,7 +178,9 @@ impl DiskInfo {
         let table = match self.table {
             TableKind::Gpt => "GPT",
             TableKind::Mbr => "MBR",
-            TableKind::None | TableKind::Unknown => "Uninitialized",
+            TableKind::None => "Uninitialized",
+            // the platform could not read the table (not root, or a damaged map): not "no table"
+            TableKind::Unknown => "Unreadable",
         };
         format!(
             "Disk {} ({}, {}, {})",
@@ -298,6 +300,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(d.display_name(), "Disk 0 (Y, Uninitialized, 0 B)");
+        let d = DiskInfo { table: TableKind::Unknown, ..d };
+        assert_eq!(d.display_name(), "Disk 0 (Y, Unreadable, 0 B)");
     }
 
     #[test]
