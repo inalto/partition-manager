@@ -1,16 +1,25 @@
 # Partition Manager
 
-Partition Manager is a Windows-first disk partition manager written in Rust. It shows every
-disk and partition, creates, formats, resizes and moves partitions, clones and migrates
-disks, saves disks as virtual-disk images, rescues data from failing media, and recovers
-lost partitions and deleted files. It ships as a wizard-driven desktop application
-(`partition-manager.exe`) and a scriptable command line (`pm.exe`) that share the same
-engines.
+Partition Manager is a disk partition manager for Windows, Linux and macOS, written in Rust
+(Windows is the reference platform). It shows every disk and partition, creates, formats,
+resizes and moves partitions, clones and migrates disks, saves disks as virtual-disk images,
+rescues data from failing media, and recovers lost partitions and deleted files. It ships as
+a wizard-driven desktop application (`partition-manager`, `.exe` on Windows) and a
+scriptable command line (`pm`) that share the same engines.
+
+| OS | Status |
+|---|---|
+| Windows | Full support, including boot repair. |
+| Linux | Supported (sysfs, `/dev` nodes, `mkfs.*`, `ntfsresize` / `resize2fs`, `smartctl`); tested in WSL2 on loop devices. |
+| macOS | Supported through `diskutil` and raw `rdisk` nodes; compile- and fixture-tested only, never run on a Mac. |
+
+Linux and macOS have no boot repair and no drive letters; macOS cannot format NTFS or resize
+file systems. See [[Known Limitations]].
 
 ![Partition Manager showing a demo image file as a disk](https://raw.githubusercontent.com/inalto/partition-manager/main/docs/screenshots/gui-shell-demo-image.png)
 
 > **Safety warning.** Nothing has yet been run elevated against a real disk. Everything is
-> tested on in-memory disks and image files. Before you point Partition Manager at a disk
+> tested on in-memory disks and image files (on Linux also on loop devices). Before you point Partition Manager at a disk
 > that holds data, work through the [[First Live Test]] checklist on scratch media (a
 > dedicated USB stick or an attached VHD), with every other external drive unplugged and a
 > backup of the machine. Until then, practice on image files with `--disk-file` (see

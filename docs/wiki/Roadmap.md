@@ -16,6 +16,9 @@ The design spec excludes these:
   a built-in formatter, for images and tests).
 - Defragmentation.
 - Writing to ext or APFS.
+- On Linux and macOS: boot repair, editing LVM / device-mapper / mdraid / APFS containers,
+  resizing on macOS, udev-based hot-plug notifications, packages (deb, rpm, dmg), code
+  signing and notarization.
 
 ## Planned follow-ups
 
@@ -34,8 +37,18 @@ The design spec excludes these:
 - **Set label.** Wire the queued "set label" operation to a platform API.
 - **VHDX writing.** Create and write VHDX images (today read-only), and replay the log of an
   unclean shutdown.
-- **Linux platform.** A real `Platform` implementation; today the non-Windows build is a
-  stub that lets the engines compile and test.
+- **Linux and macOS live verification.** Run the Linux checklist on a physical USB disk and
+  the macOS walk-through on a Mac; capture real `diskutil -plist` output as fixtures
+  (Apple Silicon, a snapshot root, Fusion).
+- **Linux follow-ups.** Fill the unprivileged view from the udev database
+  (`/run/udev/data`), `/boot` flags, btrfs multi-device file systems, a single enumeration
+  pass with de-duplicated partition data.
+- **macOS follow-ups.** Attach the APFS container's mount points to its physical store,
+  unmount through the store slice, one enumeration pass instead of one `diskutil info` per
+  slice, `statfs` instead of `diskutil` for `disk_of_path`, `smartctl` from fixed locations
+  only, resizing through `diskutil resizeVolume`.
+- **Benchmark on Linux/macOS.** The scratch file is unlinked as soon as it is open, so a
+  failed unlink can leave it behind and a running benchmark's file is invisible.
 - **Legacy MBR layouts.** Editing extended layouts with less than 1 MiB between the EBRs by
   preserving the existing EBR positions (today they are read-only: shown and cloneable, but
   not editable).

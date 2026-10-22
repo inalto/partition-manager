@@ -1,7 +1,8 @@
 # Getting Started
 
 This page covers building Partition Manager, running it, and practicing on an image file
-before you go near a real disk. All commands are run from PowerShell.
+before you go near a real disk. The Windows commands are run from PowerShell; Linux and
+macOS have their own sections ([build](#linux-and-macos), [run](#on-linux-and-macos)).
 
 You need a Rust toolchain from <https://rustup.rs>. Get the source from
 <https://github.com/inalto/partition-manager>.
@@ -69,6 +70,31 @@ Use this on a machine without Visual Studio Build Tools.
 Because the linker path is explicit, the same `cargo build --release` also works from Git
 Bash. The first build installs the pinned toolchain through rustup if it is missing.
 
+### Linux and macOS
+
+```sh
+cargo build --release          # target/release/pm and target/release/partition-manager
+cargo test --workspace
+scripts/build-release.sh       # copies both, README and LICENSE into dist/<os>-<arch>/ + a tarball
+```
+
+On Debian/Ubuntu the GUI needs the windowing development packages:
+
+```sh
+sudo apt-get install -y build-essential pkg-config libgtk-3-dev libxkbcommon-dev \
+  libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
+
+At run time Linux uses the system tools when installed: dosfstools (`mkfs.vfat`),
+exfatprogs (`mkfs.exfat`), ntfs-3g (`mkfs.ntfs`, `ntfsresize`), e2fsprogs (`mkfs.ext4`,
+`e2fsck`, `resize2fs`), parted (`partprobe`), udev (`udevadm`) and smartmontools
+(`smartctl`). A missing tool fails only the operation that needs it; `pm doctor` lists what
+it found. macOS needs the Xcode command line tools to build; `diskutil` ships with the
+system, and SMART data needs `brew install smartmontools`.
+
+If your checkout carries a `rust-toolchain.toml` pinned to the Windows GNU channel (Route B),
+override it: `RUSTUP_TOOLCHAIN=stable cargo build --release`.
+
 ### About the elevation manifest
 
 The release GUI carries a `requireAdministrator` manifest and asks for UAC on launch. It is
@@ -115,6 +141,24 @@ pm list          # disks and partitions (add --json for scripts)
 Every command is listed in the [[CLI Reference]]. Commands that change a disk print what
 they would do and write nothing until you add `--yes`.
 
+### On Linux and macOS
+
+Run as root for physical disks, as yourself for image files:
+
+```sh
+sudo ./target/release/pm doctor        # Platform, root, system disk, external tools found
+sudo ./target/release/pm list          # each disk with its node: "Disk 1 (...)  /dev/sdb"
+sudo ./target/release/pm table /dev/sdb
+sudo ./target/release/partition-manager
+./target/release/partition-manager --disk-file practice.img
+```
+
+Name disks by their node (`/dev/sdb`, `/dev/nvme0n1`, `/dev/disk2`): a whole-disk node works
+wherever `disk:N` does, `/dev/sdb:2` is its partition 2, and a partition node (`/dev/sdb2`,
+`/dev/disk2s1`) is a volume. `disk:N` is a position in the list and can change when a disk is
+plugged in. Volumes mount at folders (`pm mount /dev/sdb2 --folder /mnt/data`); there are no
+drive letters. Without root everything is read-only.
+
 ## Try it on an image file
 
 This walkthrough never touches a real disk. Creating the image file is the only step that
@@ -152,4 +196,5 @@ Things to know about practice mode:
 
 ## Before a real disk
 
-Read [[Safety Model]], then work through the [[First Live Test]] on scratch media.
+Read [[Safety Model]], then work through the [[First Live Test]] on scratch media; on Linux
+and macOS it starts with a loop device or a disk image.

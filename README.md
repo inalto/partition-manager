@@ -2,11 +2,12 @@
 
 ![CI](https://github.com/inalto/partition-manager/actions/workflows/ci.yml/badge.svg)
 
-A Windows-first disk partition manager written in Rust. It shows every disk and partition,
-creates, formats, resizes and moves partitions, clones and migrates disks, images them to
-virtual-disk formats, rescues data from failing media, and recovers lost partitions and
-deleted files. It ships as a wizard-driven desktop application (`partition-manager.exe`)
-and a scriptable command line (`pm.exe`) that share the same engines.
+A disk partition manager for Windows, Linux and macOS, written in Rust (Windows is the
+reference platform). It shows every disk and partition, creates, formats, resizes and moves
+partitions, clones and migrates disks, images them to virtual-disk formats, rescues data from
+failing media, and recovers lost partitions and deleted files. It ships as a wizard-driven
+desktop application (`partition-manager`, `partition-manager.exe` on Windows) and a
+scriptable command line (`pm`, `pm.exe`) that share the same engines.
 
 ![Partition Manager showing a demo image file as a disk](docs/screenshots/gui-shell-demo-image.png)
 
@@ -73,14 +74,30 @@ More detail, including where each check lives: [docs/ARCHITECTURE.md](docs/ARCHI
 
 ## Platform support
 
-| OS | Status |
-|---|---|
-| Windows | Full: disks, partitions, volumes, write sessions, mount, format, resize, SMART, boot repair. |
-| Linux | Builds and runs the CLI/GUI on image files (`--disk-file`) and in CI; the platform layer for physical disks is in progress. |
-| macOS | Builds and runs the CLI/GUI on image files (`--disk-file`) and in CI; the platform layer for physical disks is in progress. |
+| OS | Status | Verified |
+|---|---|---|
+| Windows | Full: disks, partitions, volumes, write sessions, mount, format, resize, SMART, boot repair. | Test suite; real-disk checklist in [docs/FIRST-LIVE-TEST.md](docs/FIRST-LIVE-TEST.md) still to be run. |
+| Linux | Supported: disks from sysfs, raw I/O on `/dev` nodes, write sessions (unmount, `O_EXCL`, `flock`, `BLKRRPART`), mount/unmount at folders, format with `mkfs.*`, NTFS/ext resize with `ntfsresize`/`resize2fs`, SMART with `smartctl`. | Test suite in WSL2 (Ubuntu 24.04) plus a live loop-device test as root: GPT through a write session, `mkfs.vfat`, mount, busy-unmount rollback. Never run on a physical disk. |
+| macOS | Supported: disks from `diskutil -plist`, raw I/O on `/dev/rdiskN` (sector-aligned), write sessions (`diskutil unmountDisk`), mount/unmount/erase through `diskutil`, SMART with `smartctl`. | Compile checks and fixture tests only (`cargo check --target aarch64-apple-darwin`, the CI macOS job); **never run on a Mac**. |
 
 Continuous integration builds and tests the workspace on all three OSes
-(`cargo test --workspace`; tests that touch real hardware are `#[ignore]`d).
+(`cargo test --workspace`; tests that touch real hardware are `#[ignore]`d). The macOS
+module and the `plist` dependency compile on every OS, so its `diskutil` fixtures run on
+Windows and Linux too.
+
+**Not available on Linux and macOS:** boot repair (`bcdboot`/`bootsect`: a clone or Migrate OS
+is not made bootable from these hosts), drive letters (volumes mount at folders), ReFS,
+editing LVM / device-mapper / mdraid / APFS containers (they are shown, and a disk holding
+one refuses writes). On macOS also: NTFS formatting (needs third-party tools) and resizing a
+filesystem (shrink/extend are `Unsupported`).
+
+**Devices on Linux and macOS** are named by their nodes: `pm table /dev/sdb`, `pm list` shows
+each disk's node next to `disk:N`. A whole-disk node (`/dev/sdb`, `/dev/nvme0n1`,
+`/dev/disk2` or `/dev/rdisk2`) is the same as its `disk:N` for every command, `/dev/sdb:2`
+is its partition 2, and a partition node (`/dev/sdb2`, `/dev/disk2s1`) is a volume. Prefer
+the node: `disk:N` is a position in the disk list that can change when a disk is plugged in.
+Without root the disks are listed read-only; on macOS their partition offsets are then
+approximate (the list says so) and nothing is written from them.
 
 ## Build
 
@@ -137,19 +154,27 @@ it into a debug build, `PM_GUI_MANIFEST=0` leaves it out of a release build).
 ```sh
 cargo build --release          # target/release/pm and target/release/partition-manager
 cargo test --workspace
+scripts/build-release.sh       # the same build, copied into dist/<os>-<arch>/ plus a tarball
 ```
 
 On Debian/Ubuntu the GUI needs the usual windowing development packages:
 
 ```sh
-sudo apt-get install -y pkg-config libgtk-3-dev libxkbcommon-dev libwayland-dev \
-  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+sudo apt-get install -y build-essential pkg-config libgtk-3-dev libxkbcommon-dev \
+  libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 ```
 
-macOS needs only the Xcode command line tools. If a `rust-toolchain.toml` pinned to a
-Windows channel (Route B above) is present in your checkout, override it on other machines:
-`RUSTUP_TOOLCHAIN=stable cargo build --release`. Writing to disks requires root (`sudo`),
-like the elevated prompt on Windows.
+At run time the Linux platform layer uses the system tools when they are installed:
+`mkfs.vfat` (dosfstools), `mkfs.exfat` (exfatprogs), `mkfs.ntfs` and `ntfsresize`
+(ntfs-3g), `mkfs.ext4`, `e2fsck` and `resize2fs` (e2fsprogs), `partprobe` (parted),
+`udevadm` and `smartctl` (smartmontools); a missing tool makes only its operation fail, naming
+the tool. `pm doctor` lists what it found.
+
+macOS needs only the Xcode command line tools to build; `diskutil` ships with the system and
+SMART data needs `brew install smartmontools`.
+
+If a `rust-toolchain.toml` pinned to a Windows channel (Route B above) is present in your
+checkout, override it on other machines: `RUSTUP_TOOLCHAIN=stable cargo build --release`.
 
 ## Run
 
@@ -163,13 +188,23 @@ like the elevated prompt on Windows.
 
 The release build always starts elevated. For development, `cargo run -p pm-gui` runs
 unelevated: the real disk list is then empty with a banner, and `--disk-file` still works.
+
+On Linux and macOS start the GUI as root for real disks, and as yourself for image files:
+
+```sh
+sudo ./target/release/partition-manager              # real disks
+./target/release/partition-manager --disk-file practice.img
+```
+
+Without root it lists the disks read-only (the status bar says "Not root: read-only").
 See [crates/pm-gui/README-gui.md](crates/pm-gui/README-gui.md) for the layout and the wizards.
 
 ### CLI
 
-`pm.exe` needs an elevated prompt for physical disks and no elevation for image files. The
-full, generated reference with every flag is in [docs/CLI.md](docs/CLI.md); the main
-commands are:
+`pm.exe` needs an elevated prompt for physical disks and no elevation for image files; on
+Linux and macOS run it with `sudo` for physical disks (`sudo ./target/release/pm list`,
+`sudo pm table /dev/sdb`). The full, generated reference with every flag is in
+[docs/CLI.md](docs/CLI.md); the main commands are:
 
 ```powershell
 # Inspect
@@ -288,7 +323,8 @@ VMDK files attach to VMware or VirtualBox (`VBoxManage showmediuminfo disk.vmdk`
 ## Before the first real-disk run
 
 **Nothing has yet been run elevated against a real disk.** Everything is tested on in-memory
-disks and image files. Before you point Partition Manager at a disk with data on it, work
+disks and image files (and, on Linux, on loop devices). The checklist has Linux (loop
+device) and macOS (`hdiutil` disk image) variants for a first run without a spare disk. Before you point Partition Manager at a disk with data on it, work
 through the 12-step checklist in [docs/FIRST-LIVE-TEST.md](docs/FIRST-LIVE-TEST.md) on a
 dedicated USB stick or an attached VHD, with every other external drive unplugged and a
 backup of the machine. In short:
@@ -354,17 +390,21 @@ backup of the machine. In short:
   disk that is not in use.
 - **Hard links, junctions and storage aliases** are not detected by the source/destination
   overlap checks of the direct-copy commands.
-- **Drive-letter checks only.** The GUI's "not on the source / target disk" checks for image
-  files, rescue mapfiles and recovery destinations look at drive letters: a path that reaches
-  the same volume through a folder mount point, a junction, a UNC share or a
-  `\\?\Volume{…}` name is not recognised.
+- **"Not on the source disk" checks** for image files, rescue mapfiles and recovery
+  destinations ask the platform which disk a path is on (`Platform::disk_of_path`: drive
+  letters and folder mount points on Windows, the mount table on Linux, `diskutil` on macOS).
+  When it cannot tell (a network share, RAM disk, LVM / device-mapper volume) and the device
+  has mounted volumes, the path is refused; choose a folder on a disk of the list. Windows
+  UNC shares are accepted.
 - **Old scan sessions.** Scan sessions saved before they recorded the scanned region load as
   whole-device sessions. A carve session saved by an older `pm recover carve` on a
   *partition* therefore restores the wrong bytes: delete it and scan again.
-- **Linux/macOS.** The `pm-platform` crate has a `NullPlatform` stub (every OS call fails
-  with `Unsupported`) so the workspace's engines compile and test on other systems, but there
-  is no real Linux implementation yet: the Linux build is a stub. Benchmarking is Windows
-  only.
+- **Linux and macOS.** See [Platform support](#platform-support) for what is unavailable.
+  Linux was tested in WSL2 on loop devices only, macOS was never run on a Mac; `disk:N` is a
+  position in the list (use the `/dev/...` node); a Linux write session refuses bind mounts
+  and btrfs subvolumes on the disk, and on macOS the volumes a session unmounted are not
+  mounted again by Partition Manager. Details per OS are on the wiki's Known Limitations
+  page.
 
 ## Project layout
 
@@ -372,7 +412,7 @@ backup of the machine. In short:
 |---|---|
 | `pm-core` | `BlockDevice` trait, file/memory/slice devices, errors, progress and cancellation, size units, disk/partition domain model |
 | `pm-parttable` | MBR and GPT read/plan/write, alignment, MBR/GPT conversion, lost-table search |
-| `pm-platform` | `Platform` trait; Windows implementation (`windows-sys`), `NullPlatform` stub, `FilePlatform` (`--disk-file`), `MockPlatform` (tests) |
+| `pm-platform` | `Platform` trait; Windows (`windows-sys`), Linux (sysfs, ioctls, `mkfs.*`) and macOS (`diskutil`, raw `rdisk` nodes) implementations with shared POSIX helpers; `FilePlatform` (`--disk-file`), `MockPlatform` (tests), `NullPlatform` (other OSes) |
 | `pm-fs` | File-system detection; read-only NTFS, FAT, exFAT and ext parsers; used-block bitmaps; FAT32 formatter |
 | `pm-image` | Raw, VHD, VMDK, qcow2 images (and read-only VHDX) as block devices; format conversion; ddrescue-style rescue engine and mapfile |
 | `pm-recover` | Lost-partition finder, deleted-file recovery, signature carver, scan sessions |
@@ -394,7 +434,10 @@ cargo test --workspace
 
 The tests run on synthetic images and the mock platform and need no administrator rights.
 Tests that touch real Windows volumes or disks are marked `#[ignore]`; run them from an
-**elevated** prompt with `cargo test --workspace -- --ignored`.
+**elevated** prompt with `cargo test --workspace -- --ignored`. On Linux the loop-device test
+runs as root (`sudo -E env "PATH=$PATH" cargo test -p pm-platform --test linux_live --
+--ignored`); the macOS live test (`macos_live`, an `hdiutil` disk image) needs `sudo` on a
+Mac.
 
 ## License
 

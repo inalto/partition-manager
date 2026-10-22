@@ -31,12 +31,44 @@ A destructive request passes four layers. Each one refuses on its own.
 
 | Layer | Where | What it refuses |
 |---|---|---|
-| 1. Planner | `pm-ops/src/planner.rs` | Overlaps, misalignment, minimum sizes, an extended-partition container, a destination smaller than the used data, whole-disk destructive operations on the running system disk, and every disk when the system disk cannot be determined |
+| 1. Planner | `pm-ops/src/planner.rs` | Table edits (delete, resize, move, create) on a disk whose table is missing or could not be read; wiping, imaging or cloning a partition whose exact byte range is unknown (an unreadable table on Linux/macOS without root, where macOS offsets are approximate; a table-less disk's whole-disk file system qualifies), overlaps, misalignment, minimum sizes, an extended-partition container, a destination smaller than the used data, whole-disk destructive operations on the running system disk, and every disk when the system disk cannot be determined |
 | 2. Precheck | `pm-ops/src/executor.rs`, also run when an operation is queued | Operations the executor can never perform, so they are not even accepted into the queue: set label (no platform API yet), resizing a recognized non-NTFS file system (ReFS may only grow), alignment that would shrink one, shrinking or aligning a partition whose file system is unknown, any write to a disk Windows reports as read-only or offline, a clone into a smaller target when the source is not an NTFS volume that can be shrunk online |
 | 3. Executor pre-flight | `pm-ops/src/executor.rs`, `pm-ops/src/identity.rs` | Re-validates every operation against the live disks just before running it: each disk it names must still match the queue on size, serial and disk id, and each partition on start, length and GPT GUID. The running system disk is refused unless explicitly allowed, and then only for resize, label, letter, mount, unmount and creating a partition in free space. A system disk that cannot be determined fails closed. Inside the session, a table-only shrink re-reads the partition head and refuses a file-system signature |
-| 4. Platform session | `pm-platform` (`WriteSession`) | Writes only through a session that holds locked and dismounted volumes; a volume that cannot be locked aborts the operation before anything is written. There is no kernel driver |
+| 4. Platform session | `pm-platform` (`WriteSession`) | Writes only through a session that holds locked and dismounted volumes; a volume that cannot be locked aborts the operation before anything is written. There is no kernel driver. See [Linux and macOS sessions](#linux-and-macos-sessions) |
 
 More on where each layer lives: [[Architecture]].
+
+## Linux and macOS sessions
+
+**Linux** (`pm-platform/src/linux/session.rs`):
+
+- A disk with holders (LVM, RAID, dm-crypt) or active swap is refused before anything is
+  unmounted.
+- Every filesystem of the disk is unmounted, deepest first, after reading
+  `/proc/self/mountinfo`: bind mounts, btrfs subvolumes and mounts covered by another mount
+  are refused, because they could not be restored exactly. If one filesystem is busy,
+  everything already unmounted is mounted again with its original options and the session
+  fails with "busy".
+- The disk is opened `O_RDWR | O_EXCL` (the kernel refuses while anything still claims it,
+  even a mount in another namespace) and locked with `flock`; the session then checks that
+  the node is still the disk that was enumerated (`BLKGETDISKSEQ`, or the size on older
+  kernels), so a hot-plug between listing and writing cannot redirect the write.
+- After writing, the table is re-read (`BLKRRPART`, then `partprobe`) while udev is kept off
+  the disk. When the session ends the filesystems are mounted again: all of them if nothing
+  was written, otherwise those whose partition was not written into and still has the same
+  start and length.
+
+**macOS** (`pm-platform/src/macos/session.rs`):
+
+- Only physical whole disks are accepted (not APFS containers or other synthesized disks).
+- `diskutil unmountDisk` first; on failure the session fails with "busy" and what was
+  unmounted is mounted again. After a session the volumes are not mounted again by
+  Partition Manager (Disk Arbitration may mount new ones).
+- I/O goes through the raw `/dev/rdiskN` node in whole sectors (`AlignedDevice`), so an
+  unaligned request never reaches the device.
+- The system disk is determined from `/`; on Fusion / CoreStorage or multi-store roots it is
+  reported unknown, so the planner protects every disk (fail closed), as on Linux with `/`
+  on LVM.
 
 ## System-disk rules
 
@@ -63,6 +95,10 @@ were queued; refresh and queue again".
 
 `pm clone`, `restore`, `image`, `convert` and `rescue` refuse:
 
+- an image file, `.partial` or mapfile on the disk or partition being imaged or rescued, and
+  a rescue mapfile on the destination disk (decided with `Platform::disk_of_path`, see
+  below);
+
 - writing onto the source;
 - writing onto a partition or volume that overlaps the source;
 - writing onto the running system disk (failing closed when it cannot be determined);
@@ -72,11 +108,21 @@ were queued; refresh and queue again".
 Images are written to `FILE.partial` and renamed when complete, so a failed run leaves an
 existing file untouched.
 
+Device arguments are normalized first: a whole-disk node (`/dev/sdb`, `/dev/disk2` or
+`/dev/rdisk2`) is the same disk as its `disk:N`, and a macOS raw slice (`/dev/rdisk2s1`) the
+same volume as `/dev/disk2s1`, so these checks see through the different names.
+
+**"Not on the source disk" checks** (image files, rescue mapfiles and `pm recover files`
+destinations in the CLI; the same files in the Create Image, Restore Image, Rescue Copy and
+Data Recovery wizards) ask the platform which disk and partition a path is on:
+the volume mount point and its extents on Windows (drive letters and folder mount points
+alike), the filesystem's device on Linux, `diskutil info` on macOS. When the platform cannot
+tell (a network share, a RAM disk, an LVM / device-mapper volume) and the device has a
+mounted filesystem, the path is refused with "Cannot tell which disk ..."; a device with
+nothing mounted cannot hold the path, and Windows UNC shares are accepted.
+
 Limits of these checks: hard links, junctions, storage aliases, a file stored on the disk
-being copied and a differencing image's parent are not detected. In the GUI, the checks
-that an image file, a rescue mapfile or a recovery destination is "not on the source or
-target disk" look at drive letters only; a path that reaches the same volume through a
-folder mount point, a junction, a UNC share or a `\\?\Volume{...}` name is not recognized.
+being copied and a differencing image's parent are not detected.
 
 ## Data safety notes
 

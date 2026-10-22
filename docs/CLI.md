@@ -4,10 +4,16 @@ Generated from the clap definitions by `scripts/gen-cli-docs.sh`; the output of
 `pm <command> --help` is authoritative. Regenerate this file after changing the CLI.
 
 **Device arguments.** Commands that take a device accept `disk:N` (physical disk N),
-`disk:N:P` (partition P of disk N, 1-based), a drive letter (`D:`), a `\\?\Volume{..}\`
-path, or an image file (`file:PATH`, `file:PATH:P`, or a bare path). With the global
+`disk:N:P` (partition P of disk N, 1-based), a drive letter (`D:`) or a `\\?\Volume{..}\`
+path (Windows), a `/dev/...` node (Linux, macOS: a whole disk such as `/dev/sdb`,
+`/dev/nvme0n1` or `/dev/disk2` / `/dev/rdisk2` is the same as its `disk:N`, `/dev/sdb:2` is its
+partition 2, and a partition node such as `/dev/sdb2` or `/dev/disk2s1` is a volume), or an
+image file (`file:PATH`, `file:PATH:P`, or a bare path). Commands that take a disk index
+(`pm create 1 ...`) accept the whole-disk node too. On Linux and macOS prefer the `/dev/...`
+form: `disk:N` is a position in the disk list that can change when a disk is plugged in or
+removed; `pm list` prints each disk's node next to its number. With the global
 `--disk-file PATH` option (repeatable) the image files become `disk:0`, `disk:1`, ... and no
-administrator rights are needed.
+administrator (root) rights are needed.
 
 **Sizes** accept binary suffixes: `4096`, `64K`, `1M`, `1.5G`.
 
@@ -67,7 +73,7 @@ Commands:
   help             Print this message or the help of the given subcommand(s)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -80,7 +86,7 @@ List disks and their partitions
 Usage: pm.exe list [OPTIONS]
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --json              Print the disks as JSON
   -h, --help              Print help
   -V, --version           Print version
@@ -94,10 +100,10 @@ Show the partition table of a disk, volume or image file
 Usage: pm.exe table [OPTIONS] <DEVICE>
 
 Arguments:
-  <DEVICE>  `disk:N`, a drive letter (`D:`), a `\\?\Volume{..}\` path, or an image file (`file:PATH` or PATH)
+  <DEVICE>  `disk:N`, a `/dev/...` node (Linux, macOS: `/dev/sdb`, `/dev/disk2`; prefer it to `disk:N`, a position that can change when a disk is plugged in), a drive letter (`D:`), a `\\?\Volume{..}\` path, or an image file (`file:PATH` or PATH)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --json              Print the table as JSON
   -h, --help              Print help
   -V, --version           Print version
@@ -111,12 +117,12 @@ Mount a volume at a drive letter or an empty folder
 Usage: pm.exe mount [OPTIONS] <--letter <LETTER>|--folder <FOLDER>> <VOLUME>
 
 Arguments:
-  <VOLUME>  Drive letter (`D:`) or `\\?\Volume{..}\` path
+  <VOLUME>  Drive letter (`D:`), `\\?\Volume{..}\` path, or (Linux, macOS) a `/dev/...` partition node
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
-      --letter <LETTER>   Drive letter, e.g. `E` or `E:`
-      --folder <FOLDER>   Empty NTFS folder to use as the mount point
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --letter <LETTER>   Drive letter, e.g. `E` or `E:` (Windows only) (Windows only)
+      --folder <FOLDER>   Empty folder to use as the mount point (on Windows, on an NTFS volume; the only kind on Linux and macOS)
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -129,12 +135,12 @@ Remove a drive letter or folder mount point from a volume
 Usage: pm.exe unmount [OPTIONS] <--letter <LETTER>|--folder <FOLDER>> <VOLUME>
 
 Arguments:
-  <VOLUME>  Drive letter (`D:`) or `\\?\Volume{..}\` path
+  <VOLUME>  Drive letter (`D:`), `\\?\Volume{..}\` path, or (Linux, macOS) a `/dev/...` partition node
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
-      --letter <LETTER>   Drive letter, e.g. `E` or `E:`
-      --folder <FOLDER>   Empty NTFS folder to use as the mount point
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --letter <LETTER>   Drive letter, e.g. `E` or `E:` (Windows only) (Windows only)
+      --folder <FOLDER>   Empty folder to use as the mount point (on Windows, on an NTFS volume; the only kind on Linux and macOS)
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -147,7 +153,7 @@ Print environment diagnostics (elevation, toolchain, disks seen)
 Usage: pm.exe doctor [OPTIONS]
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -163,14 +169,14 @@ Usage: pm.exe clone [OPTIONS] <SRC> <DST>
 
 Arguments:
   <SRC>
-          Source device: `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+          Source device: `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
 
   <DST>
           Destination device; must be at least as large as the source
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --smart
           Copy only the blocks the filesystem marks used
@@ -203,14 +209,14 @@ Usage: pm.exe image [OPTIONS] <SRC> <FILE>
 
 Arguments:
   <SRC>
-          Source device: `disk:N[:P]`, a drive letter, or an image file
+          Source device: `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file
 
   <FILE>
           Image file to create (an existing file is overwritten)
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --format <FORMAT>
           Image format; by default chosen from the file extension
@@ -270,7 +276,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --dst-offset <DST_OFFSET>
           Write starting at this byte offset of the destination (e.g. `1M`)
@@ -302,7 +308,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --format <FORMAT>
           Target format; by default chosen from the output extension
@@ -325,7 +331,7 @@ Usage: pm.exe rescue [OPTIONS] <SRC> <DST> <MAPFILE>
 
 Arguments:
   <SRC>
-          Source device: `disk:N[:P]`, a drive letter, or an image file
+          Source device: `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file
 
   <DST>
           Destination device; must be at least as large as the source. A path that does not exist yet is created as an image file of the source's size (format from --format or the extension)
@@ -335,7 +341,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --format <FORMAT>
           Format of a new destination image (raw, vhd, vhd-fixed, vmdk, vmdk-flat, qcow2). With --format an existing destination is only written to resume it: its mapfile must exist
@@ -389,10 +395,10 @@ Identify the filesystem on a device
 Usage: pm.exe probe [OPTIONS] <DEVICE>
 
 Arguments:
-  <DEVICE>  `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+  <DEVICE>  `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --offset <OFFSET>   Look for the filesystem at this byte offset of the device [default: 0]
   -h, --help              Print help
   -V, --version           Print version
@@ -406,11 +412,11 @@ List a directory of the filesystem on a device
 Usage: pm.exe ls [OPTIONS] <DEVICE> [PATH]
 
 Arguments:
-  <DEVICE>  `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+  <DEVICE>  `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
   [PATH]    Directory or file, `/`-separated (default: the root)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -423,11 +429,11 @@ Write a file of the filesystem on a device to standard output
 Usage: pm.exe cat [OPTIONS] <DEVICE> <PATH>
 
 Arguments:
-  <DEVICE>  `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+  <DEVICE>  `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
   <PATH>    File path, `/`-separated
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -440,12 +446,12 @@ Copy a file or directory tree out of the filesystem on a device
 Usage: pm.exe extract [OPTIONS] <DEVICE> <PATH> <DEST>
 
 Arguments:
-  <DEVICE>  `disk:N[:P]`, a drive letter, or an image file (`file:PATH[:P]`)
+  <DEVICE>  `disk:N[:P]`, a `/dev/...` node (Linux, macOS), a drive letter, or an image file (`file:PATH[:P]`)
   <PATH>    File or directory path, `/`-separated (`/` extracts everything)
   <DEST>    Existing or new directory to extract into
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -465,7 +471,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --dry-run
           Validate and show what would be done; write nothing
@@ -491,10 +497,10 @@ Write an empty partition table to a disk that has no partitions
 Usage: pm.exe init-disk [OPTIONS] <--gpt|--mbr> <DISK>
 
 Arguments:
-  <DISK>  Disk index (`1` or `disk:1`)
+  <DISK>  Disk index (`1` or `disk:1`) or, on Linux and macOS, its node (`/dev/sdb`)
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --gpt                
       --mbr                
       --dry-run            Validate and show what would be done; write nothing
@@ -516,7 +522,7 @@ Arguments:
   <DISK>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --start <START>      Start offset, e.g. `1M` (aligned to 1 MiB)
       --len <LEN>          Length, e.g. `100G`
       --fs <FS>            [possible values: ntfs, fat32, fat16, exfat, refs]
@@ -544,7 +550,7 @@ Arguments:
   <PART>  Partition number as `pm table` prints it
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -565,7 +571,7 @@ Arguments:
   <PART>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --fs <FS>            [possible values: ntfs, fat32, fat16, exfat, refs]
       --label <LABEL>      [default: ""]
       --cluster <CLUSTER>  Cluster size in bytes (default: the filesystem's choice)
@@ -590,7 +596,7 @@ Arguments:
   <PART>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --start <START>      New start offset
       --len <LEN>          New length
       --dry-run            Validate and show what would be done; write nothing
@@ -613,7 +619,7 @@ Arguments:
   <PART>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -635,7 +641,7 @@ Arguments:
   <LABEL>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -657,7 +663,7 @@ Arguments:
   <LETTER>  `E`, `E:` or `none`
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -678,7 +684,7 @@ Arguments:
   <PART>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --type <PTYPE>       [possible values: basic, efi, msr, recovery, linux]
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
@@ -699,7 +705,7 @@ Arguments:
   <DISK>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --method <METHOD>    [default: zero] [possible values: zero, random, dod3]
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
@@ -721,7 +727,7 @@ Arguments:
   <PART>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --method <METHOD>    [default: zero] [possible values: zero, random, dod3]
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
@@ -742,7 +748,7 @@ Arguments:
   <DISK>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --to <TO>            [possible values: gpt, mbr]
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
@@ -763,7 +769,7 @@ Arguments:
   <DISK>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -783,7 +789,7 @@ Arguments:
   <DISK>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
       --allow-system-disk  Let resize, label, drive letter, mount and creating a partition in free space touch the running system disk (destructive operations stay refused)
@@ -804,7 +810,7 @@ Arguments:
   <DST>  Target disk index
 
 Options:
-      --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --sizing <SIZING>      [default: fit] [possible values: exact, fit, proportional]
       --smart                Copy only the blocks the filesystem marks used
       --sector               Copy every sector
@@ -831,7 +837,7 @@ Arguments:
 
 Options:
       --all-partitions       Copy every partition, not only the system ones
-      --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --sizing <SIZING>      [default: fit] [possible values: exact, fit, proportional]
       --boot-fix <BOOT_FIX>  [default: none] [possible values: none, uefi, bios, all]
       --table <TABLE>        Partition table of the copy (default: the same kind as the source); converting maps the partition types, an MBR copy holds at most 4 partitions within 2 TiB [possible values: gpt, mbr]
@@ -862,7 +868,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --format <FORMAT>
           raw, vhd, vhd-fixed, vmdk, vmdk-flat or qcow2 (default: from the file extension)
@@ -937,7 +943,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
 
       --format <FORMAT>
           
@@ -1003,7 +1009,7 @@ Arguments:
   <DISK>  
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --start <START>      Write at this offset of the disk instead of over the whole disk (a partition image)
       --dry-run            Validate and show what would be done; write nothing
       --yes                Apply the operations (without it nothing is written; there is no interactive prompt)
@@ -1028,7 +1034,7 @@ Commands:
   help          Print this message or the help of the given subcommand(s)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -1045,7 +1051,7 @@ Arguments:
 
 Options:
       --disk-file <PATH>
-          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+          Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --quick
           Look at the backup GPT and the free space only, not the whole disk
       --apply
@@ -1080,7 +1086,7 @@ Arguments:
 
 Options:
       --dest <DEST>                    Restore the listed files into this directory
-      --disk-file <PATH>               Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>               Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --session <SESSION>              Save the list to this file
       --min-integrity <MIN_INTEGRITY>  Restore only files whose integrity estimate is at least this (0-100) [default: 0]
   -h, --help                           Print help
@@ -1099,7 +1105,7 @@ Arguments:
 
 Options:
       --dest <DEST>        Extract the carved files into this directory (implies --extract)
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --types <TYPES>      Comma-separated categories: image, document, archive, audio, video, executable, database, other (default: all)
       --sector <SECTOR>    File starts are looked for at multiples of this many bytes (1 = anywhere, slow) [default: 512]
       --session <SESSION>  Save the scan result to this file
@@ -1119,7 +1125,7 @@ Arguments:
   <FILE>  
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -1139,7 +1145,7 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -1155,7 +1161,7 @@ Arguments:
   <PATH>  Directory (or drive root) to scan
 
 Options:
-      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>   Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --threads <THREADS>  Worker threads (default: the number of CPUs)
       --top <TOP>          Entries shown per table [default: 10]
       --json               Print the whole report as JSON
@@ -1175,7 +1181,7 @@ Arguments:
 
 Options:
       --block <BLOCK>     Block size (default 1M)
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -1191,7 +1197,7 @@ Arguments:
   <TARGET>  Directory or drive letter (`D:`) to test
 
 Options:
-      --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>     Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --sizes <SIZES>        Comma-separated transfer sizes (default 4K,8K,16K,32K)
       --total <TOTAL>        Bytes moved per pass (default 200M)
       --queue <QUEUE>        Requests issued back to back per worker (default 8)
@@ -1210,10 +1216,10 @@ Show the SMART health of a disk
 Usage: pm.exe analyze smart [OPTIONS] <DISK>
 
 Arguments:
-  <DISK>  Disk index (`1` or `disk:1`)
+  <DISK>  Disk index (`1` or `disk:1`) or, on Linux and macOS, its node (`/dev/sdb`)
 
 Options:
-      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
+      --disk-file <PATH>  Use this raw image file as a disk instead of the physical disks (repeatable: the first is `disk:0`, the next `disk:1`, ...). Every command that takes a disk, and `list`, then works on the files; no administrator (root) rights are needed. Mounting, formatting and everything else that needs a volume layer is not available on image files
       --json              Print the data as JSON
   -h, --help              Print help
   -V, --version           Print version

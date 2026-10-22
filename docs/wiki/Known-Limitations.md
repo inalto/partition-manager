@@ -47,22 +47,66 @@ yet.
   OS or a disk that is not in use.
 - **Hard links, junctions and storage aliases** are not detected by the source/destination
   overlap checks of the direct-copy commands.
-- **Drive-letter checks only.** The GUI's "not on the source / target disk" checks for image
-  files, rescue mapfiles and recovery destinations look at drive letters: a path that
-  reaches the same volume through a folder mount point, a junction, a UNC share or a
-  `\\?\Volume{...}` name is not recognized.
+- **"Not on the source disk" checks** ask the platform which disk a path is on. A path it
+  cannot place (a network share on Linux/macOS, a RAM disk, an LVM / device-mapper volume)
+  is refused while the device being read has mounted volumes; choose a folder on a disk of
+  the list. Junctions and hard links are not followed.
 - **Old scan sessions.** Scan sessions saved before they recorded the scanned region load as
   whole-device sessions. A carve session saved by an older `pm recover carve` on a
   *partition* therefore restores the wrong bytes: delete it and scan again.
 - **Copying a volume onto a partition of its own disk** (`pm clone <volume> <partition of
   that volume's disk>`) fails with "busy" by design, because the write session locks every
   volume of the destination disk, the open source among them.
-- **Linux and macOS.** The platform crate has a stub (every OS call fails with
-  `Unsupported`) so the engines compile and test on other systems, but there is no real
-  Linux implementation: the Linux build is a stub. Benchmarking is Windows only.
+- **Linux and macOS** have their own section below.
 - **Still to be verified live:** volume reads past the file-system end, the automount
   drive-letter race on create, the drive letter of a migrated clone, copying a live C:
   without VSS, and formatting on removable media.
+
+## Linux
+
+- **Tested in WSL2 only**, on loop devices (a GPT through a write session, `mkfs.vfat`,
+  mount, the busy-unmount rollback). Never run on a physical disk. `mkfs.ntfs`,
+  `mkfs.exfat`, `mkfs.ext4`, `mkfs.xfs`, `ntfsresize`, `e2fsck` / `resize2fs` were tested as
+  command lines only; `ntfs3` mounting and `smartctl` on a real drive were not exercised.
+- **Without root** the disks come from sysfs only: the table shows as "not readable", there
+  are no partition types, unmounted partitions show no file system, and nothing is written.
+- **Disk numbers are positions.** Loop devices are listed last so attaching an image does
+  not renumber real disks, but a hot-plugged USB disk can shift `disk:N`. A write session
+  refuses a disk that changed since it was listed; address disks by node (`/dev/sdb`).
+- **System disk on LVM, dm-crypt, mdraid, ZFS or overlay** cannot be determined, so every
+  disk is protected from whole-disk destructive operations (fail closed). Disks holding
+  LVM / RAID / crypt members or active swap refuse write sessions. Editing LVM, dm or md
+  devices is not supported.
+- **Mounts.** A write session refuses a disk with bind mounts, btrfs subvolumes or covered
+  mounts (they could not be restored exactly). Filesystems on a partition the session wrote
+  into or changed are left unmounted afterwards.
+- **A file system on the whole disk** (no partition table, as on WSL's disks and some USB
+  sticks) shows as one partition at offset 0: it can be formatted, wiped, imaged and cloned,
+  not deleted or resized; wipe the disk to partition it.
+- **ioctl numbers** for powerpc, mips and sparc are encoded by hand and verified on x86_64
+  only.
+- No boot repair, no drive letters, no ReFS.
+
+## macOS
+
+- **Never run on a Mac.** The macOS layer is compile-checked (`aarch64-apple-darwin`,
+  `x86_64-apple-darwin`) and tested on hand-written `diskutil -plist` fixtures (from Apple's
+  key names, not captures). To verify on a real Mac: `BusProtocol` strings on Apple Silicon,
+  `Ejectable` / `RemovableMedia` on USB media, `FreeSpace` on non-APFS volumes, the APFS
+  physical-store key of `diskutil info`, the FAT12/FAT16 personality names, the raw-node
+  ioctls, Disk Arbitration re-mounting after a session, and the `hdiutil` live test.
+- **Without root** partition offsets come from `diskutil` and are approximate: the disk shows
+  "partition table not readable, offsets approximate" and nothing is written from them.
+- **APFS.** Containers are shown as their physical store partition, which carries the
+  container's mount points; APFS containers are not edited. A disk whose table cannot be
+  used (damaged, Apple Partition Map) lists its slices as volumes without a place on the disk.
+  Volumes unmounted by a write session are not mounted again by Partition Manager.
+- **Format** goes through `diskutil eraseVolume` (FAT32, FAT16, FAT12, exFAT, HFS+, APFS),
+  which also sets the partition type and ignores cluster size and quick mode. **NTFS cannot
+  be formatted** (third-party tools needed) and **file systems cannot be resized**.
+- `smartctl` is looked up in the system directories first, then on `PATH`;
+  `disk_of_path` runs one `diskutil` per path component until a mount point answers.
+- No boot repair, no drive letters, no ReFS.
 
 ## Deferred minor findings
 

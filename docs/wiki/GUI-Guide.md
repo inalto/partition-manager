@@ -139,12 +139,30 @@ Smaller actions without a wizard: set active (MBR), set type, align all partitio
   grid. Read-only.
 - **SMART.** Shows the SMART health attributes of a disk in a table with thresholds.
 
-## Settings and the log file
+## On Linux and macOS
+
+The same window and wizards, with these differences:
+
+- Start it with `sudo` for physical disks; without root the disks are listed read-only and
+  the status bar says "Not root: read-only".
+- Disk headers show the device node (`/dev/sdb`, `/dev/rdisk2`). A disk whose partition
+  table could not be read (without root) says "partition table not readable, offsets
+  approximate"; nothing is planned on it.
+- There are no drive letters: Create has no letter field, Mount takes an empty folder, and
+  Change Letter is not offered.
+- Copy Disk and Migrate OS show boot repair disabled: "Boot repair is Windows-only; the
+  clone will not be made bootable from this host."
+- macOS does not offer NTFS when creating or formatting; ReFS is Windows-only.
+- "Open in file manager" uses `xdg-open` (Linux) or `open` (macOS).
+
+
 
 **Settings** holds the Dry run toggle and **Open log folder**. The GUI writes its log to:
 
 ```text
-%LOCALAPPDATA%\PartitionManager\partition-manager.log
+%LOCALAPPDATA%\PartitionManager\partition-manager.log                 (Windows)
+$XDG_STATE_HOME/partition-manager/partition-manager.log              (Linux; default ~/.local/state)
+~/Library/Logs/PartitionManager/partition-manager.log                (macOS)
 ```
 
 When reporting a problem, include that file. For the `pm` command line, set

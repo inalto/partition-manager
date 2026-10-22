@@ -17,10 +17,16 @@ Generated from the clap definitions by `scripts/gen-cli-docs.sh`; the output of
 `pm <command> --help` is authoritative. Regenerate this file after changing the CLI.
 
 **Device arguments.** Commands that take a device accept `disk:N` (physical disk N),
-`disk:N:P` (partition P of disk N, 1-based), a drive letter (`D:`), a `\\?\Volume{..}\`
-path, or an image file (`file:PATH`, `file:PATH:P`, or a bare path). With the global
+`disk:N:P` (partition P of disk N, 1-based), a drive letter (`D:`) or a `\\?\Volume{..}\`
+path (Windows), a `/dev/...` node (Linux, macOS: a whole disk such as `/dev/sdb`,
+`/dev/nvme0n1` or `/dev/disk2` / `/dev/rdisk2` is the same as its `disk:N`, `/dev/sdb:2` is its
+partition 2, and a partition node such as `/dev/sdb2` or `/dev/disk2s1` is a volume), or an
+image file (`file:PATH`, `file:PATH:P`, or a bare path). Commands that take a disk index
+(`pm create 1 ...`) accept the whole-disk node too. On Linux and macOS prefer the `/dev/...`
+form: `disk:N` is a position in the disk list that can change when a disk is plugged in or
+removed; `pm list` prints each disk's node next to its number. With the global
 `--disk-file PATH` option (repeatable) the image files become `disk:0`, `disk:1`, ... and no
-administrator rights are needed.
+administrator (root) rights are needed.
 
 **Sizes** accept binary suffixes: `4096`, `64K`, `1M`, `1.5G`.
 
