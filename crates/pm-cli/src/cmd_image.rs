@@ -61,6 +61,48 @@ fn refuse_source_overwrite(read_from: &[PathBuf], written: &[PathBuf]) -> Result
     Ok(())
 }
 
+/// `(disk, partition)` of a device at `extent` (`Opened::disk_extent`): the whole disk, the
+/// partition starting there, or the whole disk when the range is neither.
+pub(crate) fn place_of_extent(platform: &dyn Platform, (d, start, end): (u32, u64, u64)) -> (u32, Option<u32>) {
+    let disks = platform.enumerate_disks().unwrap_or_default();
+    let Some(disk) = disks.into_iter().find(|x| x.index == d) else { return (d, None) };
+    if start == 0 && end >= disk.size {
+        return (d, None);
+    }
+    (d, disk.partitions.iter().find(|p| p.start == start).map(|p| p.number))
+}
+
+/// Refuse output files (`files`: the image, its `.partial`, the mapfile) that lie on the device
+/// being imaged (`place`), or may lie on it when the platform cannot tell (see
+/// `pm_ops::location`): the export would read what it writes and fill the device.
+pub(crate) fn refuse_files_on_source(platform: &dyn Platform, place: (u32, Option<u32>), files: &[PathBuf]) -> Result<(), CliError> {
+    refuse_files_on(platform, place, files, "imaged")
+}
+
+/// [`refuse_files_on_source`] for a device that is being `role` ("imaged", "rescued",
+/// "written").
+pub(crate) fn refuse_files_on(
+    platform: &dyn Platform,
+    place: (u32, Option<u32>),
+    files: &[PathBuf],
+    role: &str,
+) -> Result<(), CliError> {
+    let disks = platform.enumerate_disks().unwrap_or_default();
+    let volumes = platform.enumerate_volumes().unwrap_or_default();
+    let mounts = pm_ops::MountMap::new(&disks, &volumes);
+    let desc = match place {
+        (d, Some(n)) => format!("partition {n} of Disk {d}, the one being {role}"),
+        (d, None) => format!("Disk {d}, the disk being {role}"),
+    };
+    for f in files {
+        let abs = std::path::absolute(f).unwrap_or_else(|_| f.clone());
+        if let Some(m) = pm_ops::path_problem_on(platform, &mounts, &abs, place, "output file", &desc) {
+            return Err(CliError::Usage(m));
+        }
+    }
+    Ok(())
+}
+
 pub fn run_image(
     platform: &dyn Platform,
     src: &str,
@@ -79,6 +121,9 @@ pub fn run_image(
     let partial = Partial::new(file, fmt);
     let read_from = source_backing_files(platform, source.source_files(), source.disk_index());
     refuse_source_overwrite(&read_from, &partial.files_written())?;
+    if let Some(extent) = source.disk_extent {
+        refuse_files_on_source(platform, place_of_extent(platform, extent), &[file.to_path_buf()])?;
+    }
 
     // Everything that can be refused is refused before any output file is touched.
     let mut shared = SharedSource::new(source.dev);
@@ -157,6 +202,14 @@ pub fn run_image_rescue(
             _ => None,
         };
         refuse_source_overwrite(&source_backing_files(env.platform, Vec::new(), disk), &written)?;
+        let place = match &op {
+            Operation::ImagePartition { disk, number, .. } => Some((*disk, Some(*number))),
+            Operation::ImageDisk { disk, .. } => Some((*disk, None)),
+            _ => None,
+        };
+        if let Some(place) = place {
+            refuse_files_on_source(env.platform, place, &written)?;
+        }
         let flags = RunFlags { dry_run: false, yes: true, allow_system_disk: false };
         return run_ops(env, vec![op], &flags, out);
     }
@@ -167,6 +220,9 @@ pub fn run_image_rescue(
     }
     let read_from = source_backing_files(env.platform, source.source_files(), source.disk_index());
     refuse_source_overwrite(&read_from, &written)?;
+    if let Some(extent) = source.disk_extent {
+        refuse_files_on_source(env.platform, place_of_extent(env.platform, extent), &written)?;
+    }
     let mut shared = SharedSource::new(source.dev);
     let used = plan_used_map(&shared, mode.mode())?;
 
@@ -259,4 +315,31 @@ pub fn run_convert(
         start.elapsed().as_secs_f64()
     )
     .map_err(write_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_files_on_the_source_are_refused() {
+        use pm_core::{DiskInfo, MemDevice};
+        use pm_platform::MockPlatform;
+        let p = MockPlatform::new();
+        p.add_disk(2, MemDevice::new(4 << 20), DiskInfo::default());
+        let tmp = std::env::temp_dir();
+        let on_src = tmp.join("pm-image-on-src");
+        let elsewhere = tmp.join("pm-image-elsewhere");
+        p.set_disk_of_path(&on_src, 2, Some(1));
+        p.set_disk_of_path(&elsewhere, 7, None);
+        let refused = |place, f: &PathBuf| refuse_files_on_source(&p, place, std::slice::from_ref(f)).is_err();
+        assert!(refused((2, None), &on_src.join("x.img")));
+        assert!(refused((2, Some(1)), &on_src.join("x.img")));
+        assert!(!refused((2, Some(2)), &on_src.join("x.img")));
+        assert!(!refused((2, None), &elsewhere.join("x.img")));
+        // a place the platform cannot tell: refused only while the source has mounts (none here)
+        assert!(!refused((2, None), &tmp.join("pm-image-unknown").join("x.img")));
+        assert_eq!(place_of_extent(&p, (2, 0, 4 << 20)), (2, None));
+        assert_eq!(place_of_extent(&p, (9, 0, 1)), (9, None));
+    }
 }

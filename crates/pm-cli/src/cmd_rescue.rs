@@ -357,6 +357,10 @@ fn create_destination(platform: &dyn Platform, a: &RescueArgs, path: &Path) -> R
     }
     // the flags are checked against the source before anything is created
     opts_from_args(a, source.dev.sector_size())?;
+    if let Some(extent) = source.disk_extent {
+        let place = crate::cmd_image::place_of_extent(platform, extent);
+        crate::cmd_image::refuse_files_on(platform, place, &[path.to_path_buf(), a.mapfile.clone()], "rescued")?;
+    }
     drop(source);
     let capacity = align_up(len, 512);
     pm_image::create(path, &CreateOpts { format: fmt, capacity, sparse: true })?;
@@ -412,6 +416,19 @@ fn run_rescue(
                 a.mapfile.display()
             )));
         }
+    }
+    // the image and the mapfile stay off the failing source, and the mapfile off the
+    // destination disk, which is overwritten
+    let mut outputs = vec![a.mapfile.clone()];
+    if let Identity::File(f) = &target.identity {
+        outputs.push(f.clone());
+    }
+    if let Some(extent) = source.disk_extent {
+        let place = crate::cmd_image::place_of_extent(platform, extent);
+        crate::cmd_image::refuse_files_on(platform, place, &outputs, "rescued")?;
+    }
+    if let Some((d, _, _)) = target.disk_extent {
+        crate::cmd_image::refuse_files_on(platform, (d, None), &[a.mapfile.clone()], "written")?;
     }
     let mut opts = opts_from_args(a, source.dev.sector_size())?;
     opts.skip_zero_writes = fresh_sparse;
