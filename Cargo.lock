@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "pm-analyze"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pm-core",
  "pm-image",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "pm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "pm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "pm-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pm-core",
  "serde",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "pm-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "pm-image"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pm-core",
  "pm-fs",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "pm-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pm-core",
  "pm-fs",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "pm-parttable"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "pm-core",
@@ -2793,7 +2793,7 @@ dependencies = [
 
 [[package]]
 name = "pm-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "pm-recover"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pm-core",
  "pm-fs",

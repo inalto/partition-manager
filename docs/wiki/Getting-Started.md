@@ -7,6 +7,12 @@ macOS have their own sections ([build](#linux-and-macos), [run](#on-linux-and-ma
 You need a Rust toolchain from <https://rustup.rs>. Get the source from
 <https://github.com/inalto/partition-manager>.
 
+**Prebuilt binaries.** Every tagged version has `pm` and `partition-manager` on the
+[Releases page](https://github.com/inalto/partition-manager/releases) for Windows x86_64,
+Linux x86_64 (glibc 2.35 or newer) and macOS on Apple Silicon and Intel (unsigned: run
+`xattr -d com.apple.quarantine pm partition-manager` after downloading), with
+`SHA256SUMS.txt`. The rest of this page is for building from source.
+
 ## Building
 
 The release binaries land in `target\release\`: `pm.exe` (command line) and

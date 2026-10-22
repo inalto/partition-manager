@@ -1,0 +1,125 @@
+name: Release
+
+# Builds the release binaries for every supported target when a `v*` tag is pushed and
+# publishes them on the GitHub release of that tag, with the matching CHANGELOG section as
+# notes. `workflow_dispatch` builds the same archives as artifacts without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            # the oldest supported runner: the binaries need its glibc (2.35) or newer
+            os: ubuntu-22.04
+          - name: macos-aarch64
+            os: macos-latest
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Install GUI build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Build and package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\scripts\build-release.ps1
+          $version = (.\dist\pm.exe --version).Split(' ')[1]
+          $name = "partition-manager-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "dist\$name" | Out-Null
+          Copy-Item dist\pm.exe, dist\partition-manager.exe, README.md, LICENSE, CHANGELOG.md "dist\$name\"
+          Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
+          Get-Item "dist\$name.zip"
+
+      - name: Build and package (Linux, macOS)
+        if: runner.os != 'Windows'
+        env:
+          PM_TARGET: ${{ matrix.target }}
+        run: |
+          scripts/build-release.sh
+          ls -la dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish the GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums and release notes
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          cd assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+          # the CHANGELOG section of this version, up to the next "## [" heading
+          awk -v v="$version" '
+            /^## \[/ { p = index($0, "## [" v "]") == 1 }
+            p { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "Release $tag" > notes.md
+          fi
+          cat notes.md
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber assets/*
+          else
+            gh release create "$tag" --title "Partition Manager $tag" --notes-file notes.md assets/*
+          fi
+          gh release view "$tag"
