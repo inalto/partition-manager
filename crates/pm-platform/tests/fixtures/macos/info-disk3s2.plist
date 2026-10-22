@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Bootable</key>
+	<false/>
+	<key>BusProtocol</key>
+	<string>USB</string>
+	<key>CanBeMadeBootable</key>
+	<false/>
+	<key>CanBeMadeBootableRequiresDestroy</key>
+	<false/>
+	<key>Content</key>
+	<string>Microsoft Basic Data</string>
+	<key>DeviceBlockSize</key>
+	<integer>512</integer>
+	<key>DeviceIdentifier</key>
+	<string>disk3s2</string>
+	<key>DeviceNode</key>
+	<string>/dev/disk3s2</string>
+	<key>DiskUUID</key>
+	<string>B1B2C3D4-0000-4000-8000-000000000002</string>
+	<key>Ejectable</key>
+	<true/>
+	<key>EjectableOnly</key>
+	<true/>
+	<key>FilesystemName</key>
+	<string>Windows NT Filesystem (NTFS)</string>
+	<key>FilesystemType</key>
+	<string>ntfs</string>
+	<key>FilesystemUserVisibleName</key>
+	<string>Windows NT File System (NTFS)</string>
+	<key>GlobalPermissionsEnabled</key>
+	<false/>
+	<key>IOKitSize</key>
+	<integer>999994949632</integer>
+	<key>IORegistryEntryName</key>
+	<string>Basic data partition</string>
+	<key>Internal</key>
+	<false/>
+	<key>MediaName</key>
+	<string>Basic data partition</string>
+	<key>MediaType</key>
+	<string>Generic</string>
+	<key>MountPoint</key>
+	<string></string>
+	<key>OS9DriversInstalled</key>
+	<false/>
+	<key>ParentWholeDisk</key>
+	<string>disk3</string>
+	<key>PartitionMapPartition</key>
+	<true/>
+	<key>RAIDMaster</key>
+	<false/>
+	<key>RAIDSlice</key>
+	<false/>
+	<key>Removable</key>
+	<false/>
+	<key>RemovableMedia</key>
+	<false/>
+	<key>RemovableMediaOrExternalDevice</key>
+	<true/>
+	<key>SMARTStatus</key>
+	<string>Not Supported</string>
+	<key>Size</key>
+	<integer>999994949632</integer>
+	<key>SolidState</key>
+	<false/>
+	<key>SupportsGlobalPermissionsDisable</key>
+	<true/>
+	<key>SystemImage</key>
+	<false/>
+	<key>TotalSize</key>
+	<integer>999994949632</integer>
+	<key>VirtualOrPhysical</key>
+	<string>Physical</string>
+	<key>VolumeName</key>
+	<string>DATA</string>
+	<key>VolumeSize</key>
+	<integer>0</integer>
+	<key>WholeDisk</key>
+	<false/>
+	<key>Writable</key>
+	<true/>
+	<key>WritableMedia</key>
+	<true/>
+	<key>WritableVolume</key>
+	<false/>
+</dict>
+</plist>

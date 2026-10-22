@@ -12,6 +12,7 @@ pm-parttable = { path = "../pm-parttable" }
 serde.workspace = true
 uuid.workspace = true
 log.workspace = true
+plist.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

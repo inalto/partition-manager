@@ -8,6 +8,7 @@ pub mod console;
 pub mod file_platform;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod macos;
 pub mod mock;
 #[cfg(unix)]
 pub mod posix;
@@ -21,6 +22,8 @@ pub use mock::MockPlatform;
 pub use traits::*;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxPlatform;
+#[cfg(target_os = "macos")]
+pub use macos::MacPlatform;
 #[cfg(unix)]
 pub use posix::{BenchFile, FileBenchTarget};
 #[cfg(windows)]
@@ -32,7 +35,7 @@ use pm_core::{BlockDevice, DiskInfo, Error, FsKind, ProgressSink, Result, Volume
 use std::sync::Arc;
 
 /// The platform for the current OS: [`WindowsPlatform`] on Windows, [`LinuxPlatform`] on Linux,
-/// [`NullPlatform`] elsewhere.
+/// [`MacPlatform`] on macOS, [`NullPlatform`] elsewhere.
 pub fn default_platform() -> Arc<dyn Platform> {
     #[cfg(windows)]
     {
@@ -42,7 +45,11 @@ pub fn default_platform() -> Arc<dyn Platform> {
     {
         Arc::new(LinuxPlatform::new())
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(MacPlatform::new())
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         Arc::new(NullPlatform)
     }

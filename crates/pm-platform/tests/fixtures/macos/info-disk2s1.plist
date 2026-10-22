@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Bootable</key>
+	<false/>
+	<key>BusProtocol</key>
+	<string>USB</string>
+	<key>CanBeMadeBootable</key>
+	<false/>
+	<key>CanBeMadeBootableRequiresDestroy</key>
+	<false/>
+	<key>Content</key>
+	<string>Windows_FAT_32</string>
+	<key>DeviceBlockSize</key>
+	<integer>512</integer>
+	<key>DeviceIdentifier</key>
+	<string>disk2s1</string>
+	<key>DeviceNode</key>
+	<string>/dev/disk2s1</string>
+	<key>Ejectable</key>
+	<true/>
+	<key>EjectableOnly</key>
+	<true/>
+	<key>FilesystemName</key>
+	<string>MS-DOS FAT32</string>
+	<key>FilesystemType</key>
+	<string>msdos</string>
+	<key>FilesystemUserVisibleName</key>
+	<string>MS-DOS (FAT32)</string>
+	<key>FreeSpace</key>
+	<integer>12007561216</integer>
+	<key>GlobalPermissionsEnabled</key>
+	<true/>
+	<key>IOKitSize</key>
+	<integer>16007561216</integer>
+	<key>IORegistryEntryName</key>
+	<string>Untitled</string>
+	<key>Internal</key>
+	<false/>
+	<key>MediaName</key>
+	<string></string>
+	<key>MediaType</key>
+	<string>Generic</string>
+	<key>MountPoint</key>
+	<string>/Volumes/STICK</string>
+	<key>OS9DriversInstalled</key>
+	<false/>
+	<key>ParentWholeDisk</key>
+	<string>disk2</string>
+	<key>PartitionMapPartition</key>
+	<true/>
+	<key>RAIDMaster</key>
+	<false/>
+	<key>RAIDSlice</key>
+	<false/>
+	<key>Removable</key>
+	<false/>
+	<key>RemovableMedia</key>
+	<false/>
+	<key>RemovableMediaOrExternalDevice</key>
+	<true/>
+	<key>SMARTStatus</key>
+	<string>Not Supported</string>
+	<key>Size</key>
+	<integer>16007561216</integer>
+	<key>SolidState</key>
+	<false/>
+	<key>SupportsGlobalPermissionsDisable</key>
+	<true/>
+	<key>SystemImage</key>
+	<false/>
+	<key>TotalSize</key>
+	<integer>16007561216</integer>
+	<key>VirtualOrPhysical</key>
+	<string>Physical</string>
+	<key>VolumeName</key>
+	<string>STICK</string>
+	<key>VolumeSize</key>
+	<integer>16007561216</integer>
+	<key>WholeDisk</key>
+	<false/>
+	<key>Writable</key>
+	<true/>
+	<key>WritableMedia</key>
+	<true/>
+	<key>WritableVolume</key>
+	<true/>
+</dict>
+</plist>

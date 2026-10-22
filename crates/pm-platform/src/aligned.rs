@@ -12,8 +12,9 @@ use std::io;
 pub const MAX_CHUNK: usize = 8 << 20;
 /// Memory alignment of the bounce buffer (covers 512e and 4Kn devices).
 const BUF_ALIGN: usize = 4096;
-/// `ERROR_INVALID_PARAMETER`, returned by Windows for misaligned raw I/O.
-const ERROR_INVALID_PARAMETER: i32 = 87;
+/// The error a raw device returns for misaligned I/O: `ERROR_INVALID_PARAMETER` (87) on Windows,
+/// `EINVAL` (22) for macOS `/dev/rdiskN` nodes.
+const ERROR_INVALID_PARAMETER: i32 = if cfg!(windows) { 87 } else { 22 };
 
 /// A device whose primitive I/O must be sector-aligned in offset and length.
 pub trait RawSectorIo {
