@@ -12,7 +12,7 @@ use crate::tools::{error_text, Task};
 use pm_core::Error;
 use pm_update::{Check, Fetch, InstallKind, Release, Version};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The toast shown when an update or a restart must wait.
@@ -146,6 +146,11 @@ impl UpdateState {
         self.release.as_ref()
     }
 
+    /// The folder the update is installed into, when it is known.
+    pub fn install_dir(&self) -> Option<&Path> {
+        self.install_dir.as_deref()
+    }
+
     /// Why the release of the notice cannot be installed here, if it cannot.
     pub fn install_problem(&self) -> Option<String> {
         if let Some(p) = &self.folder_problem {
@@ -237,7 +242,11 @@ impl AppState {
         }
     }
 
+    /// A check ended with `r`. What it opens (the queued What's new or confirmation, a manual
+    /// check's error) never replaces what is on screen: under a dialog or a modal window the
+    /// queued request is dropped and the error becomes a toast.
     fn check_finished(&mut self, r: pm_core::Result<Check>, manual: bool, then: Option<Then>) {
+        let free = !self.modal();
         let u = &mut self.update;
         match r {
             Ok(Check::Newer(release)) => {
@@ -255,6 +264,7 @@ impl AppState {
                 u.refresh_can_install();
                 u.save();
                 match then {
+                    _ if !free => {}
                     Some(Then::WhatsNew) => self.handle_update(Cmd::UpdateWhatsNew),
                     Some(Then::Ask) => self.handle_update(Cmd::UpdateAsk),
                     None => {}
@@ -272,7 +282,12 @@ impl AppState {
             Err(e) => {
                 log::warn!("update check failed: {e}");
                 if manual {
-                    self.dialog = Some(Dialog::Error(format!("Cannot check for updates: {}", error_text(&e))));
+                    let text = format!("Cannot check for updates: {}", error_text(&e));
+                    if free {
+                        self.dialog = Some(Dialog::Error(text));
+                    } else {
+                        self.toast(text);
+                    }
                 }
             }
         }
@@ -598,6 +613,68 @@ mod tests {
         wait_update(&mut s);
         assert!(matches!(&s.dialog, Some(Dialog::UpdateConfirm { release }) if release.version == v("0.9.0")));
         assert_eq!(fetch.requested().len(), 2);
+    }
+
+    #[test]
+    fn a_finished_check_never_replaces_an_open_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let found = Found { version: "0.9.0".into(), page_url: PAGE.into() };
+        Settings { found: Some(found), ..Settings::default() }.save(&path).unwrap();
+        let apply = || Dialog::Confirm { allow_system: false };
+        let is_apply = |d: &Option<Dialog>| matches!(d, Some(Dialog::Confirm { .. }));
+
+        // Update on a remembered notice, then the Apply confirmation opens while it checks:
+        // the queued request is dropped
+        for cmd in [Cmd::UpdateAsk, Cmd::UpdateWhatsNew] {
+            let u = UpdateState::new(Arc::new(fake_release("0.9.0")), Some(path.clone()), None, v("0.2.2"));
+            let mut s = mock_state().with_update(u);
+            s.handle(cmd.clone());
+            assert!(s.update.checking());
+            s.dialog = Some(apply());
+            wait_update(&mut s);
+            assert!(is_apply(&s.dialog), "{cmd:?}: {:?}", s.dialog);
+            assert_eq!(s.update.release().unwrap().version, v("0.9.0"), "the release is still known");
+            // once the dialog is closed, the next click opens it at once
+            s.handle(Cmd::CloseDialog);
+            s.handle(cmd);
+            assert!(matches!(s.dialog, Some(Dialog::UpdateConfirm { .. } | Dialog::WhatsNew { .. })));
+        }
+
+        // a modal window, not a dialog, is on screen: the request is dropped as well
+        let u = UpdateState::new(Arc::new(fake_release("0.9.0")), Some(path.clone()), None, v("0.2.2"));
+        let mut s = mock_state().with_update(u);
+        s.handle(Cmd::UpdateWhatsNew);
+        s.windows.push(Box::new(Modal));
+        wait_update(&mut s);
+        assert!(s.dialog.is_none());
+
+        // a manual check that fails under an open dialog: a toast, the dialog stays
+        let (mut s, _path, _dir) = state_with(MapFetch::new(), "0.2.2");
+        s.handle(Cmd::CheckUpdates);
+        s.dialog = Some(apply());
+        wait_update(&mut s);
+        assert!(is_apply(&s.dialog), "{:?}", s.dialog);
+        assert!(toast(&s).contains("Cannot check for updates"), "{}", toast(&s));
+        assert!(toast(&s).contains(LATEST_URL), "{}", toast(&s));
+    }
+
+    /// A modal window without a worker.
+    struct Modal;
+
+    impl ToolWindow for Modal {
+        fn kind(&self) -> WindowKind {
+            WindowKind::Benchmark
+        }
+        fn modal(&self) -> bool {
+            true
+        }
+        fn running(&self) -> bool {
+            false
+        }
+        fn show(&mut self, _ctx: &eframe::egui::Context, _env: &ToolEnv) -> WindowOutcome {
+            WindowOutcome::Open
+        }
     }
 
     #[test]

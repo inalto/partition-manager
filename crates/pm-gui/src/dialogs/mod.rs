@@ -6,6 +6,7 @@
 pub mod confirm;
 pub mod progress;
 pub mod properties;
+pub mod update;
 
 use crate::app::{AppState, Cmd, Dialog};
 use crate::theme::DANGER;
@@ -78,8 +79,9 @@ pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<C
     match dlg {
         Dialog::Error(msg) => message(ctx, "Cannot do that", msg, out),
         Dialog::Confirm { allow_system } => confirm::show(ctx, s, allow_system, out),
-        // drawn by the update dialogs (next step); until then they stay open, undrawn
-        Dialog::WhatsNew { .. } | Dialog::UpdateConfirm { .. } | Dialog::Updated { .. } => true,
+        Dialog::WhatsNew { release } => update::whats_new(ctx, release, out),
+        Dialog::UpdateConfirm { release } => update::confirm(ctx, s, release, out),
+        Dialog::Updated { version } => update::updated(ctx, *version, out),
         Dialog::Report { report, dry_run, note } => {
             let mut keep = true;
             let title = match (report.failed.is_some(), *dry_run) {

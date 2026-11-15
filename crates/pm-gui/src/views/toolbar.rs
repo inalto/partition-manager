@@ -65,6 +65,14 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
             {
                 out.push(Cmd::SetDryRun(dry));
             }
+            let mut check = s.update.settings.check_updates;
+            if ui.checkbox(&mut check, "Check for updates at startup").changed() {
+                out.push(Cmd::SetCheckUpdates(check));
+            }
+            if ui.button("Check for updates now").clicked() {
+                out.push(Cmd::CheckUpdates);
+                ui.close_menu();
+            }
             ui.separator();
             if ui
                 .button("Open log folder")

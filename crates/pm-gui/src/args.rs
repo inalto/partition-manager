@@ -11,6 +11,7 @@ Options:
   --disk-file <PATH>  Show the disk image file PATH as a disk instead of the
                       physical disks (repeatable; disks are numbered from 0)
   --dry-run           Start with \"dry run\" enabled: Apply only simulates
+  --no-update-check   Do not look for a newer release at startup
   -h, --help          Print this help and exit
 ";
 
@@ -19,6 +20,7 @@ pub struct Args {
     pub disk_files: Vec<PathBuf>,
     pub dry_run: bool,
     pub help: bool,
+    pub no_update_check: bool,
 }
 
 /// Parse the arguments after the program name.
@@ -33,6 +35,7 @@ where
         match a.as_str() {
             "-h" | "--help" => out.help = true,
             "--dry-run" => out.dry_run = true,
+            "--no-update-check" => out.no_update_check = true,
             "--disk-file" => {
                 let p = it.next().ok_or("--disk-file needs a path")?;
                 out.disk_files.push(nonempty_path(&p)?);
@@ -67,6 +70,13 @@ mod tests {
         assert!(!a.help);
         assert!(parse(["-h"]).unwrap().help);
         assert!(parse(["--help"]).unwrap().help);
+    }
+
+    #[test]
+    fn no_update_check_flag_parses() {
+        assert!(parse(["--no-update-check"]).unwrap().no_update_check);
+        assert!(!parse(["--dry-run"]).unwrap().no_update_check);
+        assert!(USAGE.contains("  --no-update-check   Do not look for a newer release at startup\n"));
     }
 
     #[test]

@@ -3,8 +3,10 @@
 
 use crate::app::{AppState, Cmd, JobKind, StartOptions};
 use crate::args::Args;
-use crate::dialogs::{self, progress, properties};
+use crate::dialogs::{self, progress, properties, update as update_dialogs};
+use crate::settings::settings_dir;
 use crate::theme::{self, Theme, DANGER};
+use crate::update::UpdateState;
 use crate::views::{disk_map, disk_table, icons, legend, sidebar, toolbar};
 use crate::tools::WindowOutcome;
 use crate::wizard::WizardOutcome;
@@ -41,8 +43,8 @@ impl PartitionApp {
             theme::apply(ctx, s.theme);
             self.applied_theme = Some(s.theme);
         }
-        if s.busy() {
-            // poll the job's progress and result without blocking the UI thread
+        if s.busy() || s.update.busy() {
+            // poll the job's (or the updater's) progress and result without blocking the UI thread
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         // Closing the window mid-Apply would kill the worker between two writes.
@@ -55,6 +57,11 @@ impl PartitionApp {
         if s.windows.iter().any(|w| w.writing()) && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             s.toast("A recovery job is writing: wait for it to finish or cancel it first");
+        }
+        // and for the install, which swaps the executables
+        if s.update.downloading.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            s.toast("The update is being installed: wait for it to finish or cancel it first");
         }
 
         let mut cmds: Vec<Cmd> = Vec::new();
@@ -77,7 +84,9 @@ impl PartitionApp {
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_enabled_ui(enabled, |ui| {
-                // inside the enabled scope: Retry must not start a refresh under a modal
+                // inside the enabled scope: Retry must not start a refresh under a modal (nor
+                // the notice's buttons open a dialog)
+                update_dialogs::notice(ui, &s.update, &mut cmds);
                 if let Some(b) = &s.banner {
                     banner(ui, b, &mut cmds);
                 }
@@ -114,6 +123,9 @@ impl PartitionApp {
                 progress::show(ctx, job, &mut cmds);
             }
         }
+        if let Some(task) = &s.update.downloading {
+            update_dialogs::download(ctx, task, s.update.release().map(|r| r.version), &mut cmds);
+        }
         if let Some(mut w) = s.wizard.take() {
             let wctx = s.wizard_ctx(&w);
             match w.wizard.show(ctx, &wctx) {
@@ -140,6 +152,10 @@ impl PartitionApp {
 
         for c in cmds {
             s.handle(c);
+        }
+        if s.quit {
+            // the updated version has been started
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
@@ -191,10 +207,36 @@ pub fn platform_for(args: &Args) -> Result<(Arc<dyn Platform>, Option<String>), 
     Ok((Arc::new(p), Some(format!("Disk files: {}", names.join(", ")))))
 }
 
+/// Whether to run the automatic update check at startup: not with `--no-update-check`, and
+/// in a debug build only when `PM_UPDATE_CURRENT` sets the version to pretend to run.
+pub fn auto_check_wanted(no_update_check: bool, debug_build: bool, current_overridden: bool) -> bool {
+    !no_update_check && (!debug_build || current_overridden)
+}
+
+/// The update state of this run: the settings file in the configuration folder, the folder
+/// of the executable (cleaned of what an earlier update left there), and the automatic check
+/// when it is wanted and due.
+fn start_update(state: &mut AppState, args: &Args) {
+    let install_dir = pm_update::install_dir().ok();
+    if let Some(dir) = &install_dir {
+        pm_update::clean_up(dir);
+    }
+    let settings = settings_dir().map(|d| d.join("settings.json"));
+    let fetch = Arc::new(pm_update::HttpFetch::new());
+    state.update = UpdateState::new(fetch, settings, install_dir, pm_update::Version::current());
+    let overridden = std::env::var_os("PM_UPDATE_CURRENT").is_some();
+    if auto_check_wanted(args.no_update_check, cfg!(debug_assertions), overridden) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        state.start_auto_check(now);
+    }
+}
+
 /// Open the main window and run until it is closed.
 pub fn run(args: Args) -> Result<(), String> {
     let (platform, source) = platform_for(&args)?;
     let opts = StartOptions { dry_run: args.dry_run, source };
+    let mut state = AppState::new(platform, opts);
+    start_update(&mut state, &args);
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Partition Manager")
@@ -205,7 +247,7 @@ pub fn run(args: Args) -> Result<(), String> {
     eframe::run_native(
         "Partition Manager",
         native,
-        Box::new(move |cc| Ok(Box::new(PartitionApp::new(cc, AppState::new(platform, opts))))),
+        Box::new(move |cc| Ok(Box::new(PartitionApp::new(cc, state)))),
     )
     .map_err(|e| e.to_string())
 }
@@ -271,6 +313,123 @@ mod tests {
         frame(&mut app);
         frame(&mut app);
         assert!(app.state.dialog.is_some());
+    }
+
+    #[test]
+    fn automatic_check_only_where_wanted() {
+        // release builds check unless told not to
+        assert!(auto_check_wanted(false, false, false));
+        assert!(!auto_check_wanted(true, false, false));
+        // debug builds (and tests) only with PM_UPDATE_CURRENT
+        assert!(!auto_check_wanted(false, true, false));
+        assert!(auto_check_wanted(false, true, true));
+        assert!(!auto_check_wanted(true, true, true));
+    }
+
+    /// A worker standing in for the install: reports `total` bytes and runs until cancelled.
+    fn fake_install(total: u64) -> crate::tools::Task<pm_update::Version> {
+        let task = crate::tools::Task::spawn("Updating Partition Manager", move |p, c| {
+            p.report(&pm_core::ProgressReport {
+                phase: "Downloading".into(),
+                done: total / 2,
+                total,
+                ..Default::default()
+            });
+            while c.check().is_ok() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(pm_core::Error::Cancelled)
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while task.progress().phase.is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task
+    }
+
+    /// The update notice and every update window draw headlessly; the close of the window is
+    /// refused while the install runs, and `quit` closes it.
+    #[test]
+    fn update_frames_render_headless() {
+        use crate::update::UpdateState;
+        use pm_update::testing::{release_fixture, release_json};
+        let dir = tempfile::tempdir().unwrap();
+        let (fetch, r) = release_fixture("0.9.0", true);
+        let fetch = fetch.with(pm_update::LATEST_URL, release_json(&r));
+        let u = UpdateState::new(
+            Arc::new(fetch),
+            Some(dir.path().join("settings.json")),
+            None,
+            pm_update::Version::parse("0.2.2").unwrap(),
+        );
+        let mut state = crate::test_util::mock_state().with_update(u);
+        state.update.start_check(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.update.busy() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+            state.poll_job();
+        }
+        assert!(state.update.notice.is_some());
+        let mut app = PartitionApp { state, applied_theme: None };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut PartitionApp, close: bool| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+                ..Default::default()
+            };
+            if close {
+                input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+            }
+            ctx.run(input, |ctx| app.draw(ctx))
+        };
+        let window = |title: &str| ctx.memory(|m| m.area_rect(egui::Id::new(title))).is_some();
+        // the notice, also when the release cannot be installed here (no install folder)
+        assert!(!app.state.update.can_install);
+        frame(&mut app, false);
+        app.state.update.can_install = true;
+        frame(&mut app, false);
+        app.state.update.hidden = true;
+        frame(&mut app, false);
+        app.state.update.hidden = false;
+
+        app.state.handle(Cmd::UpdateWhatsNew);
+        frame(&mut app, false);
+        frame(&mut app, false);
+        assert!(window("What's new in 0.9.0"));
+        app.state.handle(Cmd::CloseDialog);
+        app.state.handle(Cmd::UpdateAsk);
+        frame(&mut app, false);
+        frame(&mut app, false);
+        assert!(window("Update to 0.9.0"));
+        app.state.dialog = Some(crate::app::Dialog::Updated { version: pm_update::Version::parse("0.9.0").unwrap() });
+        frame(&mut app, false);
+        frame(&mut app, false);
+        assert!(window("Update installed"));
+        app.state.dialog = None;
+
+        // the download, before and after its size is known
+        for total in [0, 4 << 20] {
+            app.state.update.downloading = Some(fake_install(total));
+            frame(&mut app, false);
+            frame(&mut app, false);
+            assert!(window("Updating to 0.9.0"));
+            app.state.toast = None;
+            let out = frame(&mut app, true);
+            let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(cmds.contains(&egui::ViewportCommand::CancelClose), "{cmds:?}");
+            let text = app.state.toast.as_ref().map(|t| t.text.clone()).unwrap_or_default();
+            assert_eq!(text, "The update is being installed: wait for it to finish or cancel it first");
+            app.state.update.downloading = None;
+        }
+
+        // quit (after starting the new version) closes the window
+        let out = frame(&mut app, false);
+        assert!(!out.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));
+        app.state.quit = true;
+        let out = frame(&mut app, false);
+        assert!(out.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));
     }
 
     /// Clicking Apply in the confirmation starts the job (the click is a real pointer click
