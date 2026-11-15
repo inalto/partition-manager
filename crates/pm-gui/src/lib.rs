@@ -16,6 +16,7 @@ pub mod jobs;
 pub mod logging;
 pub mod main_window;
 pub mod selection;
+pub mod settings;
 pub mod theme;
 pub mod tools;
 pub mod views;

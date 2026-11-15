@@ -23,6 +23,9 @@ pm-fs = { path = "../pm-fs" }
 pm-image = { path = "../pm-image" }
 pm-recover = { path = "../pm-recover" }
 pm-analyze = { path = "../pm-analyze" }
+pm-update = { path = "../pm-update" }
+serde.workspace = true
+serde_json.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
 log.workspace = true
