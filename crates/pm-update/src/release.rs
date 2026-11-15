@@ -77,16 +77,37 @@ pub fn parse_release(json: &str, target: Option<&str>) -> Result<Option<Release>
 }
 
 /// Whether `url` may be requested: `https` on `github.com`, `api.github.com`
-/// or a `*.githubusercontent.com` host, no userinfo, no port.
+/// or a `*.githubusercontent.com` host, no userinfo, no port. The URL is
+/// parsed with the same WHATWG parser ureq uses, so the host checked is the
+/// host connected to; control characters, spaces and backslashes are refused
+/// outright.
 pub fn url_allowed(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let host = rest.split('/').next().unwrap_or("");
-    if host.is_empty() || host.contains('@') || host.contains(':') {
+    if url.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
         return false;
     }
-    host == "github.com" || host == "api.github.com" || host.ends_with(".githubusercontent.com")
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+    {
+        return false;
+    }
+    // The parser drops a default port (`:443`); an explicit port is refused anyway.
+    let authority = url.split_once("://").map_or("", |(_, r)| r);
+    if authority.split(['/', '?', '#']).next().is_some_and(|a| a.contains(':')) {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            host == "github.com"
+                || host == "api.github.com"
+                || host.strip_suffix(".githubusercontent.com").is_some_and(|p| !p.is_empty())
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +163,16 @@ mod tests {
             "https://evilgithub.com/x",
             "https://example.com/github.com",
             "https://user@evil.example/github.com",
+            "https://evil.com?.githubusercontent.com",
+            "https://evil.com#.githubusercontent.com",
+            "https://evil.com\\.githubusercontent.com",
+            "https://evil.com\\@github.com/x",
+            "https://github.com\t.evil.com/x",
+            "https://evil.com\n.githubusercontent.com/x",
+            "https://github.com./x",
+            "https://github.com:443/x",
+            "https://:pw@github.com/x",
+            " https://github.com/x",
             "file:///etc/passwd",
             "",
         ] {
