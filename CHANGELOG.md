@@ -8,13 +8,16 @@ project is pre-1.0 (minor bumps may change behaviour).
 
 ### Added
 - **Update check and in-place update.** The desktop application looks for a newer release at
-  startup (at most once a day; `api.github.com` only, no other data than a generic user
-  agent) and shows a notice with What's new, Update and Skip this version. Update downloads
-  the archive for the platform, verifies it against `SHA256SUMS.txt`, replaces
-  `partition-manager` and, beside it, `pm` (both or neither) and offers a restart. Turn the
-  check off with `Settings > Check for updates at startup` or `--no-update-check`; the
-  settings file is `settings.json` in the per-user configuration folder. Releases are not
-  signed.
+  startup when the last successful check is more than 24 hours old (a failed check is tried
+  again at the next start; `api.github.com` only, no other data than a generic user agent)
+  and shows a notice with What's new, Update and Skip this version. A failed automatic check
+  is only logged; `Settings > Check for updates now` reports the error. Update downloads the
+  archive for the platform, only from this repository's release downloads, verifies it
+  against `SHA256SUMS.txt`, replaces `partition-manager` and, beside it, `pm` (both or
+  neither) and offers a restart; the previous files stay as `*.old` until the new version
+  has opened its window at the next start. Turn the check off with `Settings > Check for
+  updates at startup` or `--no-update-check`; the settings file is `settings.json` in the
+  per-user configuration folder. Releases are not signed.
 
 ### Fixed
 - **The Apply button of the confirmation starts the job.** The confirmation closed itself

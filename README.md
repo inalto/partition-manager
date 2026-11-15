@@ -28,37 +28,51 @@ The release workflow (`.github/workflows/release.yml`) builds them from the tag 
 
 ## Updates
 
-The desktop application looks for a newer release when it starts, at most once every 24
-hours. The check is one request to `api.github.com` (the latest release of
+The desktop application looks for a newer release when it starts, if the last successful
+check is more than 24 hours old; a check that failed (offline, for example) is tried again at
+the next start. The check is one request to `api.github.com` (the latest release of
 `inalto/partition-manager`) with the user agent `partition-manager/<version>`; nothing else
-is sent. A failed or offline check is only written to the log. If a newer version exists, a
-bar above the disk views names it and offers **What's new** (the release notes), **Update**,
-**Skip this version** and a close button (**x**, hides it until the next start). Where the
-application cannot update itself (a folder it cannot write to, or a platform without a
-release archive) the bar offers **Open the download page** instead of **Update**.
+is sent. A failed automatic check is only written to the log; `Settings > Check for updates
+now` reports its error. If a newer version exists, a bar above the disk views names it and
+offers **What's new** (the release notes), **Update**, **Skip this version** and a close
+button (**x**, hides it until the next start). Where the application cannot update itself (a
+folder it cannot write to, a platform without a release archive, or a release without an
+archive for your platform or without checksums) the bar offers **Open the download page**
+instead of **Update**, and **Update** on a notice remembered from an earlier start says why
+it cannot install the release instead of asking for confirmation. The download page is the
+release's page on GitHub, or the newest release's page when the release names none.
 
 Nothing is downloaded until you press **Update** and confirm. It then downloads the archive
-for your platform from GitHub (only `github.com`, `api.github.com` and
-`*.githubusercontent.com` over https are ever contacted), checks it against the SHA-256 in
-the release's `SHA256SUMS.txt`, and replaces `partition-manager` and, when it sits in the
-same folder, `pm` by name with the files from the archive (and the README, LICENSE and
-CHANGELOG already there). Both executables are replaced or neither; if a step fails the
-previous files are put back. The old files are kept as `*.old` until the next start, which
-removes them. In the unlikely case that the previous files cannot be put back, the error
-message names them and where their previous versions are, so you can restore them by hand.
-When it is done, **Restart now** starts the new version with the same arguments; **Later**
-keeps the old one running.
+for your platform from GitHub, checks it against the SHA-256 in the release's
+`SHA256SUMS.txt`, and replaces `partition-manager` and, when it sits in the same folder, `pm`
+by name with the files from the archive (and the README, LICENSE and CHANGELOG already
+there). The archive and the checksums are only accepted from this repository's release
+downloads (`https://github.com/inalto/partition-manager/releases/download/...`), and only
+`github.com`, `api.github.com` and `*.githubusercontent.com` over https are ever contacted,
+redirects included. Both executables are replaced or neither; if a step fails the previous
+files are put back. In the unlikely case that the previous files cannot be put back, the
+error message names them and where their previous versions are, so you can restore them by
+hand. When it is done, **Restart now** starts the new version with the same arguments;
+**Later** keeps the old one running (the new version is not offered again in that session:
+**Update** and **Check for updates now** show the restart message instead).
 
-**Update** and **Restart now** are unavailable while an operation or job is running (the
-application asks you to wait for it). The restart drops the pending operations and the open
-windows, and the confirmation tells you how many. Nothing is written to a disk by an update.
+The previous files are kept as `partition-manager.old` and `pm.old` (`.exe.old` on Windows)
+and removed at the next start, once the new version has opened its window. If the
+application is missing after an interrupted update (a power loss in the middle of the swap,
+say), rename `partition-manager.old` (`partition-manager.exe.old` on Windows) back to
+`partition-manager` (`partition-manager.exe`), and the same for `pm`.
+
+While an operation, job or tool is running, **Update** and **Restart now** stay clickable
+but only answer "Wait for the running work to finish first". The restart drops the pending
+operations and the open windows; the confirmation says how many operations are pending and
+that the open windows are dropped. Nothing is written to a disk by an update.
 
 To turn the automatic check off, clear `Settings > Check for updates at startup`, or start
 the application with `--no-update-check`. `Settings > Check for updates now` checks on
-demand. The choice, the time of the last check, a skipped version and the release found are
-kept in `settings.json`, in `%APPDATA%\PartitionManager` on Windows,
-`~/Library/Application Support/PartitionManager` on macOS and
-`$XDG_CONFIG_HOME/partition-manager` (or `~/.config/partition-manager`) on Linux.
+demand, whenever the last check was. The choice, the time of the last successful check, a
+skipped version and the release found are kept in `settings.json`, in
+`%APPDATA%\PartitionManager` on Windows, `~/Library/Application Support/PartitionManager` on
+macOS and `$XDG_CONFIG_HOME/partition-manager` (or `~/.config/partition-manager`) on Linux.
 
 Releases are not signed. The checksum protects against a corrupted download, not against a
 compromised release: trusting an update is the same as trusting a manual download from the
