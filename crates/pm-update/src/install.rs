@@ -32,15 +32,24 @@ pub fn install_dir() -> Result<PathBuf> {
     Ok(strip_verbatim(dir))
 }
 
+/// `\\?\C:\...` becomes `C:\...`; every other path, verbatim or not (`\\?\UNC\...`,
+/// `\\?\Volume{...}\...`), is returned unchanged: dropping its prefix would change its
+/// meaning or make it relative.
 fn strip_verbatim(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        // `\\?\UNC\server\share` is left alone: dropping the prefix would
-        // change its meaning.
-        Some(rest) if !rest.starts_with(r"UNC\") => PathBuf::from(rest),
-        _ => path.to_path_buf(),
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    if let Some(Component::Prefix(p)) = components.next() {
+        if let Prefix::VerbatimDisk(drive) = p.kind() {
+            let mut plain = PathBuf::from(format!("{}:", char::from(drive)));
+            plain.push(components.as_path());
+            return plain;
+        }
     }
+    path.to_path_buf()
 }
+
+/// Start of the name of the file `install_kind` creates to test the folder.
+const PROBE: &str = ".pm-update-probe-";
 
 /// Whether this installation can update itself.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,12 +60,17 @@ pub enum InstallKind {
 }
 
 /// `Unavailable` when this platform has no release archive or when nothing
-/// can be created in `dir` (a system-wide, read-only or missing folder).
+/// can be created in `dir` (a system-wide, read-only or missing folder). The test
+/// creates and removes a probe file; one left over by an earlier run with the same
+/// process id is removed first.
 pub fn install_kind(dir: &Path) -> InstallKind {
     if TARGET.is_none() {
         return InstallKind::Unavailable("self-update is not available on this platform".into());
     }
-    let probe = dir.join(format!(".pm-update-probe-{}", std::process::id()));
+    let probe = dir.join(format!("{PROBE}{}", std::process::id()));
+    if std::fs::symlink_metadata(&probe).is_ok_and(|m| !m.is_dir()) {
+        let _ = std::fs::remove_file(&probe);
+    }
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
         Ok(file) => {
             drop(file);
@@ -215,10 +229,17 @@ fn undo_one(
 }
 
 /// Removes the previous versions (`<name>.old`) and the staging folder left
-/// by an update. Errors are ignored: a file still in use is retried at the
-/// next start. An `.old` whose executable is missing is the only copy left
-/// of it (a failed rollback): it stays, and so does the staging folder.
+/// by an update, and probe files left by `install_kind`. Errors are ignored:
+/// a file still in use is retried at the next start. An `.old` whose
+/// executable is missing is the only copy left of it (a failed rollback): it
+/// stays, and so does the staging folder.
 pub fn clean_up(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let is_probe = entry.file_name().to_str().is_some_and(|n| n.starts_with(PROBE));
+        if is_probe && entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
     let mut orphan = false;
     for name in executables() {
         if dir.join(&name).exists() {
@@ -596,6 +617,52 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
         if !can_write {
             assert!(matches!(kind, InstallKind::Unavailable(_)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn install_kind_is_not_fooled_by_a_stale_probe_file() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), &format!(".pm-update-probe-{}", std::process::id()), "left by a crash");
+        assert_eq!(install_kind(dir.path()), InstallKind::Portable);
+        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+    }
+
+    #[test]
+    fn clean_up_removes_stale_probe_files() {
+        let dir = installed(true);
+        put(dir.path(), ".pm-update-probe-123", "");
+        put(dir.path(), ".pm-update-probe-98765", "");
+        put(dir.path(), "pm-update-probe-1", "mine");
+        fs::create_dir(dir.path().join(".pm-update-probe-dir")).unwrap();
+        clean_up(dir.path());
+        assert_eq!(names(dir.path()), {
+            let mut v = vec![
+                EXE_GUI.to_string(),
+                EXE_PM.to_string(),
+                "README.md".to_string(),
+                "pm-update-probe-1".to_string(),
+                ".pm-update-probe-dir".to_string(),
+            ];
+            v.sort();
+            v
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_only_strips_the_drive_letter_form() {
+        assert_eq!(strip_verbatim(Path::new(r"\\?\C:\Program Files\pm")), PathBuf::from(r"C:\Program Files\pm"));
+        assert_eq!(strip_verbatim(Path::new(r"\\?\D:\")), PathBuf::from(r"D:\"));
+        for keep in [
+            r"\\?\UNC\server\share\pm",
+            r"\\?\Volume{0e9bd4a6-62a4-4b6c-9f4e-1a2b3c4d5e6f}\pm",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\pm",
+            r"\\.\C:\pm",
+            r"C:\pm",
+            r"\\server\share\pm",
+        ] {
+            assert_eq!(strip_verbatim(Path::new(keep)), PathBuf::from(keep), "{keep}");
         }
     }
 
