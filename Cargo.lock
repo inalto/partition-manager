@@ -2823,6 +2823,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-update"
+version = "0.2.2"
+dependencies = [
+ "pm-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
