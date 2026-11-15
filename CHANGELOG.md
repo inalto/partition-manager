@@ -4,7 +4,7 @@ All notable changes to Partition Manager. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver while the
 project is pre-1.0 (minor bumps may change behaviour).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-15
 
 ### Added
 - **Update check and in-place update.** The desktop application looks for a newer release at
@@ -106,6 +106,7 @@ a multi-step wizard GUI (egui/eframe) and the `pm` command line; a planner / pre
 executor pipeline with write sessions, identity checks and a dry run; `--disk-file`
 practice mode on image files.
 
+[0.3.0]: https://github.com/inalto/partition-manager/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/inalto/partition-manager/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/inalto/partition-manager/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/inalto/partition-manager/compare/v0.1.0...v0.2.0
