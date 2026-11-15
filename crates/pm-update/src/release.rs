@@ -2,6 +2,45 @@ use crate::version::Version;
 use pm_core::{Error, Result};
 use serde::Deserialize;
 
+/// The GitHub repository the releases come from, as a literal for `concat!`.
+macro_rules! repo {
+    () => {
+        "inalto/partition-manager"
+    };
+}
+pub(crate) use repo;
+
+/// Every archive and checksum file is downloaded from below this address.
+pub const DOWNLOAD_PREFIX: &str = concat!("https://github.com/", repo!(), "/releases/download/");
+
+/// The page of the newest release: where to send the user when a release names no
+/// usable page of its own.
+pub const RELEASES_PAGE: &str = concat!("https://github.com/", repo!(), "/releases/latest");
+
+/// `url` when it may be opened (see [`url_allowed`]), else [`RELEASES_PAGE`]: a release
+/// page that is missing, empty or off the allow-list (from the API or a hand-edited
+/// settings file) still leads somewhere useful.
+pub fn release_page(url: &str) -> String {
+    if url_allowed(url) {
+        url.to_string()
+    } else {
+        RELEASES_PAGE.to_string()
+    }
+}
+
+/// Whether `url` is one of this repository's release downloads (exactly below
+/// [`DOWNLOAD_PREFIX`], also once `.` and `..` segments are resolved). Debug builds also
+/// take a local test server (`http://127.0.0.1`).
+fn is_release_download(url: &str) -> bool {
+    #[cfg(debug_assertions)]
+    if crate::fetch::is_loopback(url) {
+        return true;
+    }
+    url_allowed(url)
+        && url.starts_with(DOWNLOAD_PREFIX)
+        && url::Url::parse(url).is_ok_and(|u| u.as_str().starts_with(DOWNLOAD_PREFIX))
+}
+
 /// A downloadable release asset.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Asset {
@@ -63,14 +102,19 @@ pub fn parse_release(json: &str, target: Option<&str>) -> Result<Option<Release>
         raw.assets
             .iter()
             .find(|a| a.name == want)
+            .filter(|a| is_release_download(&a.browser_download_url))
             .map(|a| Asset { name: a.name.clone(), url: a.browser_download_url.clone(), size: a.size })
     });
-    let sums_url =
-        raw.assets.iter().find(|a| a.name == "SHA256SUMS.txt").map(|a| a.browser_download_url.clone());
+    let sums_url = raw
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS.txt")
+        .filter(|a| is_release_download(&a.browser_download_url))
+        .map(|a| a.browser_download_url.clone());
     Ok(Some(Release {
         version,
         notes: raw.body.unwrap_or_default(),
-        page_url: raw.html_url.unwrap_or_default(),
+        page_url: release_page(raw.html_url.as_deref().unwrap_or_default()),
         archive,
         sums_url,
     }))
@@ -132,6 +176,55 @@ mod tests {
         assert!(parse_release(SAMPLE, None).unwrap().unwrap().archive.is_none());
         assert!(parse_release(SAMPLE, Some("freebsd-x86_64")).unwrap().unwrap().archive.is_none());
         assert!(parse_release(SAMPLE_NO_SUMS, Some("linux-x86_64")).unwrap().unwrap().sums_url.is_none());
+    }
+
+    #[test]
+    fn downloads_must_be_this_repositorys_release_downloads() {
+        let ok = parse_release(SAMPLE, Some("linux-x86_64")).unwrap().unwrap();
+        assert!(ok.archive.is_some() && ok.sums_url.is_some());
+        let ours = "https://github.com/inalto/partition-manager/releases/download/";
+        for other in [
+            "https://github.com/evil/partition-manager/releases/download/",
+            "https://github.com/inalto/partition-manager-fork/releases/download/",
+            "https://objects.githubusercontent.com/inalto/partition-manager/releases/download/",
+            "http://github.com/inalto/partition-manager/releases/download/",
+            "https://github.com/inalto/partition-manager/releases/download/../../../evil/x/releases/download/",
+            "https://github.com/inalto/partition-manager/releases/download/%2e%2e/%2e%2e/%2e%2e/evil/x/",
+            "http://127.0.0.1.evil.com/",
+        ] {
+            let r = parse_release(&SAMPLE.replace(ours, other), Some("linux-x86_64")).unwrap().unwrap();
+            assert!(r.archive.is_none() && r.sums_url.is_none(), "{other}");
+            assert_eq!(r.version.to_string(), "0.2.3", "the release itself is still found");
+        }
+    }
+
+    #[test]
+    fn an_unusable_page_url_becomes_the_releases_page() {
+        let page = "https://github.com/inalto/partition-manager/releases/tag/v0.2.3";
+        assert_eq!(release_page(page), page);
+        assert_eq!(RELEASES_PAGE, "https://github.com/inalto/partition-manager/releases/latest");
+        for bad in ["", "   ", "http://github.com/x", "https://example.com/", "file:///etc/passwd"] {
+            assert_eq!(release_page(bad), RELEASES_PAGE, "{bad:?}");
+        }
+        // a release without (or with an odd) html_url
+        let none = SAMPLE.replace(&format!(r#""html_url": "{page}","#), "");
+        assert_eq!(parse_release(&none, None).unwrap().unwrap().page_url, RELEASES_PAGE);
+        let odd = SAMPLE.replace(page, "https://example.com/x");
+        assert_eq!(parse_release(&odd, None).unwrap().unwrap().page_url, RELEASES_PAGE);
+        assert_eq!(parse_release(SAMPLE, None).unwrap().unwrap().page_url, page);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_builds_also_take_downloads_from_a_local_server() {
+        let ours = "https://github.com/inalto/partition-manager/releases/download/";
+        let json = SAMPLE.replace(ours, "http://127.0.0.1:8080/dl/");
+        let r = parse_release(&json, Some("linux-x86_64")).unwrap().unwrap();
+        assert_eq!(
+            r.archive.unwrap().url,
+            "http://127.0.0.1:8080/dl/v0.2.3/partition-manager-0.2.3-linux-x86_64.tar.gz"
+        );
+        assert_eq!(r.sums_url.unwrap(), "http://127.0.0.1:8080/dl/v0.2.3/SHA256SUMS.txt");
     }
 
     #[test]

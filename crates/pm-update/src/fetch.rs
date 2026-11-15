@@ -1,11 +1,11 @@
-use crate::release::{parse_release, url_allowed, Release};
+use crate::release::{parse_release, repo, url_allowed, Release};
 use crate::version::{Version, TARGET};
 use pm_core::{Error, Result};
 use std::io::Read;
 use std::time::Duration;
 
 /// Where the newest published release is described.
-pub const LATEST_URL: &str = "https://api.github.com/repos/inalto/partition-manager/releases/latest";
+pub const LATEST_URL: &str = concat!("https://api.github.com/repos/", repo!(), "/releases/latest");
 
 /// Upper bound for the release JSON.
 const MAX_RELEASE_JSON: u64 = 1024 * 1024;
@@ -69,8 +69,9 @@ fn allowed(url: &str) -> bool {
     url_allowed(url) || is_loopback(url)
 }
 
+/// `http://127.0.0.1` with any port and no userinfo (debug builds only).
 #[cfg(debug_assertions)]
-fn is_loopback(url: &str) -> bool {
+pub(crate) fn is_loopback(url: &str) -> bool {
     if url.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
         return false;
     }

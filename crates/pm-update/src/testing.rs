@@ -4,7 +4,7 @@
 //! release build.
 
 use crate::fetch::Fetch;
-use crate::release::{Asset, Release};
+use crate::release::{Asset, Release, DOWNLOAD_PREFIX};
 use crate::unpack::DOCUMENTS;
 use crate::version::{Version, TARGET};
 use pm_core::{Error, Result};
@@ -256,7 +256,7 @@ pub fn release_fixture(version: &str, good_sum: bool) -> (MapFetch, Release) {
     };
     let bytes = std::fs::read(archive).unwrap();
     let name = format!("partition-manager-{version}-{target}.{ext}");
-    let base = format!("https://github.com/inalto/partition-manager/releases/download/v{version}");
+    let base = format!("{DOWNLOAD_PREFIX}v{version}");
     let digest = if good_sum { format!("{:x}", Sha256::digest(&bytes)) } else { "0".repeat(64) };
     let fetch = MapFetch::new()
         .with(&format!("{base}/SHA256SUMS.txt"), format!("{digest}  {name}\n"))
