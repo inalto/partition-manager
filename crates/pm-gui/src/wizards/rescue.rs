@@ -800,6 +800,9 @@ impl ToolWindow for RescueWizard {
     fn kind(&self) -> WindowKind {
         WindowKind::RescueCopy
     }
+    fn running(&self) -> bool {
+        self.task.is_some()
+    }
     fn modal(&self) -> bool {
         true
     }

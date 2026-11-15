@@ -78,6 +78,8 @@ pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<C
     match dlg {
         Dialog::Error(msg) => message(ctx, "Cannot do that", msg, out),
         Dialog::Confirm { allow_system } => confirm::show(ctx, s, allow_system, out),
+        // drawn by the update dialogs (next step); until then they stay open, undrawn
+        Dialog::WhatsNew { .. } | Dialog::UpdateConfirm { .. } | Dialog::Updated { .. } => true,
         Dialog::Report { report, dry_run, note } => {
             let mut keep = true;
             let title = match (report.failed.is_some(), *dry_run) {

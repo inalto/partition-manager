@@ -93,6 +93,9 @@ pub trait ToolWindow {
     fn writing(&self) -> bool {
         false
     }
+    /// A worker of this window has not finished (reading or writing): an update waits for it.
+    /// Deliberately without a default, so that every window answers from its own [`Task`]s.
+    fn running(&self) -> bool;
     fn show(&mut self, ctx: &egui::Context, env: &ToolEnv) -> WindowOutcome;
 }
 

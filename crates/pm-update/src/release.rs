@@ -113,7 +113,7 @@ pub fn url_allowed(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::samples::*;
+    use crate::testing::*;
 
     #[test]
     fn release_picks_this_targets_archive() {

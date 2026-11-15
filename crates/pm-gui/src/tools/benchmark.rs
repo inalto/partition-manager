@@ -167,6 +167,9 @@ impl ToolWindow for BenchmarkWindow {
     fn kind(&self) -> WindowKind {
         WindowKind::Benchmark
     }
+    fn running(&self) -> bool {
+        self.task.is_some()
+    }
 
     fn show(&mut self, ctx: &egui::Context, env: &ToolEnv) -> WindowOutcome {
         if let Some(t) = self.task.as_mut() {

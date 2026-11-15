@@ -214,85 +214,9 @@ fn unpack_targz(archive: &Path, sink: &mut Sink) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use std::io::Write;
-    use std::path::PathBuf;
-
-    const DOC_NAMES: [&str; 3] = DOCUMENTS;
-
-    fn zip_with(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
-        let path = dir.join("a.zip");
-        let mut w = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-        let opts = zip::write::SimpleFileOptions::default();
-        for (name, data) in entries {
-            if name.ends_with('/') || name.ends_with('\\') {
-                w.add_directory(*name, opts).unwrap();
-            } else {
-                w.start_file(*name, opts).unwrap();
-                w.write_all(data).unwrap();
-            }
-        }
-        w.finish().unwrap();
-        path
-    }
-
-    pub(crate) fn zip_fixture(dir: &Path, top: &str, sep: &str, with_dir: bool) -> PathBuf {
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        if with_dir {
-            entries.push((format!("{top}{sep}"), Vec::new()));
-        }
-        for n in ["partition-manager.exe", "pm.exe"].iter().chain(DOC_NAMES.iter()) {
-            entries.push((format!("{top}{sep}{n}"), format!("bin:{n}").into_bytes()));
-        }
-        let refs: Vec<(&str, &[u8])> =
-            entries.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
-        zip_with(dir, &refs)
-    }
-
-    /// One tar entry; the name is written into the header verbatim so that
-    /// hostile names (`..`, absolute) can be built.
-    struct TarEntry {
-        name: String,
-        kind: tar::EntryType,
-        data: Vec<u8>,
-    }
-
-    fn file(name: &str, data: &[u8]) -> TarEntry {
-        TarEntry { name: name.into(), kind: tar::EntryType::Regular, data: data.to_vec() }
-    }
-    fn of_kind(name: &str, kind: tar::EntryType) -> TarEntry {
-        TarEntry { name: name.into(), kind, data: Vec::new() }
-    }
-
-    fn targz_with(dir: &Path, entries: &[TarEntry]) -> PathBuf {
-        let path = dir.join("a.tar.gz");
-        let gz = flate2::write::GzEncoder::new(
-            std::fs::File::create(&path).unwrap(),
-            flate2::Compression::default(),
-        );
-        let mut b = tar::Builder::new(gz);
-        for e in entries {
-            let mut h = tar::Header::new_gnu();
-            let raw = h.as_old_mut();
-            raw.name[..e.name.len()].copy_from_slice(e.name.as_bytes());
-            h.set_entry_type(e.kind);
-            h.set_mode(0o644);
-            h.set_size(e.data.len() as u64);
-            h.set_cksum();
-            b.append(&h, e.data.as_slice()).unwrap();
-        }
-        b.into_inner().unwrap().finish().unwrap();
-        path
-    }
-
-    pub(crate) fn targz_fixture(dir: &Path, top: &str) -> PathBuf {
-        let mut entries = vec![of_kind(&format!("{top}/"), tar::EntryType::Directory)];
-        for n in ["partition-manager", "pm"].iter().chain(DOC_NAMES.iter()) {
-            entries.push(file(&format!("{top}/{n}"), format!("bin:{n}").as_bytes()));
-        }
-        targz_with(dir, &entries)
-    }
+    use crate::testing::{file, of_kind, targz_fixture, targz_with, zip_fixture, zip_with};
 
     fn sorted(mut v: Vec<String>) -> Vec<String> {
         v.sort();

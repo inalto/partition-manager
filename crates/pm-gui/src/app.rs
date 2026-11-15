@@ -9,9 +9,11 @@ use crate::jobs::{spawn_job, JobHandle, JobOutput};
 use crate::selection::Selected;
 use crate::theme::Theme;
 use crate::tools::{Device, ToolEnv, ToolWindow};
+use crate::update::UpdateState;
 use crate::wizard::{Wizard, WizardCtx};
 use pm_ops::{execute_queued, ExecOpts, ExecReport, Model, OpQueue, Operation};
 use pm_platform::Platform;
+use pm_update::{Release, Version};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,6 +70,12 @@ pub enum Dialog {
     Confirm { allow_system: bool },
     /// Result of an Apply run.
     Report { report: ExecReport, dry_run: bool, note: Option<String> },
+    /// The notes of a newer release.
+    WhatsNew { release: Release },
+    /// Ask before downloading and installing `release`.
+    UpdateConfirm { release: Release },
+    /// `version` was installed; offers the restart.
+    Updated { version: Version },
 }
 
 /// Everything a view or dialog can ask for.
@@ -98,6 +106,25 @@ pub enum Cmd {
     /// its summary page otherwise.
     FinishWizard(Vec<Operation>),
     CloseWizard,
+    /// Check for a newer release now and report the outcome.
+    CheckUpdates,
+    /// Turn the automatic update check on or off (saved).
+    SetCheckUpdates(bool),
+    /// Show the notes of the newer release (checking first when only its version is known).
+    UpdateWhatsNew,
+    /// Open the update confirmation (checking first when only the version is known).
+    UpdateAsk,
+    /// Download and install the release of the confirmation.
+    UpdateStart,
+    UpdateCancel,
+    /// Do not offer the version of the notice again (saved).
+    UpdateSkip,
+    /// Hide the notice for this session.
+    UpdateHide,
+    /// Start the installed new version and quit.
+    UpdateRestart,
+    /// Open a GitHub page in the browser.
+    OpenUrl(String),
 }
 
 /// A wizard on screen and what it was opened on.
@@ -158,6 +185,10 @@ pub struct AppState {
     /// The next successful refresh drops the pending operations instead of rebasing them
     /// (set after a failed Apply, when some of them may already have been written).
     pub reset_on_refresh: bool,
+    /// The update check, notice and install.
+    pub update: UpdateState,
+    /// The application should close (set after starting the updated version).
+    pub quit: bool,
 }
 
 impl AppState {
@@ -182,6 +213,8 @@ impl AppState {
             windows: Vec::new(),
             wizard: None,
             reset_on_refresh: false,
+            update: UpdateState::disabled(),
+            quit: false,
         };
         s.start_refresh();
         s
@@ -202,6 +235,13 @@ impl AppState {
             || self.wizard.is_some()
             || self.windows.iter().any(|w| w.modal())
             || matches!(self.job, Some(RunningJob { kind: JobKind::Apply { .. }, .. }))
+            || self.update.downloading.is_some()
+    }
+
+    /// Work is running that an update or a restart must not interrupt: a job (refresh,
+    /// Apply), a worker of a window, or the install itself.
+    pub fn anything_running(&self) -> bool {
+        self.job.is_some() || self.windows.iter().any(|w| w.running()) || self.update.downloading.is_some()
     }
 
     pub fn toast(&mut self, text: impl Into<String>) {
@@ -247,8 +287,10 @@ impl AppState {
         self.job = Some(RunningJob { kind: JobKind::Apply { dry_run }, handle });
     }
 
-    /// Collect the result of a finished job, if any. Call once per frame.
+    /// Collect the result of a finished job, and of the update workers, if any. Call once per
+    /// frame.
     pub fn poll_job(&mut self) {
+        self.poll_update();
         let Some(job) = self.job.as_mut() else { return };
         let Some(result) = job.handle.poll() else { return };
         let kind = job.kind;
@@ -494,6 +536,16 @@ impl AppState {
                 },
             },
             Cmd::CloseWizard => self.wizard = None,
+            Cmd::CheckUpdates
+            | Cmd::SetCheckUpdates(_)
+            | Cmd::UpdateWhatsNew
+            | Cmd::UpdateAsk
+            | Cmd::UpdateStart
+            | Cmd::UpdateCancel
+            | Cmd::UpdateSkip
+            | Cmd::UpdateHide
+            | Cmd::UpdateRestart
+            | Cmd::OpenUrl(_) => self.handle_update(cmd),
         }
     }
 
@@ -594,43 +646,9 @@ pub fn rebase(queue: &mut OpQueue, base: Model) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{gpt_disk, mbr_disk, model_of};
-    use pm_core::{FsKind, MemDevice, VolumeId, VolumeInfo, MIB};
+    use crate::test_util::{gpt_disk, mbr_disk, mock_state, model_of, wait_idle};
+    use pm_core::{VolumeId, MIB};
     use pm_ops::WipeMethod;
-    use pm_platform::MockPlatform;
-
-    fn wait_idle(s: &mut AppState) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while s.busy() {
-            assert!(Instant::now() < deadline, "job did not finish");
-            std::thread::sleep(Duration::from_millis(5));
-            s.poll_job();
-        }
-    }
-
-    fn mock_state() -> AppState {
-        let mock = MockPlatform::new();
-        for d in [gpt_disk(1), mbr_disk(0)] {
-            let mut dev = MemDevice::new(d.size);
-            pm_parttable::write_table(&mut dev, &pm_ops::table_from_disk(&d)).unwrap();
-            mock.add_disk(d.index, dev, d);
-        }
-        let vol = VolumeInfo {
-            id: VolumeId("vol-e".into()),
-            fs: Some(FsKind::Ntfs),
-            label: "Data".into(),
-            mount_points: vec!["E:\\".into()],
-            total: 684 * MIB,
-            free: 342 * MIB,
-            ..Default::default()
-        };
-        mock.add_volume(vol, 1, 117 * MIB, 684 * MIB);
-        // a system disk that is neither test disk, so the executor guard lets both through
-        mock.set_system_disk(7);
-        let mut s = AppState::new(Arc::new(mock), StartOptions::default());
-        wait_idle(&mut s);
-        s
-    }
 
     #[test]
     fn refresh_loads_disks_on_start() {

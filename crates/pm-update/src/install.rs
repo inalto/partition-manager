@@ -323,12 +323,8 @@ pub fn restart(dir: &Path, args: &[OsString]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fetch::MapFetch;
-    use crate::release::Asset;
-    use crate::unpack::tests::{targz_fixture, zip_fixture};
-    use crate::version::Version;
+    use crate::testing::MapFetch;
     use pm_core::NullProgress;
-    use sha2::{Digest, Sha256};
     use std::fs;
     use std::io;
 
@@ -494,40 +490,9 @@ mod tests {
         assert!(!dir.path().join(format!("{EXE_PM}.old")).exists());
     }
 
-    const TARGET_NAME: &str = if cfg!(all(windows, target_arch = "x86_64")) {
-        "windows-x86_64"
-    } else {
-        "linux-x86_64"
-    };
-
-    /// A fake release for this platform (a `.zip` on Windows, a `.tar.gz`
-    /// elsewhere; the target name only matters for the file name).
+    /// The fake release 0.3.0 for this platform.
     fn release_fixture(good_sum: bool) -> (MapFetch, Release) {
-        let src = tempfile::tempdir().unwrap();
-        let (archive, ext) = if WINDOWS {
-            (zip_fixture(src.path(), "partition-manager-0.3.0-windows-x86_64", "/", true), "zip")
-        } else {
-            (targz_fixture(src.path(), "linux-x86_64"), "tar.gz")
-        };
-        let bytes = fs::read(archive).unwrap();
-        let name = format!("partition-manager-0.3.0-{TARGET_NAME}.{ext}");
-        let base = "https://github.com/inalto/partition-manager/releases/download/v0.3.0";
-        let digest = if good_sum { format!("{:x}", Sha256::digest(&bytes)) } else { "0".repeat(64) };
-        let fetch = MapFetch::new()
-            .with(&format!("{base}/SHA256SUMS.txt"), format!("{digest}  {name}\n"))
-            .with(&format!("{base}/{name}"), &bytes);
-        let release = Release {
-            version: Version::parse("0.3.0").unwrap(),
-            notes: String::new(),
-            page_url: String::new(),
-            archive: Some(Asset {
-                name: name.clone(),
-                url: format!("{base}/{name}"),
-                size: bytes.len() as u64,
-            }),
-            sums_url: Some(format!("{base}/SHA256SUMS.txt")),
-        };
-        (fetch, release)
+        crate::testing::release_fixture("0.3.0", good_sum)
     }
 
     #[test]

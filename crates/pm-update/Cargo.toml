@@ -15,6 +15,12 @@ zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
 url = "2"
+# Only for the `testing` feature (test doubles for the tests of dependent crates).
+tempfile = { workspace = true, optional = true }
+
+[features]
+# Exposes `pm_update::testing`; enabled only from dev-dependencies.
+testing = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile.workspace = true

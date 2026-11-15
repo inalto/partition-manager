@@ -83,3 +83,39 @@ pub fn platform_placing(dir: &std::path::Path) -> std::sync::Arc<dyn pm_platform
     p.set_disk_of_path(dir, 99, None);
     std::sync::Arc::new(p)
 }
+
+/// Poll `s` until its job (refresh, Apply) has finished.
+pub fn wait_idle(s: &mut crate::app::AppState) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.busy() {
+        assert!(std::time::Instant::now() < deadline, "job did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.poll_job();
+    }
+}
+
+/// An application over a mock platform with [`gpt_disk`] 1 (E: mounted) and [`mbr_disk`] 0,
+/// the first enumeration done.
+pub fn mock_state() -> crate::app::AppState {
+    let mock = pm_platform::MockPlatform::new();
+    for d in [gpt_disk(1), mbr_disk(0)] {
+        let mut dev = pm_core::MemDevice::new(d.size);
+        pm_parttable::write_table(&mut dev, &pm_ops::table_from_disk(&d)).unwrap();
+        mock.add_disk(d.index, dev, d);
+    }
+    let vol = pm_core::VolumeInfo {
+        id: VolumeId("vol-e".into()),
+        fs: Some(FsKind::Ntfs),
+        label: "Data".into(),
+        mount_points: vec!["E:\\".into()],
+        total: 684 * MIB,
+        free: 342 * MIB,
+        ..Default::default()
+    };
+    mock.add_volume(vol, 1, 117 * MIB, 684 * MIB);
+    // a system disk that is neither test disk, so the executor guard lets both through
+    mock.set_system_disk(7);
+    let mut s = crate::app::AppState::new(std::sync::Arc::new(mock), crate::app::StartOptions::default());
+    wait_idle(&mut s);
+    s
+}

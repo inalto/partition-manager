@@ -49,6 +49,9 @@ impl ToolWindow for SmartWindow {
     fn kind(&self) -> WindowKind {
         WindowKind::Smart
     }
+    fn running(&self) -> bool {
+        self.task.is_some()
+    }
 
     fn show(&mut self, ctx: &egui::Context, env: &ToolEnv) -> WindowOutcome {
         if self.shown.is_none() && self.disk.is_some() {

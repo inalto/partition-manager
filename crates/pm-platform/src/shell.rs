@@ -1,4 +1,5 @@
-//! Desktop-shell helpers: opening a folder in the system file manager.
+//! Desktop-shell helpers: opening a folder in the system file manager, a web page in the
+//! browser.
 
 use pm_core::{Error, Result};
 use std::path::Path;
@@ -30,6 +31,20 @@ pub fn open_in_file_manager(path: &Path) -> Result<()> {
     })
 }
 
+/// Open the web page `url` in the default browser, through the same launcher as
+/// [`open_in_file_manager`] (detached; never waits for it). Anything that does not start with
+/// `https://` is refused with `Error::Invalid` and nothing is started.
+pub fn open_url(url: &str) -> Result<()> {
+    if !url.starts_with("https://") {
+        return Err(Error::Invalid(format!("not an https address: {url:?}")));
+    }
+    let cmd = file_manager_command();
+    Command::new(cmd).arg(url).spawn().map(drop).map_err(|e| Error::Platform {
+        code: e.raw_os_error().map_or(0, |c| c as u32),
+        msg: format!("cannot start {cmd} for {url}: {e}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +53,13 @@ mod tests {
     fn missing_path_is_not_found_and_nothing_is_started() {
         let p = Path::new("this/path/does/not/exist/pm-shell-test");
         assert!(matches!(open_in_file_manager(p), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn open_url_refuses_anything_but_https_and_starts_nothing() {
+        for url in ["file:///x", "http://github.com/", "C:\\Windows\\notepad.exe", "", " https://github.com/"] {
+            assert!(matches!(open_url(url), Err(Error::Invalid(_))), "{url:?}");
+        }
     }
 
     #[test]

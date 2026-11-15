@@ -146,7 +146,7 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fetch::MapFetch;
+    use crate::testing::MapFetch;
     use crate::release::Asset;
     use crate::version::Version;
     use pm_core::{NullProgress, ProgressReport};

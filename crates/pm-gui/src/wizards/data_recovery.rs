@@ -730,6 +730,9 @@ impl ToolWindow for DataRecoveryWizard {
     fn kind(&self) -> WindowKind {
         WindowKind::DataRecovery
     }
+    fn running(&self) -> bool {
+        self.scan_task.is_some() || self.restore_task.is_some() || self.save_task.is_some()
+    }
     fn modal(&self) -> bool {
         true
     }

@@ -312,6 +312,9 @@ impl ToolWindow for PartitionRecoveryWizard {
     fn kind(&self) -> WindowKind {
         WindowKind::PartitionRecovery
     }
+    fn running(&self) -> bool {
+        self.scan_task.is_some() || self.apply_task.is_some()
+    }
     fn modal(&self) -> bool {
         true
     }

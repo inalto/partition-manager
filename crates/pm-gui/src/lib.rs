@@ -19,6 +19,7 @@ pub mod selection;
 pub mod settings;
 pub mod theme;
 pub mod tools;
+pub mod update;
 pub mod views;
 pub mod wizard;
 pub mod wizards;

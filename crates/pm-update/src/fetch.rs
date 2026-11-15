@@ -138,81 +138,9 @@ impl Fetch for HttpFetch {
 }
 
 #[cfg(test)]
-pub(crate) struct MapFetch {
-    files: std::collections::HashMap<String, Vec<u8>>,
-    requested: std::sync::Mutex<Vec<String>>,
-    /// When set, every stream fails with an I/O error after this many bytes.
-    fail_after: Option<usize>,
-}
-
-/// Yields the first `n` bytes of `data`, then an I/O error.
-#[cfg(test)]
-struct BreaksAfter {
-    data: std::io::Cursor<Vec<u8>>,
-    left: usize,
-}
-
-#[cfg(test)]
-impl Read for BreaksAfter {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.left == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "stream broke"));
-        }
-        let max = buf.len().min(self.left);
-        let n = self.data.read(&mut buf[..max])?;
-        self.left -= n;
-        Ok(n)
-    }
-}
-
-#[cfg(test)]
-impl MapFetch {
-    pub(crate) fn new() -> MapFetch {
-        MapFetch { files: Default::default(), requested: Default::default(), fail_after: None }
-    }
-
-    pub(crate) fn with(mut self, url: &str, bytes: impl AsRef<[u8]>) -> MapFetch {
-        self.files.insert(url.to_string(), bytes.as_ref().to_vec());
-        self
-    }
-
-    /// A copy of this fetcher whose streams fail after `n` bytes.
-    pub(crate) fn failing_after(&self, n: usize) -> MapFetch {
-        MapFetch {
-            files: self.files.clone(),
-            requested: Default::default(),
-            fail_after: Some(n),
-        }
-    }
-
-    /// URLs asked for so far, in order.
-    pub(crate) fn requested(&self) -> Vec<String> {
-        self.requested.lock().unwrap().clone()
-    }
-}
-
-#[cfg(test)]
-impl Fetch for MapFetch {
-    fn get(&self, url: &str) -> Result<Box<dyn Read + Send>> {
-        self.requested.lock().unwrap().push(url.to_string());
-        match self.files.get(url) {
-            Some(b) => {
-                let data = std::io::Cursor::new(b.clone());
-                Ok(match self.fail_after {
-                    // Only large bodies break: the small checksum file stays readable.
-                    Some(left) if b.len() > left => Box::new(BreaksAfter { data, left }),
-                    _ => Box::new(data),
-                })
-            }
-            None => Err(Error::NotFound(url.to_string())),
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::samples::*;
+    use crate::testing::*;
 
     #[test]
     fn check_reports_newer_equal_and_older() {

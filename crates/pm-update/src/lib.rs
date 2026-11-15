@@ -9,8 +9,8 @@ mod release;
 mod unpack;
 mod version;
 
-#[cfg(test)]
-pub(crate) mod samples;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use download::{download, sha256_hex, sum_for};
 pub use fetch::{check, read_limited, Check, Fetch, HttpFetch, LATEST_URL};
