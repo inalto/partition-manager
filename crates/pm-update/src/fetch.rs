@@ -62,10 +62,25 @@ fn latest_url() -> String {
     LATEST_URL.to_string()
 }
 
-/// Debug builds may talk to a local test server; release builds never.
+/// Debug builds may talk to a local test server (`http://127.0.0.1`, any port, no
+/// userinfo); release builds never.
 #[cfg(debug_assertions)]
 fn allowed(url: &str) -> bool {
-    url_allowed(url) || url.starts_with("http://127.0.0.1:") || url.starts_with("http://127.0.0.1/")
+    url_allowed(url) || is_loopback(url)
+}
+
+#[cfg(debug_assertions)]
+fn is_loopback(url: &str) -> bool {
+    if url.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "http"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.host() == Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
 }
 
 #[cfg(not(debug_assertions))]
@@ -179,5 +194,137 @@ mod tests {
     fn http_fetch_refuses_urls_off_the_allow_list_without_connecting() {
         assert!(HttpFetch::new().get("https://example.com/x").is_err());
         assert!(HttpFetch::new().get("http://github.com/x").is_err());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_debug_loopback_exception_is_only_127_0_0_1() {
+        assert!(allowed("http://127.0.0.1:8080/x"));
+        assert!(allowed("http://127.0.0.1/x"));
+        for bad in [
+            "http://127.0.0.1:1@evil.com/",
+            "http://127.0.0.1@evil.com/",
+            "http://user:pw@127.0.0.1/x",
+            "http://127.0.0.1.evil.com/x",
+            "http://localhost:8080/x",
+            "ftp://127.0.0.1/x",
+        ] {
+            assert!(!allowed(bad), "{bad}");
+        }
+    }
+
+    /// Redirect handling of the real client, against a loopback server (debug builds admit
+    /// `http://127.0.0.1`). No external network is used.
+    #[cfg(debug_assertions)]
+    mod redirects {
+        use super::*;
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        /// A loopback HTTP/1.1 server answering each request with `answer(base, path)`
+        /// (status line and extra headers, body) until stopped; counts the connections.
+        struct Server {
+            base: String,
+            connections: Arc<AtomicUsize>,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Server {
+            fn start(answer: fn(&str, &str) -> (String, String)) -> Server {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let (connections, stop) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+                let (count, done, b) = (connections.clone(), stop.clone(), base.clone());
+                let thread = std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        let Ok((mut stream, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        };
+                        count.fetch_add(1, Ordering::SeqCst);
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut req = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !req.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                            req.push(byte[0]);
+                        }
+                        let req = String::from_utf8_lossy(&req);
+                        let path = req.split(' ').nth(1).unwrap_or("/").to_string();
+                        let (head, body) = answer(&b, &path);
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    }
+                });
+                Server { base, connections, stop, thread: Some(thread) }
+            }
+
+            /// Stops the server and returns how many connections it accepted.
+            fn finish(mut self) -> usize {
+                self.stop.store(true, Ordering::SeqCst);
+                self.thread.take().unwrap().join().unwrap();
+                self.connections.load(Ordering::SeqCst)
+            }
+        }
+
+        fn get(server: &Server, path: &str) -> Result<String> {
+            let mut body = String::new();
+            HttpFetch::new().get(&format!("{}{path}", server.base))?.read_to_string(&mut body).unwrap();
+            Ok(body)
+        }
+
+        #[test]
+        fn a_redirect_off_the_allow_list_is_refused_before_connecting() {
+            let server = Server::start(|_, _| ("302 Found\r\nLocation: https://example.com/x".into(), String::new()));
+            let e = get(&server, "/start").unwrap_err();
+            assert!(e.to_string().contains("refusing to request example.com"), "{e}");
+            assert_eq!(server.finish(), 1, "no second connection");
+        }
+
+        #[test]
+        fn a_redirect_without_location_fails() {
+            let server = Server::start(|_, _| ("302 Found".into(), String::new()));
+            let e = get(&server, "/start").unwrap_err();
+            assert!(e.to_string().contains("without Location"), "{e}");
+            assert_eq!(server.finish(), 1);
+        }
+
+        #[test]
+        fn a_redirect_loop_stops_after_the_hop_limit() {
+            let server = Server::start(|base, _| (format!("302 Found\r\nLocation: {base}/again"), String::new()));
+            let e = get(&server, "/start").unwrap_err();
+            assert!(e.to_string().contains("too many redirects"), "{e}");
+            assert_eq!(server.finish(), 1 + MAX_REDIRECTS);
+        }
+
+        #[test]
+        fn an_allowed_redirect_is_followed_to_the_body() {
+            let server = Server::start(|base, path| match path {
+                "/start" => (format!("302 Found\r\nLocation: {base}/final"), String::new()),
+                "/final" => ("200 OK".into(), "the body".into()),
+                _ => ("500 Internal Server Error".into(), String::new()),
+            });
+            assert_eq!(get(&server, "/start").unwrap(), "the body");
+            assert_eq!(server.finish(), 2);
+        }
+
+        #[test]
+        fn a_final_error_status_is_reported() {
+            let server = Server::start(|_, _| ("404 Not Found".into(), "nothing here".into()));
+            match get(&server, "/start") {
+                Err(Error::Invalid(m)) => assert!(m.contains("404"), "{m}"),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(server.finish(), 1);
+        }
     }
 }
