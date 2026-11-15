@@ -5,6 +5,7 @@
 //! from a successful source read, except zero-filled unused areas (`zero_unused`). With
 //! `skip_zero_writes`, blocks read as all zeros are not written at all.
 
+use super::blockmap::BlockMap;
 use super::mapfile::{BlockStatus, MapFile};
 use pm_core::{format_size, BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result};
 use pm_fs::UsedMap;
@@ -159,7 +160,12 @@ struct Engine<'a> {
     opts: &'a RescueOpts,
     progress: &'a dyn ProgressSink,
     cancel: &'a CancelToken,
-    map: MapFile,
+    /// The blocks of the mapfile, in the form that stays fast with millions of them.
+    map: BlockMap,
+    /// Status line of the mapfile: `current_pos`, `current_status`, `current_pass`.
+    cur_pos: u64,
+    cur_status: char,
+    cur_pass: u32,
     comments: Vec<String>,
     len: u64,
     sector: u64,
@@ -185,9 +191,19 @@ impl<'a> Engine<'a> {
         if let Some(p) = &self.opts.mapfile {
             // data the mapfile calls finished must be durable before the mapfile says so
             self.dst.flush()?;
-            self.map.save_with_comments(p, &self.comments)?;
+            self.snapshot().save_with_comments(p, &self.comments)?;
         }
         Ok(())
+    }
+
+    /// The run's state as a mapfile.
+    fn snapshot(&self) -> MapFile {
+        MapFile {
+            current_pos: self.cur_pos,
+            current_status: self.cur_status,
+            pass: self.cur_pass,
+            blocks: self.map.to_blocks(),
+        }
     }
 
     fn maybe_save(&mut self) -> Result<()> {
@@ -202,15 +218,15 @@ impl<'a> Engine<'a> {
     }
 
     fn done(&self) -> u64 {
-        self.map.stats().rescued.saturating_sub(self.unused)
+        self.map.bytes(BlockStatus::Finished).saturating_sub(self.unused)
     }
 
     fn start_phase(&mut self, name: &str, status: char, pass: u32) -> Result<()> {
         if let Some(t) = self.tracker.as_mut() {
             t.finish();
         }
-        self.map.current_status = status;
-        self.map.pass = pass;
+        self.cur_status = status;
+        self.cur_pass = pass;
         let mut t = ProgressTracker::new(self.progress, name, self.total());
         t.set_detail(&self.detail());
         t.add(self.done());
@@ -220,7 +236,6 @@ impl<'a> Engine<'a> {
     }
 
     fn detail(&self) -> String {
-        let st = self.map.stats();
         let secs = self.start.elapsed().as_secs_f64();
         let rate = if secs > 0.0 {
             (self.rescued_this_run as f64 / secs) as u64
@@ -229,8 +244,8 @@ impl<'a> Engine<'a> {
         };
         format!(
             "errsize {}, errors {}, read errors {}, rate {}/s",
-            format_size(st.non_trimmed + st.non_scraped + st.bad_bytes),
-            unrescued_areas(&self.map),
+            format_size(errsize(&self.map)),
+            self.map.unrescued_areas(),
             self.read_errors,
             format_size(rate)
         )
@@ -258,7 +273,7 @@ impl<'a> Engine<'a> {
     fn try_read(&mut self, pos: u64, n: u64, on_err: BlockStatus) -> Result<Read> {
         self.cancel.check()?;
         self.maybe_save()?;
-        self.map.current_pos = pos;
+        self.cur_pos = pos;
         let n = n as usize;
         match self.src.read_at(pos, &mut self.buf[..n]) {
             Ok(()) => {
@@ -289,7 +304,8 @@ impl<'a> Engine<'a> {
     fn apply_used_map(&mut self, used: &UsedMap) -> Result<()> {
         let unused = complement(&used_ranges(used, self.len, self.sector), self.len);
         self.unused = unused.iter().map(|r| r.1).sum();
-        let mut map = self.map.clone();
+        // one linear pass over the plain mapfile form, however many unused areas there are
+        let mut map = self.snapshot();
         let changed = map.mark_many(&unused, BlockStatus::Finished);
         if self.opts.zero_unused && !changed.is_empty() {
             // its own phase: on a large mostly-empty disk this can be most of the run
@@ -308,7 +324,7 @@ impl<'a> Engine<'a> {
             }
             tracker.finish();
         }
-        self.map = map;
+        self.map = BlockMap::from_map(&map);
         Ok(())
     }
 
@@ -464,7 +480,7 @@ impl<'a> Engine<'a> {
     }
 
     fn has(&self, st: BlockStatus) -> bool {
-        self.map.blocks.iter().any(|b| b.2 == st)
+        self.map.has(st)
     }
 
     fn run(&mut self) -> Result<()> {
@@ -477,11 +493,11 @@ impl<'a> Engine<'a> {
             self.start_phase("Copying", '?', 1)?;
             self.copy_pass(rev, true)?;
             if self.has(BlockStatus::NonTried) {
-                self.map.pass = 2;
+                self.cur_pass = 2;
                 self.copy_pass(!rev, true)?;
             }
             if self.has(BlockStatus::NonTried) {
-                self.map.pass = 3;
+                self.cur_pass = 3;
                 self.copy_pass(rev, false)?;
             }
         }
@@ -507,12 +523,10 @@ impl<'a> Engine<'a> {
     }
 
     fn stats(&self) -> RescueStats {
-        let bad_bytes: u64 =
-            self.map.blocks.iter().filter(|b| b.2 != BlockStatus::Finished).map(|b| b.1).sum();
         RescueStats {
             rescued: self.done(),
-            bad_bytes,
-            bad_areas: unrescued_areas(&self.map),
+            bad_bytes: self.map.unrescued_bytes(),
+            bad_areas: self.map.unrescued_areas(),
             read_errors: self.read_errors,
             elapsed_secs: self.start.elapsed().as_secs_f64(),
             passes: self.passes,
@@ -605,7 +619,10 @@ pub fn rescue(
         opts,
         progress,
         cancel,
-        map,
+        map: BlockMap::from_map(&map),
+        cur_pos: map.current_pos,
+        cur_status: map.current_status,
+        cur_pass: map.pass,
         comments,
         len,
         sector,
@@ -630,7 +647,7 @@ pub fn rescue(
         let _ = eng.save();
         return Err(e);
     }
-    eng.map.current_status = '+';
+    eng.cur_status = '+';
     let d = final_detail(&eng.map, eng.read_errors);
     // nothing left to do (e.g. a finished mapfile): still report the outcome once
     let (total, done) = (eng.total(), eng.done());
@@ -646,27 +663,18 @@ pub fn rescue(
     Ok(eng.stats())
 }
 
-/// Number of maximal areas that are not finished (bad, non-tried, non-trimmed or
-/// non-scraped, adjacent ones counted once): what ddrescue reports as "errors".
-pub(crate) fn unrescued_areas(map: &MapFile) -> u64 {
-    let mut areas = 0;
-    let mut prev_unrescued = false;
-    for &(_, size, st) in &map.blocks {
-        let unrescued = st != BlockStatus::Finished && size > 0;
-        if unrescued && !prev_unrescued {
-            areas += 1;
-        }
-        prev_unrescued = unrescued;
-    }
-    areas
+/// Bytes in failed areas still to be worked on: ddrescue's "errsize".
+fn errsize(map: &BlockMap) -> u64 {
+    map.bytes(BlockStatus::NonTrimmed)
+        + map.bytes(BlockStatus::NonScraped)
+        + map.bytes(BlockStatus::Bad)
 }
 
-fn final_detail(map: &MapFile, read_errors: u64) -> String {
-    let st = map.stats();
+fn final_detail(map: &BlockMap, read_errors: u64) -> String {
     format!(
         "errsize {}, errors {}, read errors {read_errors}, finished",
-        format_size(st.non_trimmed + st.non_scraped + st.bad_bytes),
-        unrescued_areas(map)
+        format_size(errsize(map)),
+        map.unrescued_areas()
     )
 }
 
