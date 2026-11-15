@@ -20,6 +20,12 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// The text has a line starting with `error:` (log lines, such as a platform warning, may
+/// come before it on stderr).
+fn has_error_line(text: &str) -> bool {
+    text.lines().any(|l| l.starts_with("error:"))
+}
+
 fn gpt_entry(number: u32, start: u64, len: u64, name: &str) -> Entry {
     Entry {
         number,
@@ -93,7 +99,7 @@ fn cli_list_json_runs() {
         }
         Some(2) => {
             let err = stderr(&out);
-            assert!(err.starts_with("error:"), "{err}");
+            assert!(has_error_line(&err), "{err}");
             // access denied (with the elevation hint) or an OS without a platform layer yet
             assert!(
                 err.contains("elevated") || err.contains("sudo") || err.contains("not supported"),
@@ -144,12 +150,12 @@ fn cli_unknown_volume_exits_1() {
     // an unknown disk index is an argument error, not a platform failure
     let out = pm(&["table", "disk:99999"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
+    assert!(has_error_line(&stderr(&out)), "{}", stderr(&out));
 
     // so is a device node that does not exist (Linux, macOS syntax; parsed on every OS)
     let out = pm(&["table", "/dev/pm-no-such-node"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
+    assert!(has_error_line(&stderr(&out)), "{}", stderr(&out));
 
     // so is a drive letter nothing is mounted at, for every command that takes a volume
     // (drive letters exist on Windows only)
@@ -174,6 +180,6 @@ fn cli_missing_file_exits_1_for_both_forms() {
     for arg in [m.to_string(), format!("file:{m}")] {
         let out = pm(&["table", &arg]);
         assert_eq!(out.status.code(), Some(1), "{arg}: {}", stderr(&out));
-        assert!(stderr(&out).starts_with("error:"), "{}", stderr(&out));
+        assert!(has_error_line(&stderr(&out)), "{}", stderr(&out));
     }
 }
