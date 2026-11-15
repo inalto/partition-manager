@@ -92,12 +92,17 @@ pub fn swap(staged: &Path, dir: &Path) -> Result<()> {
 }
 
 /// `swap` with the rename operation injectable, so that failures half-way
-/// can be tested.
+/// (in the swap or in the rollback) can be tested.
 fn swap_with(
     staged: &Path,
     dir: &Path,
     rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<()> {
+    // The running program is always replaced; `pm` only when it is installed.
+    let gui = exe_name("partition-manager", cfg!(windows));
+    if !dir.join(&gui).exists() {
+        return Err(Error::Invalid(format!("{gui} is not in {}", dir.display())));
+    }
     let installed: Vec<String> = executables().filter(|n| dir.join(n).exists()).collect();
 
     // Everything that can be checked without changing anything comes first.
@@ -120,11 +125,16 @@ fn swap_with(
 
     let mut done: Vec<&String> = Vec::new();
     for name in &installed {
-        if let Err(e) = swap_one(staged, dir, name, rename) {
+        if let Err(failure) = swap_one(staged, dir, name, rename) {
+            let mut stuck = failure.stuck;
             for name in done.into_iter().rev() {
-                undo_one(staged, dir, name);
+                stuck.extend(undo_one(staged, dir, name, rename));
             }
-            return Err(e);
+            return Err(if stuck.is_empty() {
+                failure.cause
+            } else {
+                rollback_error(&failure.cause, dir, &stuck)
+            });
         }
         done.push(name);
     }
@@ -139,6 +149,34 @@ fn swap_with(
     Ok(())
 }
 
+/// Start of the message of a failed rollback; see `rollback_failed`.
+const ROLLBACK_FAILED: &str = "the update failed and could not be rolled back";
+
+/// The error for a swap that failed with `cause` after which the files in
+/// `stuck` could not be restored: it names each of them and where its
+/// previous version survives.
+fn rollback_error(cause: &Error, dir: &Path, stuck: &[String]) -> Error {
+    let files: Vec<String> = stuck
+        .iter()
+        .map(|n| format!("{n} (previous version: {})", dir.join(old_name(n)).display()))
+        .collect();
+    Error::Invalid(format!("{ROLLBACK_FAILED} ({cause}); not restored: {}", files.join(", ")))
+}
+
+/// Whether `e` says that an update failed and the installed copy could not be
+/// put back as it was. The previous versions are then still on disk as
+/// `<name>.old` and must be restored by hand.
+pub fn rollback_failed(e: &Error) -> bool {
+    matches!(e, Error::Invalid(m) if m.starts_with(ROLLBACK_FAILED))
+}
+
+/// Why one executable could not be swapped, and which files could not be put
+/// back while undoing that single step.
+struct Failure {
+    cause: Error,
+    stuck: Vec<String>,
+}
+
 /// `<name>` becomes `<name>.old` and the staged file becomes `<name>`. When
 /// the second step fails the first is undone.
 fn swap_one(
@@ -146,34 +184,52 @@ fn swap_one(
     dir: &Path,
     name: &str,
     rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
-) -> Result<()> {
+) -> std::result::Result<(), Failure> {
     let (target, old) = (dir.join(name), dir.join(old_name(name)));
-    rename(&target, &old).map_err(|e| io_error("move aside", &target, e))?;
+    rename(&target, &old)
+        .map_err(|e| Failure { cause: io_error("move aside", &target, e), stuck: Vec::new() })?;
     if let Err(e) = rename(&staged.join(name), &target) {
-        let _ = std::fs::rename(&old, &target);
-        return Err(io_error("replace", &target, e));
+        let stuck = match rename(&old, &target) {
+            Ok(()) => Vec::new(),
+            Err(_) => vec![name.to_string()],
+        };
+        return Err(Failure { cause: io_error("replace", &target, e), stuck });
     }
     Ok(())
 }
 
 /// Reverts a completed `swap_one`: the new file goes back to the staging
-/// folder (or is removed) and the old one is restored.
-fn undo_one(staged: &Path, dir: &Path, name: &str) {
+/// folder (or is removed) and the old one is restored. Returns `name` when
+/// the old one could not be restored.
+fn undo_one(
+    staged: &Path,
+    dir: &Path,
+    name: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Option<String> {
     let (target, old) = (dir.join(name), dir.join(old_name(name)));
-    if std::fs::rename(&target, staged.join(name)).is_err() {
+    if rename(&target, &staged.join(name)).is_err() {
         let _ = std::fs::remove_file(&target);
     }
-    let _ = std::fs::rename(&old, &target);
+    rename(&old, &target).err().map(|_| name.to_string())
 }
 
 /// Removes the previous versions (`<name>.old`) and the staging folder left
 /// by an update. Errors are ignored: a file still in use is retried at the
-/// next start.
+/// next start. An `.old` whose executable is missing is the only copy left
+/// of it (a failed rollback): it stays, and so does the staging folder.
 pub fn clean_up(dir: &Path) {
+    let mut orphan = false;
     for name in executables() {
-        let _ = std::fs::remove_file(dir.join(old_name(&name)));
+        if dir.join(&name).exists() {
+            let _ = std::fs::remove_file(dir.join(old_name(&name)));
+        } else if dir.join(old_name(&name)).exists() {
+            orphan = true;
+        }
     }
-    remove_staging(dir);
+    if !orphan {
+        remove_staging(dir);
+    }
 }
 
 fn remove_staging(dir: &Path) {
@@ -199,14 +255,29 @@ pub fn update(
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
 ) -> Result<()> {
+    update_with(fetch, release, dir, progress, cancel, &mut |from, to| std::fs::rename(from, to))
+}
+
+fn update_with(
+    fetch: &dyn Fetch,
+    release: &Release,
+    dir: &Path,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let staging = dir.join(STAGING);
     remove_staging(dir);
     if std::fs::symlink_metadata(&staging).is_ok() {
         return Err(Error::Invalid(format!("cannot remove the old {}", staging.display())));
     }
     std::fs::create_dir(&staging).map_err(|e| io_error("create", &staging, e))?;
-    let result = stage_and_swap(fetch, release, dir, &staging, progress, cancel);
-    remove_staging(dir);
+    let result = stage_and_swap(fetch, release, dir, &staging, progress, cancel, rename);
+    // After a failed rollback the staging folder holds the only other copy of
+    // the new files: it stays.
+    if !matches!(&result, Err(e) if rollback_failed(e)) {
+        remove_staging(dir);
+    }
     result
 }
 
@@ -217,6 +288,7 @@ fn stage_and_swap(
     staging: &Path,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let archive = download(fetch, release, staging, progress, cancel)?;
     let unpacked = staging.join("unpacked");
@@ -224,7 +296,7 @@ fn stage_and_swap(
     unpack(&archive, &unpacked)?;
     // The last point where giving up is free.
     cancel.check()?;
-    swap(&unpacked, dir)
+    swap_with(&unpacked, dir, rename)
 }
 
 /// Starts `dir/partition-manager[.exe]` with `args`, detached: the new
@@ -567,6 +639,115 @@ mod tests {
         let dir = install_dir().unwrap();
         assert!(dir.is_dir());
         assert!(!dir.to_string_lossy().starts_with(r"\\?\"), "{}", dir.display());
+    }
+
+    /// Runs a full swap of two installed executables where the renames whose
+    /// 1-based numbers are in `failing` fail.
+    fn swap_failing(failing: &[usize]) -> (tempfile::TempDir, Result<()>) {
+        let dir = installed(true);
+        let staged = staged_all();
+        let mut calls = 0;
+        let mut rename = |from: &Path, to: &Path| {
+            calls += 1;
+            if failing.contains(&calls) {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+            } else {
+                fs::rename(from, to)
+            }
+        };
+        let r = swap_with(staged.path(), dir.path(), &mut rename);
+        (dir, r)
+    }
+
+    #[test]
+    fn a_failing_restore_is_reported_with_the_surviving_old_files() {
+        // Renames: 1 gui->old, 2 staged->gui, 3 pm->old, 4 staged->pm; then
+        // the rollback: 5 pm.old->pm, 6 gui->staged, 7 gui.old->gui.
+        // (failing renames, executables that stay missing)
+        let cases: [(&[usize], &[&str]); 4] = [
+            (&[4, 5], &[EXE_PM]),
+            (&[4, 7], &[EXE_GUI]),
+            (&[4, 5, 7], &[EXE_GUI, EXE_PM]),
+            (&[2, 3], &[EXE_GUI]),
+        ];
+        for (failing, missing) in cases {
+            let (dir, r) = swap_failing(failing);
+            let e = r.unwrap_err();
+            let text = e.to_string();
+            assert!(rollback_failed(&e), "{failing:?}: {text}");
+            assert!(
+                e.to_string().contains("the update failed and could not be rolled back"),
+                "{failing:?}: {text}"
+            );
+            for name in missing {
+                let old = dir.path().join(format!("{name}.old"));
+                assert!(old.exists(), "{failing:?}: {name}");
+                assert!(text.contains(&old.display().to_string()), "{failing:?}: {text}");
+                assert!(!dir.path().join(name).exists(), "{failing:?}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_move_back_of_the_new_file_still_restores_the_old_one() {
+        // Rename 6 (new gui -> staged) fails: the new file is removed instead.
+        let (dir, r) = swap_failing(&[4, 6]);
+        let e = r.unwrap_err();
+        assert!(!rollback_failed(&e), "{e}");
+        assert_eq!(read(&dir, EXE_GUI), "old gui");
+        assert_eq!(read(&dir, EXE_PM), "old pm");
+        assert_eq!(names(dir.path()).len(), 3, "{:?}", names(dir.path()));
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_a_failed_rollback() {
+        assert!(!rollback_failed(&Error::Invalid("cannot replace x".into())));
+        assert!(!rollback_failed(&Error::Cancelled));
+    }
+
+    #[test]
+    fn update_keeps_the_staging_folder_when_the_rollback_failed() {
+        let dir = installed(true);
+        let (fetch, release) = release_fixture(true);
+        let mut calls = 0;
+        let mut rename = |from: &Path, to: &Path| {
+            calls += 1;
+            if calls == 2 || calls == 3 {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+            } else {
+                fs::rename(from, to)
+            }
+        };
+        let e = update_with(&fetch, &release, dir.path(), &NullProgress, &CancelToken::default(), &mut rename)
+            .unwrap_err();
+        assert!(rollback_failed(&e), "{e}");
+        assert!(dir.path().join(STAGING).is_dir());
+        assert!(dir.path().join(format!("{EXE_GUI}.old")).exists());
+    }
+
+    #[test]
+    fn clean_up_keeps_an_old_file_whose_executable_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), &format!("{EXE_GUI}.old"), "only copy");
+        put(dir.path(), EXE_PM, "pm");
+        put(dir.path(), &format!("{EXE_PM}.old"), "old pm");
+        fs::create_dir(dir.path().join(STAGING)).unwrap();
+        clean_up(dir.path());
+        assert_eq!(read(&dir, &format!("{EXE_GUI}.old")), "only copy");
+        assert!(!dir.path().join(format!("{EXE_PM}.old")).exists());
+        assert!(dir.path().join(STAGING).is_dir());
+    }
+
+    #[test]
+    fn swap_without_the_gui_executable_fails_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), EXE_PM, "old pm");
+        let staged = staged_all();
+        let e = swap(staged.path(), dir.path()).unwrap_err();
+        assert!(e.to_string().contains(EXE_GUI), "{e}");
+        assert!(!rollback_failed(&e));
+        assert_eq!(names(dir.path()), vec![EXE_PM.to_string()]);
+        assert_eq!(read(&dir, EXE_PM), "old pm");
     }
 
     #[test]
