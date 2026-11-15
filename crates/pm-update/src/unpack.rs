@@ -214,7 +214,7 @@ fn unpack_targz(archive: &Path, sink: &mut Sink) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
@@ -237,7 +237,7 @@ mod tests {
         path
     }
 
-    fn zip_fixture(dir: &Path, top: &str, sep: &str, with_dir: bool) -> PathBuf {
+    pub(crate) fn zip_fixture(dir: &Path, top: &str, sep: &str, with_dir: bool) -> PathBuf {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         if with_dir {
             entries.push((format!("{top}{sep}"), Vec::new()));
@@ -286,7 +286,7 @@ mod tests {
         path
     }
 
-    fn targz_fixture(dir: &Path, top: &str) -> PathBuf {
+    pub(crate) fn targz_fixture(dir: &Path, top: &str) -> PathBuf {
         let mut entries = vec![of_kind(&format!("{top}/"), tar::EntryType::Directory)];
         for n in ["partition-manager", "pm"].iter().chain(DOC_NAMES.iter()) {
             entries.push(file(&format!("{top}/{n}"), format!("bin:{n}").as_bytes()));
