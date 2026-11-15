@@ -6,6 +6,7 @@
 //! GNU ddrescue's mapfile, so an interrupted rescue can be resumed by either tool.
 //! [`copy_simple`] is the fast abort-on-first-error path used by plain clones.
 
+mod blockmap;
 mod engine;
 #[cfg(any(test, feature = "testing"))]
 mod faulty;
