@@ -272,4 +272,62 @@ mod tests {
         frame(&mut app);
         assert!(app.state.dialog.is_some());
     }
+
+    /// Clicking Apply in the confirmation starts the job (the click is a real pointer click
+    /// on the button, through a whole frame, not a hand-made command).
+    #[test]
+    fn confirmation_apply_button_starts_the_job() {
+        let mock = MockPlatform::new();
+        let d = gpt_disk(1);
+        let mut dev = MemDevice::new(d.size);
+        pm_parttable::write_table(&mut dev, &pm_ops::table_from_disk(&d)).unwrap();
+        mock.add_disk(1, dev, d);
+        let state = AppState::new(Arc::new(mock), StartOptions { dry_run: true, source: Some("test".into()) });
+        let mut app = PartitionApp { state, applied_theme: None };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut PartitionApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.draw(ctx));
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.state.loaded {
+            assert!(Instant::now() < deadline);
+            frame(&mut app, Vec::new());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.state.handle(Cmd::Push(vec![pm_ops::Operation::DeletePartition { disk: 1, number: 3 }]));
+        // the buttons sit in the dialog's last row, Cancel then Apply: click along that row
+        // (a click on Cancel closes the dialog, which is then opened again)
+        let mut started = false;
+        for step in 0..60 {
+            if app.state.dialog.is_none() {
+                app.state.handle(Cmd::Apply);
+            }
+            frame(&mut app, Vec::new());
+            frame(&mut app, Vec::new());
+            let rect = ctx
+                .memory(|m| m.area_rect(egui::Id::new("Apply (dry run)")))
+                .expect("confirmation window");
+            let pos = egui::pos2(rect.left() + 10.0 + 5.0 * step as f32, rect.bottom() - 18.0);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            frame(&mut app, vec![button(true)]);
+            frame(&mut app, vec![button(false)]);
+            if app.state.job.is_some() {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "clicking Apply in the confirmation must start the job");
+        assert!(app.state.dialog.is_none(), "the confirmation closes when the job starts");
+    }
 }

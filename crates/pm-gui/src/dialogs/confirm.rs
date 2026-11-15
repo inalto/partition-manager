@@ -75,8 +75,9 @@ pub fn show(
             }
             let label = if s.dry_run { "Simulate" } else { "Apply" };
             if ui.button(RichText::new(label).strong()).clicked() {
+                // the dialog stays until the command is handled: Apply only starts from an
+                // open confirmation, and the handler closes it
                 out.push(Cmd::ConfirmApply { allow_system: *allow_system });
-                keep = false;
             }
         });
     });
