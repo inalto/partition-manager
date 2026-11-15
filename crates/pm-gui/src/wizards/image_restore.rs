@@ -245,6 +245,7 @@ pub fn wizard(state: ImageRestoreState) -> Wizard {
         vec![("Image file", file_ui, file_summary), ("Target", target_ui, target_summary)],
         ImageRestoreState::build,
     )
+    .with_finish("Finish", "Finish opens the Apply confirmation; nothing is written before you confirm.")
 }
 
 pub fn new(ctx: &WizardCtx) -> Option<Wizard> {

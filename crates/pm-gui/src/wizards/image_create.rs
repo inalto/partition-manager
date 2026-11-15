@@ -404,6 +404,7 @@ pub fn wizard(state: ImageCreateState) -> Wizard {
         ],
         ImageCreateState::build,
     )
+    .with_finish("Start", "The image is written as soon as you press Start.")
 }
 
 pub fn new(ctx: &WizardCtx) -> Option<Wizard> {

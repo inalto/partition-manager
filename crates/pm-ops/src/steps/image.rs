@@ -183,6 +183,10 @@ pub(crate) fn image(
     rescue: Option<&RescueSettings>,
 ) -> Result<()> {
     let d = ctx.live_disk(disk)?;
+    if mode == CloneMode::Smart {
+        // reads every filesystem's allocation map: seconds on a large or slow disk
+        ctx.step("scan used space");
+    }
     let (start, len, used) = match number {
         Some(n) => {
             let q = ctx.live_partition(disk, n)?;

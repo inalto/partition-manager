@@ -483,14 +483,38 @@ impl AppState {
                 )),
             },
             Cmd::DismissBanner => self.banner = None,
-            Cmd::FinishWizard(ops) => match self.try_push_ops(ops) {
-                Ok(()) => self.wizard = None,
+            Cmd::FinishWizard(ops) => match self.try_push_ops(ops.clone()) {
+                Ok(()) => {
+                    self.wizard = None;
+                    self.run_finished_images(&ops);
+                }
                 Err(e) => match &mut self.wizard {
                     Some(w) => w.wizard.set_error(e),
                     None => self.error(e),
                 },
             },
             Cmd::CloseWizard => self.wizard = None,
+        }
+    }
+
+    /// Image operations do not change what the disk views show, so queueing them silently
+    /// looks like nothing happened: when a wizard queued only image operations (`ops`), run
+    /// them. Creating an image with nothing else pending starts at once (the wizard's summary
+    /// was the confirmation, and the disks are only read); a restore, or other pending
+    /// operations that would run first, go through the Apply confirmation.
+    fn run_finished_images(&mut self, ops: &[Operation]) {
+        let image = |o: &Operation| {
+            matches!(o, Operation::ImageDisk { .. } | Operation::ImagePartition { .. } | Operation::RestoreImage { .. })
+        };
+        if ops.is_empty() || !ops.iter().all(image) {
+            return;
+        }
+        if self.busy() {
+            self.toast("Queued: press Apply once the disks have been read");
+        } else if self.queue.len() == ops.len() && !ops.iter().any(Operation::is_destructive) {
+            self.start_apply(false);
+        } else {
+            self.dialog = Some(Dialog::Confirm { allow_system: false });
         }
     }
 
@@ -739,6 +763,55 @@ mod tests {
         assert!(s.wizard.is_none());
         assert_eq!(s.queue.len(), 1);
         assert!(matches!(s.queue.ops()[0], Operation::FormatPartition { disk: 1, number: 3, .. }));
+    }
+
+    #[test]
+    fn finishing_create_image_starts_it_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.qcow2");
+        let image = || Operation::ImagePartition {
+            disk: 1,
+            number: 3,
+            path: path.clone(),
+            format: pm_image::ImageFormat::Qcow2,
+            mode: pm_ops::CloneMode::Sector,
+            rescue: None,
+        };
+        let mut s = mock_state();
+        s.handle(Cmd::OpenTool(Tool::CreateImage));
+        assert_eq!(s.wizard.as_ref().unwrap().wizard.finish_label(), "Start");
+        s.handle(Cmd::FinishWizard(vec![image()]));
+        assert!(s.wizard.is_none() && s.dialog.is_none());
+        assert!(matches!(s.job, Some(RunningJob { kind: JobKind::Apply { dry_run: false }, .. })), "Apply runs");
+        wait_idle(&mut s);
+        match &s.dialog {
+            Some(Dialog::Report { report, .. }) => assert_eq!((report.completed, &report.failed), (1, &None), "{report:?}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(path.exists());
+        assert!(s.queue.is_empty());
+        s.handle(Cmd::CloseDialog);
+
+        // other operations are pending (they would run first): the Apply confirmation opens
+        s.handle(Cmd::Push(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
+        s.handle(Cmd::FinishWizard(vec![image()]));
+        assert!(s.job.is_none());
+        assert!(matches!(s.dialog, Some(Dialog::Confirm { .. })));
+        assert_eq!(s.queue.len(), 2);
+        s.handle(Cmd::CloseDialog);
+        s.handle(Cmd::Discard);
+
+        // a restore overwrites its target: never without the confirmation
+        s.handle(Cmd::FinishWizard(vec![Operation::RestoreImage { path: path.clone(), dst_disk: 1, dst_start: None }]));
+        assert!(s.job.is_none());
+        assert!(matches!(s.dialog, Some(Dialog::Confirm { .. })), "{:?}", s.dialog);
+        s.handle(Cmd::CloseDialog);
+        s.handle(Cmd::Discard);
+
+        // other wizards keep queueing
+        s.handle(Cmd::FinishWizard(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
+        assert!(s.job.is_none() && s.dialog.is_none());
+        assert_eq!(s.queue.len(), 1);
     }
 
     #[test]

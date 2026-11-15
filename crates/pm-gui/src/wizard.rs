@@ -210,6 +210,10 @@ pub struct Wizard {
     on_finish: FinishFn,
     /// The current step's result as of the last frame drawn.
     valid: StepResult,
+    /// Label of the button that finishes the wizard.
+    finish_label: &'static str,
+    /// What the summary page says happens on finish.
+    finish_note: &'static str,
 }
 
 impl Wizard {
@@ -221,7 +225,21 @@ impl Wizard {
             error: None,
             on_finish,
             valid: StepResult::Invalid(String::new()),
+            finish_label: "Finish",
+            finish_note: "Nothing is written until you press Apply.",
         }
+    }
+
+    /// Another finish button label and summary-page note, for wizards whose operations the
+    /// application runs (or asks to confirm) as soon as they are queued.
+    pub fn with_finish(mut self, label: &'static str, note: &'static str) -> Wizard {
+        self.finish_label = label;
+        self.finish_note = note;
+        self
+    }
+
+    pub fn finish_label(&self) -> &'static str {
+        self.finish_label
     }
 
     /// The common shape of a wizard: one state struct `S`, steps drawn by plain functions
@@ -372,7 +390,7 @@ impl Wizard {
                 }
                 let ok = self.valid == StepResult::Continue;
                 if self.on_summary() {
-                    if ui.add_enabled(ok && self.error.is_none(), egui::Button::new("Finish")).clicked() {
+                    if ui.add_enabled(ok && self.error.is_none(), egui::Button::new(self.finish_label)).clicked() {
                         if let Ok(ops) = self.build_ops() {
                             outcome = WizardOutcome::Finished(ops);
                         }
@@ -405,7 +423,7 @@ impl Wizard {
                     ui.label(format!("• {}", op.summary()));
                 }
                 ui.add_space(4.0);
-                ui.weak("Nothing is written until you press Apply.");
+                ui.weak(self.finish_note);
             }
             Err(_) => {
                 ui.label("The operation cannot be queued:");
