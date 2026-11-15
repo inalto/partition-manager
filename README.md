@@ -26,6 +26,45 @@ macOS on Apple Silicon and Intel (tar.gz, unsigned: after downloading run
 The release workflow (`.github/workflows/release.yml`) builds them from the tag with the
 `scripts/build-release.*` scripts; `CHANGELOG.md` has the notes.
 
+## Updates
+
+The desktop application looks for a newer release when it starts, at most once every 24
+hours. The check is one request to `api.github.com` (the latest release of
+`inalto/partition-manager`) with the user agent `partition-manager/<version>`; nothing else
+is sent. A failed or offline check is only written to the log. If a newer version exists, a
+bar above the disk views names it and offers **What's new** (the release notes), **Update**,
+**Skip this version** and a close button (**x**, hides it until the next start). Where the
+application cannot update itself (a folder it cannot write to, or a platform without a
+release archive) the bar offers **Open the download page** instead of **Update**.
+
+Nothing is downloaded until you press **Update** and confirm. It then downloads the archive
+for your platform from GitHub (only `github.com`, `api.github.com` and
+`*.githubusercontent.com` over https are ever contacted), checks it against the SHA-256 in
+the release's `SHA256SUMS.txt`, and replaces `partition-manager` and, when it sits in the
+same folder, `pm` by name with the files from the archive (and the README, LICENSE and
+CHANGELOG already there). Both executables are replaced or neither; if a step fails the
+previous files are put back. The old files are kept as `*.old` until the next start, which
+removes them. In the unlikely case that the previous files cannot be put back, the error
+message names them and where their previous versions are, so you can restore them by hand.
+When it is done, **Restart now** starts the new version with the same arguments; **Later**
+keeps the old one running.
+
+**Update** and **Restart now** are unavailable while an operation or job is running (the
+application asks you to wait for it). The restart drops the pending operations and the open
+windows, and the confirmation tells you how many. Nothing is written to a disk by an update.
+
+To turn the automatic check off, clear `Settings > Check for updates at startup`, or start
+the application with `--no-update-check`. `Settings > Check for updates now` checks on
+demand. The choice, the time of the last check, a skipped version and the release found are
+kept in `settings.json`, in `%APPDATA%\PartitionManager` on Windows,
+`~/Library/Application Support/PartitionManager` on macOS and
+`$XDG_CONFIG_HOME/partition-manager` (or `~/.config/partition-manager`) on Linux.
+
+Releases are not signed. The checksum protects against a corrupted download, not against a
+compromised release: trusting an update is the same as trusting a manual download from the
+GitHub Releases page. `pm` has no update check of its own; it is replaced together with the
+application when it is in the same folder.
+
 ## Features
 
 - **Enumerate, manage and mount.** Disks and partitions with capacity, usage, file system,

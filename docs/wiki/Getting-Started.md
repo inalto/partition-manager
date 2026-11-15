@@ -13,6 +13,10 @@ Linux x86_64 (built against glibc 2.35, runs on AlmaLinux 9's 2.34 too) and macO
 `xattr -d com.apple.quarantine pm partition-manager` after downloading), with
 `SHA256SUMS.txt`. The rest of this page is for building from source.
 
+The desktop application checks for a newer release at startup and can update itself in
+place; see [Updates](https://github.com/inalto/partition-manager#updates) in the README
+(including how to turn the check off with `--no-update-check`).
+
 ## Building
 
 The release binaries land in `target\release\`: `pm.exe` (command line) and

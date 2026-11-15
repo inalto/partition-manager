@@ -4,6 +4,22 @@ All notable changes to Partition Manager. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver while the
 project is pre-1.0 (minor bumps may change behaviour).
 
+## [Unreleased]
+
+### Added
+- **Update check and in-place update.** The desktop application looks for a newer release at
+  startup (at most once a day; `api.github.com` only, no other data than a generic user
+  agent) and shows a notice with What's new, Update and Skip this version. Update downloads
+  the archive for the platform, verifies it against `SHA256SUMS.txt`, replaces
+  `partition-manager` and, beside it, `pm` (both or neither) and offers a restart. Turn the
+  check off with `Settings > Check for updates at startup` or `--no-update-check`; the
+  settings file is `settings.json` in the per-user configuration folder. Releases are not
+  signed.
+
+### Fixed
+- **The Apply button of the confirmation starts the job.** The confirmation closed itself
+  before its command was handled, so the dialog vanished and nothing ran.
+
 ## [0.2.2] - 2026-11-15
 
 ### Fixed
