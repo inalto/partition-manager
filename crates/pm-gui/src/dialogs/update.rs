@@ -8,7 +8,7 @@ use crate::app::{AppState, Cmd};
 use crate::tools::{progress_panel, Task};
 use crate::update::{Notice, UpdateState};
 use eframe::egui::{self, RichText};
-use pm_update::{Release, Version};
+use pm_update::{release_page, Release, Version};
 use std::path::Path;
 
 /// The text of the notice bar.
@@ -58,7 +58,7 @@ pub fn notice(ui: &mut egui::Ui, u: &UpdateState, out: &mut Vec<Cmd>) {
                         out.push(Cmd::UpdateAsk);
                     }
                 } else if ui.small_button("Open the download page").clicked() {
-                    out.push(Cmd::OpenUrl(n.page_url.clone()));
+                    out.push(Cmd::OpenUrl(release_page(&n.page_url)));
                 }
                 if ui.small_button("Skip this version").clicked() {
                     out.push(Cmd::UpdateSkip);
@@ -83,7 +83,7 @@ pub fn whats_new(ctx: &egui::Context, release: &Release, out: &mut Vec<Cmd>) -> 
         ui.separator();
         ui.horizontal(|ui| {
             if ui.button("Open the release page").clicked() {
-                out.push(Cmd::OpenUrl(release.page_url.clone()));
+                out.push(Cmd::OpenUrl(release_page(&release.page_url)));
             }
             if ui.button("Close").clicked() {
                 keep = false;

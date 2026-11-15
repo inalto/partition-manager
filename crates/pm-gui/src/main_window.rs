@@ -18,13 +18,20 @@ use std::time::{Duration, Instant};
 pub struct PartitionApp {
     state: AppState,
     applied_theme: Option<Theme>,
+    /// What an earlier update left in the install folder has been removed (once, after the
+    /// first frame: until this version has shown that it starts, the previous one is kept).
+    cleaned_up: bool,
 }
 
 impl PartitionApp {
     pub fn new(cc: &eframe::CreationContext<'_>, state: AppState) -> Self {
         // rows and segments are click targets; selectable label text would swallow the clicks
         cc.egui_ctx.style_mut(|s| s.interaction.selectable_labels = false);
-        PartitionApp { state, applied_theme: None }
+        PartitionApp::with_state(state)
+    }
+
+    fn with_state(state: AppState) -> Self {
+        PartitionApp { state, applied_theme: None, cleaned_up: false }
     }
 }
 
@@ -157,6 +164,12 @@ impl PartitionApp {
             // the updated version has been started
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if !self.cleaned_up {
+            self.cleaned_up = true;
+            if let Some(dir) = self.state.update.install_dir() {
+                pm_update::clean_up(dir);
+            }
+        }
     }
 }
 
@@ -214,13 +227,10 @@ pub fn auto_check_wanted(no_update_check: bool, debug_build: bool, current_overr
 }
 
 /// The update state of this run: the settings file in the configuration folder, the folder
-/// of the executable (cleaned of what an earlier update left there), and the automatic check
-/// when it is wanted and due.
+/// of the executable (cleaned of what an earlier update left there after the first frame,
+/// see [`PartitionApp`]), and the automatic check when it is wanted and due.
 fn start_update(state: &mut AppState, args: &Args) {
     let install_dir = pm_update::install_dir().ok();
-    if let Some(dir) = &install_dir {
-        pm_update::clean_up(dir);
-    }
     let settings = settings_dir().map(|d| d.join("settings.json"));
     let fetch = Arc::new(pm_update::HttpFetch::new());
     state.update = UpdateState::new(fetch, settings, install_dir, pm_update::Version::current());
@@ -280,7 +290,7 @@ mod tests {
         mock.add_disk(1, dev, d);
         mock.set_system_disk(7);
         let state = AppState::new(Arc::new(mock), StartOptions { dry_run: true, source: Some("test".into()) });
-        let mut app = PartitionApp { state, applied_theme: None };
+        let mut app = PartitionApp::with_state(state);
         let ctx = egui::Context::default();
         let frame = |app: &mut PartitionApp| {
             let input = egui::RawInput {
@@ -372,7 +382,7 @@ mod tests {
             state.poll_job();
         }
         assert!(state.update.notice.is_some());
-        let mut app = PartitionApp { state, applied_theme: None };
+        let mut app = PartitionApp::with_state(state);
         let ctx = egui::Context::default();
         let frame = |app: &mut PartitionApp, close: bool| {
             let mut input = egui::RawInput {
@@ -399,7 +409,8 @@ mod tests {
         frame(&mut app, false);
         assert!(window("What's new in 0.9.0"));
         app.state.handle(Cmd::CloseDialog);
-        app.state.handle(Cmd::UpdateAsk);
+        // (Update itself would report that there is no install folder)
+        app.state.dialog = Some(crate::app::Dialog::UpdateConfirm { release: r });
         frame(&mut app, false);
         frame(&mut app, false);
         assert!(window("Update to 0.9.0"));
@@ -432,6 +443,44 @@ mod tests {
         assert!(out.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));
     }
 
+    /// What an earlier update left in the install folder is removed only once this version has
+    /// drawn its first frame, and never without a known install folder.
+    #[test]
+    fn old_files_are_removed_after_the_first_frame() {
+        let install = tempfile::tempdir().unwrap();
+        let gui = pm_update::exe_name("partition-manager", cfg!(windows));
+        std::fs::write(install.path().join(&gui), "new").unwrap();
+        let old = install.path().join(format!("{gui}.old"));
+        std::fs::write(&old, "old").unwrap();
+        let ctx = egui::Context::default();
+        let frame = |app: &mut PartitionApp| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.draw(ctx));
+        };
+
+        let u = UpdateState::new(
+            Arc::new(pm_update::testing::MapFetch::new()),
+            None,
+            Some(install.path().to_path_buf()),
+            pm_update::Version::parse("0.2.2").unwrap(),
+        );
+        let mut app = PartitionApp::with_state(crate::test_util::mock_state().with_update(u));
+        assert!(old.exists(), "nothing is removed before the first frame");
+        frame(&mut app);
+        assert!(!old.exists(), "removed after the first frame");
+        assert!(install.path().join(&gui).exists());
+
+        // the install folder is unknown: the file stays
+        std::fs::write(&old, "old").unwrap();
+        let mut app = PartitionApp::with_state(crate::test_util::mock_state());
+        frame(&mut app);
+        frame(&mut app);
+        assert!(old.exists());
+    }
+
     /// Clicking Apply in the confirmation starts the job (the click is a real pointer click
     /// on the button, through a whole frame, not a hand-made command).
     #[test]
@@ -442,7 +491,7 @@ mod tests {
         pm_parttable::write_table(&mut dev, &pm_ops::table_from_disk(&d)).unwrap();
         mock.add_disk(1, dev, d);
         let state = AppState::new(Arc::new(mock), StartOptions { dry_run: true, source: Some("test".into()) });
-        let mut app = PartitionApp { state, applied_theme: None };
+        let mut app = PartitionApp::with_state(state);
         let ctx = egui::Context::default();
         let frame = |app: &mut PartitionApp, events: Vec<egui::Event>| {
             let input = egui::RawInput {

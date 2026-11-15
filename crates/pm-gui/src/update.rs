@@ -10,7 +10,7 @@ use crate::app::{AppState, Cmd, Dialog};
 use crate::settings::{Found, Settings};
 use crate::tools::{error_text, Task};
 use pm_core::Error;
-use pm_update::{Check, Fetch, InstallKind, Release, Version};
+use pm_update::{release_page, Check, Fetch, InstallKind, Release, Version};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,18 +49,24 @@ pub struct UpdateState {
     pub hidden: bool,
     /// The running version.
     pub current: Version,
-    /// The release of the notice can be installed here (see [`UpdateState::install_problem`]).
+    /// The release of the notice can be installed here (see [`UpdateState::install_problem`]);
+    /// `false` without a notice.
     pub can_install: bool,
     /// The running download and install; yields the installed version.
     pub downloading: Option<Task<Version>>,
     fetch: Arc<dyn Fetch>,
     settings_path: Option<PathBuf>,
     install_dir: Option<PathBuf>,
-    /// Why nothing can be installed into `install_dir`, whatever the release.
-    folder_problem: Option<String>,
+    /// Why nothing can be installed into `install_dir`, whatever the release: `None` until
+    /// the folder is probed, which happens on first need (a notice to show, an update asked
+    /// for) and only once.
+    folder_problem: Option<Option<String>>,
     /// The newer release found by a check of this session.
     release: Option<Release>,
     checking: Option<Checking>,
+    /// The version installed by this session (it runs after the restart): never offered or
+    /// installed again, and the only reason to restart.
+    installed: Option<Version>,
 }
 
 /// The [`Fetch`] of [`UpdateState::disabled`]: every request fails, nothing is contacted.
@@ -80,8 +86,9 @@ fn unix_now() -> u64 {
 impl UpdateState {
     /// The update state of a run of version `current`: the settings are read from
     /// `settings_path` (defaults without one), a remembered newer release becomes the notice
-    /// when it is still newer than `current` and not skipped (and is forgotten otherwise),
-    /// and `install_dir` is probed once for whether it can be written. Nothing is fetched.
+    /// when it is still newer than `current` and not skipped (and is forgotten otherwise).
+    /// Nothing is fetched; `install_dir` is probed for whether it can be written only when
+    /// there is such a notice.
     pub fn new(
         fetch: Arc<dyn Fetch>,
         settings_path: Option<PathBuf>,
@@ -89,13 +96,6 @@ impl UpdateState {
         current: Version,
     ) -> UpdateState {
         let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
-        let folder_problem = match &install_dir {
-            None => Some("the folder of the application is unknown".to_string()),
-            Some(dir) => match pm_update::install_kind(dir) {
-                InstallKind::Portable => None,
-                InstallKind::Unavailable(why) => Some(why),
-            },
-        };
         let mut u = UpdateState {
             settings,
             notice: None,
@@ -106,14 +106,15 @@ impl UpdateState {
             fetch,
             settings_path,
             install_dir,
-            folder_problem,
+            folder_problem: None,
             release: None,
             checking: None,
+            installed: None,
         };
         if let Some(found) = u.settings.found.clone() {
             match Version::parse(&found.version) {
                 Some(version) if version > current && !u.is_skipped(version) => {
-                    u.notice = Some(Notice { version, page_url: found.page_url })
+                    u.notice = Some(Notice { version, page_url: release_page(&found.page_url) })
                 }
                 _ => {
                     u.settings.found = None;
@@ -151,10 +152,11 @@ impl UpdateState {
         self.install_dir.as_deref()
     }
 
-    /// Why the release of the notice cannot be installed here, if it cannot.
-    pub fn install_problem(&self) -> Option<String> {
-        if let Some(p) = &self.folder_problem {
-            return Some(p.clone());
+    /// Why the release of the notice cannot be installed here, if it cannot. Probes the
+    /// install folder the first time.
+    pub fn install_problem(&mut self) -> Option<String> {
+        if let Some(p) = self.folder_problem() {
+            return Some(p);
         }
         let r = self.release.as_ref()?;
         if r.archive.is_none() {
@@ -189,8 +191,24 @@ impl UpdateState {
         self.settings.skipped.as_deref().and_then(Version::parse) == Some(v)
     }
 
+    /// Why nothing can be installed into the install folder, whatever the release (probed
+    /// once, then remembered).
+    fn folder_problem(&mut self) -> Option<String> {
+        let dir = &self.install_dir;
+        self.folder_problem
+            .get_or_insert_with(|| match dir {
+                None => Some("the folder of the application is unknown".to_string()),
+                Some(dir) => match pm_update::install_kind(dir) {
+                    InstallKind::Portable => None,
+                    InstallKind::Unavailable(why) => Some(why),
+                },
+            })
+            .clone()
+    }
+
+    /// Only with a notice to show: without one the install folder is not probed.
     fn refresh_can_install(&mut self) {
-        self.can_install = self.install_problem().is_none();
+        self.can_install = self.notice.is_some() && self.install_problem().is_none();
     }
 
     /// Write the settings file; a failure is logged and otherwise ignored.
@@ -210,10 +228,17 @@ impl UpdateState {
         self.refresh_can_install();
     }
 
-    /// The release page of the notice, if any.
-    fn page_url(&self) -> Option<String> {
-        self.release.as_ref().map(|r| r.page_url.clone()).or_else(|| self.notice.as_ref().map(|n| n.page_url.clone()))
+    /// The release page of the notice, or the page of the newest release when there is no
+    /// usable one.
+    fn page_url(&self) -> String {
+        let page = self.release.as_ref().map(|r| r.page_url.as_str()).or(self.notice.as_ref().map(|n| n.page_url.as_str()));
+        release_page(page.unwrap_or_default())
     }
+}
+
+/// The message for a release that cannot be installed here, with where to get it instead.
+fn cannot_update_text(why: &str, page_url: &str) -> String {
+    format!("Cannot update here: {why}.\n\nThe release can be downloaded from {}", release_page(page_url))
 }
 
 impl AppState {
@@ -249,11 +274,26 @@ impl AppState {
         let free = !self.modal();
         let u = &mut self.update;
         match r {
-            Ok(Check::Newer(release)) => {
+            // the release this session installed (or an older one): not offered again
+            Ok(Check::Newer(release)) if u.installed.is_some_and(|i| release.version <= i) => {
+                let installed = u.installed.expect("checked by the guard");
                 u.settings.last_check = unix_now();
-                u.settings.found = Some(Found { version: release.version.to_string(), page_url: release.page_url.clone() });
+                u.clear_found();
+                u.save();
+                if manual {
+                    if free {
+                        self.dialog = Some(Dialog::Updated { version: installed });
+                    } else {
+                        self.toast(format!("Updated to {installed}. Restart Partition Manager to use it."));
+                    }
+                }
+            }
+            Ok(Check::Newer(release)) => {
+                let page_url = release_page(&release.page_url);
+                u.settings.last_check = unix_now();
+                u.settings.found = Some(Found { version: release.version.to_string(), page_url: page_url.clone() });
                 if manual || !u.is_skipped(release.version) {
-                    u.notice = Some(Notice { version: release.version, page_url: release.page_url.clone() });
+                    u.notice = Some(Notice { version: release.version, page_url });
                     if manual {
                         u.hidden = false;
                     }
@@ -299,6 +339,7 @@ impl AppState {
     fn install_finished(&mut self, r: pm_core::Result<Version>) {
         match r {
             Ok(version) => {
+                self.update.installed = Some(version);
                 self.update.clear_found();
                 self.update.save();
                 self.dialog = Some(Dialog::Updated { version });
@@ -307,10 +348,11 @@ impl AppState {
             Err(e) => {
                 log::warn!("update failed: {e}");
                 // a failed rollback names the files to restore by hand: shown in full
-                let mut text = format!("The update failed: {}", error_text(&e));
-                if let Some(page) = self.update.page_url() {
-                    text.push_str(&format!("\n\nThe release can be downloaded from {page}"));
-                }
+                let text = format!(
+                    "The update failed: {}\n\nThe release can be downloaded from {}",
+                    error_text(&e),
+                    self.update.page_url()
+                );
                 self.dialog = Some(Dialog::Error(text));
             }
         }
@@ -330,12 +372,20 @@ impl AppState {
                 None => {}
             },
             Cmd::UpdateAsk => {
+                if let Some(version) = self.update.installed {
+                    self.dialog = Some(Dialog::Updated { version });
+                    return;
+                }
                 if self.anything_running() {
                     self.toast(WAIT_TEXT);
                     return;
                 }
                 match self.update.release.clone() {
-                    Some(release) => self.dialog = Some(Dialog::UpdateConfirm { release }),
+                    // a confirmation is only offered for a release that can be installed
+                    Some(release) => match self.update.install_problem() {
+                        Some(why) => self.dialog = Some(Dialog::Error(cannot_update_text(&why, &release.page_url))),
+                        None => self.dialog = Some(Dialog::UpdateConfirm { release }),
+                    },
                     None if self.update.notice.is_some() => self.update.start_check_then(true, Some(Then::Ask)),
                     None => {}
                 }
@@ -356,6 +406,10 @@ impl AppState {
             }
             Cmd::UpdateHide => self.update.hidden = true,
             Cmd::UpdateRestart => {
+                if self.update.installed.is_none() {
+                    log::warn!("restart asked for without an installed update");
+                    return;
+                }
                 if self.anything_running() {
                     self.toast(WAIT_TEXT);
                     return;
@@ -383,8 +437,13 @@ impl AppState {
     }
 
     /// [`Cmd::UpdateStart`]: only from the confirmation the user is looking at, with nothing
-    /// else running, and only for a release that can be installed here.
+    /// else running, only for a release that can be installed here, and never again once an
+    /// update is installed.
     fn start_install(&mut self) {
+        if let Some(version) = self.update.installed {
+            self.dialog = Some(Dialog::Updated { version });
+            return;
+        }
         let Some(Dialog::UpdateConfirm { release }) = &self.dialog else { return };
         let release = release.clone();
         if self.anything_running() {
@@ -397,10 +456,7 @@ impl AppState {
             (None, Some(dir)) => dir,
             (problem, _) => {
                 let why = problem.unwrap_or_else(|| "the folder of the application is unknown".into());
-                self.dialog = Some(Dialog::Error(format!(
-                    "Cannot update here: {why}.\n\nThe release can be downloaded from {}",
-                    release.page_url
-                )));
+                self.dialog = Some(Dialog::Error(cannot_update_text(&why, &release.page_url)));
                 return;
             }
         };
@@ -581,7 +637,8 @@ mod tests {
         let found = Found { version: "0.9.0".into(), page_url: PAGE.into() };
         Settings { found: Some(found), ..Settings::default() }.save(&path).unwrap();
         let fetch = Arc::new(fake_release("0.9.0"));
-        let u = UpdateState::new(fetch.clone(), Some(path.clone()), None, v("0.2.2"));
+        let install = old_install();
+        let u = UpdateState::new(fetch.clone(), Some(path.clone()), Some(install.path().to_path_buf()), v("0.2.2"));
         let mut s = mock_state().with_update(u);
         assert_eq!(s.update.notice.as_ref().unwrap().version, v("0.9.0"));
         assert!(fetch.requested().is_empty(), "nothing is fetched at start");
@@ -606,7 +663,7 @@ mod tests {
         assert_eq!(fetch.requested().len(), 1);
 
         // Update on a remembered notice checks first as well
-        let u = UpdateState::new(fetch.clone(), Some(path), None, v("0.2.2"));
+        let u = UpdateState::new(fetch.clone(), Some(path), Some(install.path().to_path_buf()), v("0.2.2"));
         let mut s = mock_state().with_update(u);
         s.handle(Cmd::UpdateAsk);
         assert!(s.dialog.is_none());
@@ -626,8 +683,10 @@ mod tests {
 
         // Update on a remembered notice, then the Apply confirmation opens while it checks:
         // the queued request is dropped
+        let install = old_install();
         for cmd in [Cmd::UpdateAsk, Cmd::UpdateWhatsNew] {
-            let u = UpdateState::new(Arc::new(fake_release("0.9.0")), Some(path.clone()), None, v("0.2.2"));
+            let dir = Some(install.path().to_path_buf());
+            let u = UpdateState::new(Arc::new(fake_release("0.9.0")), Some(path.clone()), dir, v("0.2.2"));
             let mut s = mock_state().with_update(u);
             s.handle(cmd.clone());
             assert!(s.update.checking());
@@ -736,9 +795,12 @@ mod tests {
         assert!(s.dialog.is_none());
         assert!(toast(&s).contains("Wait for the running work to finish first"), "{}", toast(&s));
         s.toast = None;
+        // (Restart only acts once an update is installed)
+        s.update.installed = Some(v("0.9.0"));
         s.handle(Cmd::UpdateRestart);
         assert!(!s.quit && s.dialog.is_none());
         assert!(toast(&s).contains("Wait for the running work to finish first"));
+        s.update.installed = None;
         wait_idle(&mut s);
 
         // a window's worker is running
@@ -748,10 +810,14 @@ mod tests {
         s.handle(Cmd::UpdateAsk);
         assert!(s.dialog.is_none());
         assert!(toast(&s).contains("Wait for the running work to finish first"));
+        s.toast = None;
+        s.update.installed = Some(v("0.9.0"));
         s.handle(Cmd::UpdateRestart);
         assert!(!s.quit && s.dialog.is_none());
+        assert!(toast(&s).contains("Wait for the running work to finish first"));
+        s.update.installed = None;
 
-        // nothing runs any more: both go ahead
+        // nothing runs any more: the update goes ahead
         s.windows.clear();
         assert!(!s.anything_running());
         s.handle(Cmd::UpdateAsk);
@@ -762,6 +828,7 @@ mod tests {
     fn restart_without_the_executable_reports_and_stays() {
         let install = tempfile::tempdir().unwrap();
         let (mut s, _path, _dir) = state_installed(never_fetch(), "0.2.2", Some(install.path().to_path_buf()));
+        s.update.installed = Some(v("0.9.0"));
         s.handle(Cmd::UpdateRestart);
         assert!(!s.quit);
         match &s.dialog {
@@ -770,6 +837,7 @@ mod tests {
         }
         // without an install folder there is nothing to start either
         let (mut s, _path, _dir) = state_with(MapFetch::new(), "0.2.2");
+        s.update.installed = Some(v("0.9.0"));
         s.handle(Cmd::UpdateRestart);
         assert!(!s.quit);
         assert!(matches!(s.dialog, Some(Dialog::Error(_))));
@@ -790,7 +858,7 @@ mod tests {
         assert!(s.update.downloading.is_some());
         assert!(s.modal() && s.anything_running());
         wait_update(&mut s);
-        assert!(!s.modal() || s.dialog.is_some());
+        assert!(s.update.downloading.is_none());
         match &s.dialog {
             Some(Dialog::Updated { version }) => assert_eq!(*version, v("0.9.0")),
             other => panic!("unexpected {other:?}"),
@@ -980,11 +1048,166 @@ mod tests {
     fn disabled_state_touches_nothing() {
         let mut s = mock_state();
         assert!(s.update.notice.is_none() && !s.update.busy() && !s.quit);
+        // no network: the check goes to the fetcher that refuses everything
         s.handle(Cmd::CheckUpdates);
         wait_update(&mut s);
-        assert!(matches!(s.dialog, Some(Dialog::Error(_))), "a manual check reports that it cannot check");
+        match &s.dialog {
+            Some(Dialog::Error(m)) => assert!(m.contains("not available in this session"), "{m}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        s.dialog = None;
+        // no settings file, no install folder, and the folder was never probed
         s.handle(Cmd::SetCheckUpdates(false));
         assert!(!s.update.settings.check_updates);
+        assert!(s.update.settings_path.is_none() && s.update.install_dir().is_none());
+        for cmd in [Cmd::UpdateAsk, Cmd::UpdateStart, Cmd::UpdateRestart, Cmd::UpdateSkip] {
+            s.handle(cmd);
+        }
+        assert!(s.update.folder_problem.is_none(), "probed");
+        assert!(!s.quit && !s.update.busy() && s.dialog.is_none());
+    }
+
+    #[test]
+    fn the_installed_release_is_not_offered_again() {
+        let install = old_install();
+        let fetch = Arc::new(fake_release("0.9.0"));
+        let (mut s, path, _dir) = state_installed(fetch.clone(), "0.2.2", Some(install.path().to_path_buf()));
+        s.update.start_check(false);
+        wait_update(&mut s);
+        s.handle(Cmd::UpdateAsk);
+        s.handle(Cmd::UpdateStart);
+        wait_update(&mut s);
+        let updated = |s: &AppState| matches!(&s.dialog, Some(Dialog::Updated { version }) if *version == v("0.9.0"));
+        assert!(updated(&s), "{:?}", s.dialog);
+        s.handle(Cmd::CloseDialog); // Later
+
+        // Check for updates now: no notice, the "updated" message again
+        s.handle(Cmd::CheckUpdates);
+        wait_update(&mut s);
+        assert!(s.update.notice.is_none());
+        assert!(updated(&s), "{:?}", s.dialog);
+        assert!(Settings::load(&path).found.is_none());
+        s.handle(Cmd::CloseDialog);
+        // an automatic check shows nothing at all
+        s.update.start_check(false);
+        wait_update(&mut s);
+        assert!(s.update.notice.is_none() && s.dialog.is_none() && s.toast.is_none());
+
+        // Update asked for anyway (or started from a stale confirmation): the message again,
+        // nothing downloaded, nothing swapped
+        let requests = fetch.requested().len();
+        s.handle(Cmd::UpdateAsk);
+        assert!(updated(&s), "{:?}", s.dialog);
+        s.dialog = Some(Dialog::UpdateConfirm { release: release_fixture("0.9.0", true).1 });
+        s.handle(Cmd::UpdateStart);
+        assert!(updated(&s), "{:?}", s.dialog);
+        assert!(s.update.downloading.is_none());
+        assert_eq!(fetch.requested().len(), requests);
+        assert_eq!(read(install.path(), GUI), format!("bin:{GUI}"));
+    }
+
+    #[test]
+    fn restart_needs_an_installed_update() {
+        let install = tempfile::tempdir().unwrap();
+        let (mut s, _path, _dir) = state_installed(never_fetch(), "0.2.2", Some(install.path().to_path_buf()));
+        s.handle(Cmd::UpdateRestart);
+        assert!(!s.quit && s.dialog.is_none() && s.toast.is_none());
+    }
+
+    #[test]
+    fn an_unusable_page_url_becomes_the_releases_page() {
+        use pm_update::RELEASES_PAGE;
+        // remembered from a hand-edited settings file
+        for bad in ["", "https://example.com/x", "javascript:alert(1)"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let found = Found { version: "0.9.0".into(), page_url: bad.into() };
+            Settings { found: Some(found), ..Settings::default() }.save(&path).unwrap();
+            let u = UpdateState::new(never_fetch(), Some(path), None, v("0.2.2"));
+            assert_eq!(u.notice.as_ref().unwrap().page_url, RELEASES_PAGE, "{bad:?}");
+        }
+
+        // a release without a page: the notice and the remembered release get the fallback
+        let (f, mut r) = release_fixture("0.9.0", true);
+        r.page_url = String::new();
+        let (mut s, path, _dir) = state_with(serving(f, &r), "0.2.2");
+        s.update.start_check(false);
+        wait_update(&mut s);
+        assert_eq!(s.update.notice.as_ref().unwrap().page_url, RELEASES_PAGE);
+        assert_eq!(Settings::load(&path).found.unwrap().page_url, RELEASES_PAGE);
+
+        // the failure dialog never ends in an empty address
+        s.update.release.as_mut().unwrap().page_url = String::new();
+        s.update.notice.as_mut().unwrap().page_url = String::new();
+        s.update.downloading = Some(Task::spawn("fake install", |_p, _c| Err(Error::Invalid("boom".into()))));
+        wait_update(&mut s);
+        assert!(matches!(&s.dialog, Some(Dialog::Error(m)) if m.ends_with(RELEASES_PAGE)), "{:?}", s.dialog);
+
+        // nor does "cannot update here"
+        let (mut s, _path, _dir) = state_with(MapFetch::new(), "0.2.2");
+        let mut release = release_fixture("0.9.0", true).1;
+        release.page_url = "https://example.com/".into();
+        s.dialog = Some(Dialog::UpdateConfirm { release });
+        s.handle(Cmd::UpdateStart);
+        assert!(matches!(&s.dialog, Some(Dialog::Error(m)) if m.ends_with(RELEASES_PAGE)), "{:?}", s.dialog);
+    }
+
+    #[test]
+    fn update_on_a_remembered_notice_reports_a_release_that_cannot_be_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let found = Found { version: "0.9.0".into(), page_url: PAGE.into() };
+        Settings { found: Some(found), ..Settings::default() }.save(&path).unwrap();
+        let install = old_install();
+        let (f, mut r) = release_fixture("0.9.0", true);
+        r.archive = None;
+        let u = UpdateState::new(Arc::new(serving(f, &r)), Some(path), Some(install.path().to_path_buf()), v("0.2.2"));
+        let mut s = mock_state().with_update(u);
+        assert!(s.update.can_install, "nothing is known against it before the check");
+        s.handle(Cmd::UpdateAsk);
+        wait_update(&mut s);
+        let cannot = |s: &AppState| {
+            matches!(&s.dialog, Some(Dialog::Error(m)) if m.contains("no download for this system") && m.contains(PAGE))
+        };
+        assert!(cannot(&s), "{:?}", s.dialog);
+        assert!(!s.update.can_install);
+        // asked again with the release known: the same answer, not the confirmation
+        s.handle(Cmd::CloseDialog);
+        s.handle(Cmd::UpdateAsk);
+        assert!(cannot(&s), "{:?}", s.dialog);
+    }
+
+    #[test]
+    fn the_install_folder_is_probed_only_when_needed_and_once() {
+        // install_kind removes a probe file of its own name before probing: a stale one
+        // shows whether the folder was probed
+        let install = old_install();
+        let probe = install.path().join(format!(".pm-update-probe-{}", std::process::id()));
+        std::fs::write(&probe, "").unwrap();
+        let fetch: Arc<dyn Fetch> = Arc::new(fake_release("0.9.0"));
+        let (mut s, _path, _dir) = state_installed(fetch, "0.2.2", Some(install.path().to_path_buf()));
+        assert!(probe.exists(), "probed at start");
+        s.update.start_check(false);
+        wait_update(&mut s);
+        assert!(s.update.notice.is_some() && s.update.can_install);
+        assert!(!probe.exists(), "not probed for the notice");
+        // the answer is kept
+        std::fs::write(&probe, "").unwrap();
+        s.handle(Cmd::UpdateAsk);
+        assert!(matches!(s.dialog, Some(Dialog::UpdateConfirm { .. })));
+        s.update.start_check(true);
+        wait_update(&mut s);
+        assert!(probe.exists(), "probed again");
+
+        // an up-to-date check does not probe either
+        let install = old_install();
+        let probe = install.path().join(format!(".pm-update-probe-{}", std::process::id()));
+        std::fs::write(&probe, "").unwrap();
+        let fetch: Arc<dyn Fetch> = Arc::new(fake_release("0.9.0"));
+        let (mut s, _path, _dir) = state_installed(fetch, "0.9.0", Some(install.path().to_path_buf()));
+        s.update.start_check(false);
+        wait_update(&mut s);
+        assert!(probe.exists(), "probed without a notice");
     }
 
     #[test]
