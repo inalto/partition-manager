@@ -9,5 +9,9 @@ description = "Partition Manager self-update: release discovery, download, verif
 pm-core = { path = "../pm-core" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 ureq.workspace = true
 url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true
