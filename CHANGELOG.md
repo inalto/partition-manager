@@ -4,6 +4,14 @@ All notable changes to Partition Manager. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver while the
 project is pre-1.0 (minor bumps may change behaviour).
 
+## [0.2.2] - 2026-11-15
+
+### Fixed
+- **Images of fragmented disks no longer crawl.** The copy engine's block map cost time in
+  proportion to the number of used-space fragments on every chunk: about 12 MiB/s at
+  3,000,000 fragments in a synthetic benchmark, against about 3,200 MiB/s now, whatever the
+  fragmentation. The mapfile format is unchanged.
+
 ## [0.2.1] - 2026-11-15
 
 ### Fixed
@@ -79,6 +87,7 @@ a multi-step wizard GUI (egui/eframe) and the `pm` command line; a planner / pre
 executor pipeline with write sessions, identity checks and a dry run; `--disk-file`
 practice mode on image files.
 
+[0.2.2]: https://github.com/inalto/partition-manager/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/inalto/partition-manager/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/inalto/partition-manager/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/inalto/partition-manager/releases/tag/v0.1.0
