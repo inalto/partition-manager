@@ -232,8 +232,8 @@ impl AppState {
             self.check_finished(r, c.manual, c.then);
         }
         if let Some(r) = self.update.downloading.as_mut().and_then(|t| t.poll()) {
-            let cancelled = self.update.downloading.take().is_some_and(|t| t.is_cancelled());
-            self.install_finished(r, cancelled);
+            self.update.downloading = None;
+            self.install_finished(r);
         }
     }
 
@@ -278,14 +278,17 @@ impl AppState {
         }
     }
 
-    fn install_finished(&mut self, r: pm_core::Result<Version>, cancelled: bool) {
+    /// The install ended with `r`. Only `Error::Cancelled` means a cancel stopped it in time:
+    /// a cancel that arrived during the swap (which cannot stop) leaves its real outcome,
+    /// installed or failed (possibly without rollback), and that is what is shown.
+    fn install_finished(&mut self, r: pm_core::Result<Version>) {
         match r {
             Ok(version) => {
                 self.update.clear_found();
                 self.update.save();
                 self.dialog = Some(Dialog::Updated { version });
             }
-            Err(e) if cancelled || matches!(e, Error::Cancelled) => log::info!("update cancelled"),
+            Err(Error::Cancelled) => log::info!("update cancelled"),
             Err(e) => {
                 log::warn!("update failed: {e}");
                 // a failed rollback names the files to restore by hand: shown in full
@@ -792,6 +795,59 @@ mod tests {
         assert!(s.dialog.is_none() && s.toast.is_none(), "{:?}", s.dialog);
         assert_eq!(read(install.path(), GUI), "old gui");
         assert!(s.update.notice.is_some());
+    }
+
+    /// An install worker that waits until it is cancelled and then returns `r`, like an
+    /// install whose cancel arrived during the swap (which cannot stop any more).
+    fn cancelled_during_swap(r: pm_core::Result<Version>) -> Task<Version> {
+        Task::spawn("fake install", move |_p, c| {
+            while c.check().is_ok() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            r
+        })
+    }
+
+    /// The application after a check found 0.9.0, with `task` as the running install.
+    fn installing(task: Task<Version>) -> (AppState, PathBuf, TempDir) {
+        let (mut s, path, dir) = state_with(fake_release("0.9.0"), "0.2.2");
+        s.update.start_check(false);
+        wait_update(&mut s);
+        s.update.downloading = Some(task);
+        s.handle(Cmd::UpdateCancel);
+        wait_update(&mut s);
+        (s, path, dir)
+    }
+
+    #[test]
+    fn a_swap_that_fails_after_cancel_is_still_reported_in_full() {
+        let msg = "the update failed and could not be rolled back (rename failed); not restored: \
+                   partition-manager.exe (previous version: C:\\pm\\partition-manager.exe.old)";
+        let e = pm_core::Error::Invalid(msg.into());
+        assert!(pm_update::rollback_failed(&e));
+        let (s, _path, _dir) = installing(cancelled_during_swap(Err(e)));
+        match &s.dialog {
+            Some(Dialog::Error(m)) => {
+                assert!(m.contains(msg), "{m}");
+                assert!(m.contains(PAGE), "{m}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // an ordinary failure during the swap as well
+        let e = pm_core::Error::Invalid("cannot rename pm.exe".into());
+        let (s, _path, _dir) = installing(cancelled_during_swap(Err(e)));
+        assert!(matches!(&s.dialog, Some(Dialog::Error(m)) if m.contains("cannot rename pm.exe") && m.contains(PAGE)));
+    }
+
+    #[test]
+    fn a_swap_that_succeeds_after_cancel_is_reported_as_updated() {
+        let (s, path, _dir) = installing(cancelled_during_swap(Ok(v("0.9.0"))));
+        assert!(matches!(&s.dialog, Some(Dialog::Updated { version }) if *version == v("0.9.0")), "{:?}", s.dialog);
+        assert!(s.update.notice.is_none());
+        assert!(Settings::load(&path).found.is_none());
+        // a cancel that stopped the install in time shows nothing
+        let (s, _path, _dir) = installing(cancelled_during_swap(Err(pm_core::Error::Cancelled)));
+        assert!(s.dialog.is_none() && s.toast.is_none());
     }
 
     #[test]
