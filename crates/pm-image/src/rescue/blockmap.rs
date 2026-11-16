@@ -10,6 +10,15 @@ use std::collections::BTreeMap;
 
 const STATUSES: usize = 5;
 
+/// Slices a map is summarised in for progress reports: more than the pixels of a progress
+/// bar, few enough to copy on every report.
+pub(crate) const SLICES: u64 = 512;
+
+/// Bytes of status `st` in one entry of [`BlockMap::slice_bytes`].
+pub(crate) fn slice_status(slice: &[u64; STATUSES], st: BlockStatus) -> u64 {
+    slice[idx(st)]
+}
+
 fn idx(st: BlockStatus) -> usize {
     match st {
         BlockStatus::NonTried => 0,
@@ -30,6 +39,14 @@ pub(crate) struct BlockMap {
     bytes: [u64; STATUSES],
     /// Blocks per status.
     count: [usize; STATUSES],
+    /// Bytes per status in each of the equal slices of `[0, len)` (see [`BlockMap::bound`]),
+    /// kept up to date by `insert` / `remove` so that a report never scans the blocks.
+    slices: Vec<[u64; STATUSES]>,
+}
+
+/// How many slices a map of `len` bytes has: [`SLICES`], or one per byte when it is shorter.
+fn slice_count(len: u64) -> usize {
+    len.min(SLICES) as usize
 }
 
 impl BlockMap {
@@ -41,13 +58,68 @@ impl BlockMap {
             bytes[idx(st)] += s;
             count[idx(st)] += 1;
         }
-        BlockMap {
+        let mut bm = BlockMap {
             // ascending input: built in linear time
             blocks: map.blocks.iter().map(|&(p, s, st)| (p, (s, st))).collect(),
             len: map.len(),
             bytes,
             count,
+            slices: vec![[0; STATUSES]; slice_count(map.len())],
+        };
+        for &(p, s, st) in &map.blocks {
+            bm.slice_add(p, s, st, true);
         }
+        bm
+    }
+
+    /// First byte of slice `i` (`i` may be the slice count: the end of the map).
+    fn bound(&self, i: usize) -> u64 {
+        (i as u128 * self.len as u128 / self.slices.len().max(1) as u128) as u64
+    }
+
+    /// The slice byte `pos` (inside the map) falls in.
+    fn slice_of(&self, pos: u64) -> usize {
+        let n = self.slices.len();
+        let mut i = ((pos as u128 * n as u128 / self.len.max(1) as u128) as usize).min(n - 1);
+        while self.bound(i) > pos {
+            i -= 1;
+        }
+        while i + 1 < n && self.bound(i + 1) <= pos {
+            i += 1;
+        }
+        i
+    }
+
+    /// Add (or take away) the bytes of block `[pos, pos + size)` to the slices it covers.
+    fn slice_add(&mut self, pos: u64, size: u64, st: BlockStatus, add: bool) {
+        if size == 0 || self.slices.is_empty() {
+            return;
+        }
+        let end = pos + size;
+        let mut i = self.slice_of(pos);
+        loop {
+            let (lo, hi) = (self.bound(i).max(pos), self.bound(i + 1).min(end));
+            let cell = &mut self.slices[i][idx(st)];
+            if add {
+                *cell += hi - lo;
+            } else {
+                *cell -= hi - lo;
+            }
+            if hi >= end {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    /// Bytes per status in each slice, first to last, indexed like [`slice_status`].
+    pub fn slice_bytes(&self) -> &[[u64; STATUSES]] {
+        &self.slices
+    }
+
+    /// `(start, end)` of slice `i` in bytes.
+    pub fn slice_range(&self, i: usize) -> (u64, u64) {
+        (self.bound(i), self.bound(i + 1))
     }
 
     /// The blocks in [`MapFile::blocks`] form.
@@ -59,12 +131,14 @@ impl BlockMap {
         self.bytes[idx(st)] += size;
         self.count[idx(st)] += 1;
         self.blocks.insert(pos, (size, st));
+        self.slice_add(pos, size, st, true);
     }
 
     fn remove(&mut self, pos: u64) -> (u64, BlockStatus) {
         let (size, st) = self.blocks.remove(&pos).expect("block map is contiguous");
         self.bytes[idx(st)] -= size;
         self.count[idx(st)] -= 1;
+        self.slice_add(pos, size, st, false);
         (size, st)
     }
 
@@ -193,6 +267,46 @@ mod tests {
             assert_eq!(bm.ranges(s), reference.ranges(s));
             assert_eq!(bm.has(s), reference.blocks.iter().any(|b| b.2 == s));
         }
+        assert_eq!(bm.slice_bytes(), slices_by_scan(reference).as_slice());
+    }
+
+    /// The per-slice bytes, counted byte range by byte range from the plain blocks.
+    fn slices_by_scan(m: &MapFile) -> Vec<[u64; STATUSES]> {
+        let n = slice_count(m.len());
+        let bound = |i: usize| (i as u128 * m.len() as u128 / n as u128) as u64;
+        (0..n)
+            .map(|i| {
+                let (lo, hi) = (bound(i), bound(i + 1));
+                let mut b = [0; STATUSES];
+                for &(p, s, st) in &m.blocks {
+                    b[idx(st)] += (p + s).min(hi).saturating_sub(p.max(lo));
+                }
+                b
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slices_follow_the_marks() {
+        // 5120 bytes in 512 slices of 10
+        let mut bm = BlockMap::from_map(&MapFile::new(5120));
+        assert_eq!(bm.slice_bytes().len(), 512);
+        assert_eq!(bm.slice_range(3), (30, 40));
+        assert!(bm.slice_bytes().iter().all(|s| slice_status(s, NonTried) == 10));
+        // a range over three slices: 5 bytes of the first, all of the second, 2 of the third
+        bm.mark(15, 17, Bad);
+        let bad: Vec<u64> = bm.slice_bytes()[..4].iter().map(|s| slice_status(s, Bad)).collect();
+        assert_eq!(bad, [0, 5, 10, 2]);
+        assert_eq!(slice_status(&bm.slice_bytes()[1], NonTried), 5);
+        // rescued on a retry: the bad bytes are gone from the slices
+        bm.mark(15, 17, Finished);
+        assert!(bm.slice_bytes().iter().all(|s| slice_status(s, Bad) == 0));
+        assert_eq!(slice_status(&bm.slice_bytes()[2], Finished), 10);
+        // a map shorter than the slice count has one slice per byte; an uneven one loses none
+        assert_eq!(BlockMap::from_map(&MapFile::new(7)).slice_bytes().len(), 7);
+        let odd = BlockMap::from_map(&MapFile::new(1000));
+        assert_eq!(odd.slice_bytes().iter().map(|s| slice_status(s, NonTried)).sum::<u64>(), 1000);
+        assert_eq!(odd.slice_range(511).1, 1000);
     }
 
     /// Every mark gives exactly what `MapFile::mark` gives, totals included.
@@ -231,6 +345,7 @@ mod tests {
         assert!(bm.to_blocks().is_empty());
         assert_eq!(bm.unrescued_areas(), 0);
         assert_eq!(bm.unrescued_bytes(), 0);
+        assert!(bm.slice_bytes().is_empty());
     }
 
     #[test]

@@ -503,6 +503,7 @@ mod tests {
             rate_bps: (100u64 << 20) as f64,
             eta_secs: Some(65),
             detail: detail.into(),
+            slices: None,
         }
     }
 

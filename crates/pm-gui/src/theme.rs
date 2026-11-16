@@ -21,8 +21,16 @@ impl Theme {
 }
 
 pub const ACCENT: Color32 = Color32::from_rgb(0x3C, 0x78, 0xC8);
+/// Fill of the Apply button: dark enough for white text on it (contrast above 4.5:1).
+pub const ACCENT_STRONG: Color32 = Color32::from_rgb(0x2F, 0x6A, 0xB8);
 pub const SELECTED: Color32 = Color32::from_rgb(0xE5, 0xA8, 0x00);
 pub const DANGER: Color32 = Color32::from_rgb(0xD0, 0x30, 0x30);
+/// Healthy, done, read without trouble.
+pub const OK: Color32 = Color32::from_rgb(0x4C, 0xAF, 0x50);
+/// Slow, degraded, needs attention but not lost.
+pub const WARN: Color32 = Color32::from_rgb(0xE0, 0x80, 0x10);
+/// Smallest text painted anywhere (chart axes, map captions), in points.
+pub const TEXT_SMALL: f32 = 11.0;
 
 /// Colors of the disk map.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,11 +68,13 @@ impl MapColors {
 
 pub fn map_colors(theme: Theme) -> MapColors {
     let common = MapColors {
+        // different hues, not shades of one blue: they must be told apart on a thin strip,
+        // also with a color vision deficiency (blue, green, vermilion, purple, grey)
         primary: ACCENT,
-        logical: Color32::from_rgb(0x2C, 0xB5, 0xC8),
+        logical: Color32::from_rgb(0x00, 0x9E, 0x73),
         unallocated: Color32::from_rgb(0xA0, 0xA0, 0xA0),
-        system: Color32::from_rgb(0x1E, 0x4E, 0x8C),
-        recovery: Color32::from_rgb(0x4B, 0x5A, 0xA8),
+        system: Color32::from_rgb(0xD5, 0x5E, 0x00),
+        recovery: Color32::from_rgb(0xA0, 0x40, 0xC8),
         selected: SELECTED,
         body: Color32::WHITE,
         border: Color32::from_rgb(0xB4, 0xB9, 0xC2),
@@ -143,6 +153,16 @@ mod tests {
             let kinds = [ItemKind::Primary, ItemKind::Logical, ItemKind::Unallocated, ItemKind::System, ItemKind::Recovery];
             let colors: std::collections::HashSet<_> = kinds.iter().map(|k| c.of(*k)).collect();
             assert_eq!(colors.len(), kinds.len());
+            // no two kinds are shades of the same hue: some channel differs by a lot
+            for (i, a) in kinds.iter().enumerate() {
+                for b in &kinds[i + 1..] {
+                    let (x, y) = (c.of(*a), c.of(*b));
+                    let far = [(x.r(), y.r()), (x.g(), y.g()), (x.b(), y.b())]
+                        .iter()
+                        .any(|(p, q)| p.abs_diff(*q) >= 0x50);
+                    assert!(far, "{a:?} and {b:?} are too close");
+                }
+            }
             assert_ne!(c.body, c.text);
         }
         assert_eq!(Theme::Light.toggled(), Theme::Dark);

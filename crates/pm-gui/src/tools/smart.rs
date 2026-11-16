@@ -9,8 +9,8 @@ use std::time::Duration;
 
 pub fn health_color(h: Health) -> Color32 {
     match h {
-        Health::Ok => Color32::from_rgb(0x4C, 0xAF, 0x50),
-        Health::Warn => Color32::from_rgb(0xE0, 0x80, 0x10),
+        Health::Ok => crate::theme::OK,
+        Health::Warn => crate::theme::WARN,
         Health::Bad => crate::theme::DANGER,
     }
 }

@@ -126,7 +126,35 @@ const BAR_HEIGHT: f32 = 56.0;
 /// Width of the "Disk N / GPT / size" block at the left of each bar.
 const LABEL_WIDTH: f32 = 110.0;
 /// Height of the colored strip at the top of each segment.
-const STRIP: f32 = 6.0;
+const STRIP: f32 = 9.0;
+/// Distance between the two text lines of a segment.
+const LINE: f32 = 15.0;
+
+/// The lines of a segment's `label` ("name\nsize fs") to draw, given what `fits` in it: each
+/// line whole, else a shorter form (the drive letter alone, the size alone), else nothing.
+/// Text is never cut mid-word; the tooltip always has the full label.
+pub fn fit_label(label: &str, fits: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, line) in label.lines().enumerate() {
+        let short = if i == 0 {
+            // "D: SYSTEM" -> "D:" (a name without a drive letter has no shorter form)
+            line.split_once(": ").filter(|(l, _)| l.len() == 1).map(|(letter, _)| format!("{letter}:"))
+        } else {
+            // "1015.63 MB FAT32" -> "1015.63 MB"
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some(n), Some(unit), Some(_)) => Some(format!("{n} {unit}")),
+                _ => None,
+            }
+        };
+        if fits(line) {
+            out.push(line.to_string());
+        } else if let Some(s) = short.filter(|s| fits(s)) {
+            out.push(s);
+        }
+    }
+    out
+}
 
 /// Draw one bar per disk of the preview model.
 pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
@@ -198,13 +226,19 @@ fn disk_bar(ui: &mut egui::Ui, s: &AppState, d: &DiskInfo, c: &MapColors, out: &
         }
         painter.rect_filled(Rect::from_min_size(body.min, vec2(body.width(), STRIP)), 2.0, color);
         painter.rect_stroke(body, 2.0, Stroke::new(1.0_f32, c.border));
-        painter.with_clip_rect(body.shrink(3.0)).text(
-            body.min + vec2(4.0, STRIP + 4.0),
-            Align2::LEFT_TOP,
-            &seg.label,
-            FontId::proportional(11.5),
-            c.text,
-        );
+        // whole lines or shorter forms of them, never text cut by the edge of the segment
+        let font = FontId::proportional(11.5);
+        let room = body.width() - 8.0;
+        let fits = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), c.text).size().x <= room;
+        for (row, line) in fit_label(&seg.label, fits).iter().enumerate() {
+            painter.text(
+                body.min + vec2(4.0, STRIP + 3.0 + row as f32 * LINE),
+                Align2::LEFT_TOP,
+                line,
+                font.clone(),
+                c.text,
+            );
+        }
         if !seg.selectable {
             continue;
         }
@@ -285,7 +319,7 @@ mod tests {
     fn labels_usage_and_selection() {
         let d = gpt_disk(1);
         let segs = segments(&d, 600.0);
-        assert_eq!(segs[2].label, "E:Data\n684.00 MB NTFS");
+        assert_eq!(segs[2].label, "E: Data\n684.00 MB NTFS");
         assert!((segs[2].used_frac - 0.5).abs() < 1e-6);
         assert_eq!(segs[2].sel, Selected::Partition(1, 3));
         assert!(segs[2].selectable);
@@ -294,6 +328,24 @@ mod tests {
         assert!(free.label.starts_with("Unallocated\n"));
         assert_eq!(free.used_frac, 0.0);
         assert_eq!(segs[1].used_frac, 0.0); // MSR: usage unknown
+    }
+
+    #[test]
+    fn labels_are_shortened_by_whole_words_or_dropped() {
+        // `fits` by character count, standing in for the measured width
+        let fit = |label: &str, max: usize| fit_label(label, |t| t.len() <= max);
+        let label = "D: SYSTEM\n1015.63 MB FAT32";
+        assert_eq!(fit(label, 40), ["D: SYSTEM", "1015.63 MB FAT32"]);
+        assert_eq!(fit(label, 10), ["D: SYSTEM", "1015.63 MB"]);
+        assert_eq!(fit(label, 7), ["D:"]);
+        assert!(fit(label, 1).is_empty());
+        // no drive letter: the name whole or nothing
+        assert_eq!(fit("WinRE_DRV\n3.82 GB NTFS", 8), ["3.82 GB"]);
+        assert_eq!(fit("(no letter)\n16.00 MB Other", 8), ["16.00 MB"]);
+        assert_eq!(fit("My: Disk\n1.00 GB NTFS", 4), Vec::<String>::new());
+        // free space: two words on the second line, nothing shorter to fall back to
+        assert_eq!(fit("Unallocated\n3.40 GB", 7), ["3.40 GB"]);
+        assert!(fit("Unallocated\n3.40 GB", 6).is_empty());
     }
 
     #[test]

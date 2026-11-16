@@ -14,17 +14,34 @@ as a disk, with no elevation and no physical disk touched.
 
 - **Toolbar.** Apply, Undo and Discard on the left; then the big tools (Data Recovery,
   Partition Recovery, Disk Benchmark, Space Analyzer, Image/Backup); then Settings.
-- **Sidebar.** Context actions grouped as Wizards, Convert, Clean, Check and Manage. They
-  enable and disable depending on what is selected. A "Pending operations: N" counter sits
-  in the sidebar.
+- **Sidebar.** Names the selected item and lists the actions meant for it, grouped as
+  Wizards, Convert, Clean, Check and Manage: disk actions for a disk, partition actions for
+  a partition, Create for unallocated space. An action that cannot run on that item stays
+  listed, disabled, and its tooltip says why. With nothing selected it asks you to select a
+  disk or a partition. Below the actions, a Tools group opens every tool. A "Pending
+  operations: N" counter sits at the bottom of the sidebar; while operations are pending,
+  Apply (filled, with their count), Undo and Discard appear there as well as in the toolbar.
 - **Table.** One block per disk listing Partition, Capacity, Used, Unused, File system, Type
-  and Status.
+  and Status. Sizes are right-aligned. A partition reads "C: Windows", or its label alone
+  when it has no drive letter; a cell with nothing to say (unknown usage, no status) is
+  empty. Hover a disk row for its device path.
 - **Disk map.** One bar per disk with segments proportional to size, a usage fill, color by
-  partition type and a highlight for the selection. Right-clicking a segment or a row opens
-  a context menu with the same actions. A legend sits at the bottom.
+  partition type and a highlight for the selection. A segment too narrow for its label
+  shows a shorter form (the drive letter, the size) or nothing; the tooltip has it in full.
+  Right-clicking a segment or a row opens a context menu with the same actions. A legend
+  sits at the bottom: Primary (blue), Logical (green), Unallocated (grey), EFI/System
+  (vermilion), Recovery (purple), and the Used and Free fill.
 
 Long jobs run on a worker thread. A progress dialog shows the phase, bytes done, rate and
 estimated time, and has a Cancel button; the interface does not block.
+
+While an image is created, the bar is a map of the source disk or partition, from its
+first byte on the left to its last on the right: blue where it was copied, pale blue where
+unused space was skipped, empty where nothing was read yet, orange where a read failed and
+is still being retried, red where the data could not be read. One stretch stands for a
+slice of the source (1/512 of it) and takes the color of the worst thing in it, so red
+means "something in here is damaged", not that the whole slice is lost; the line under the
+phase gives the real size (`errsize`). Hover the bar for the state under the pointer.
 
 ## Pending operations: Apply, Undo, Discard
 

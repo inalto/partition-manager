@@ -118,7 +118,7 @@ pub fn parse_size_mb(s: &str) -> Option<u64> {
     parse_size(t).ok()
 }
 
-/// `"Partition 3 (E:Data, NTFS, 684.00 MB) on Disk 1"`.
+/// `"Partition 3 (E: Data, NTFS, 684.00 MB) on Disk 1"`.
 pub fn partition_desc(disk: u32, p: &PartitionInfo) -> String {
     format!("Partition {} ({}, {}, {}) on Disk {disk}", p.number, partition_name(p), fs_text(p), format_size(p.len))
 }
@@ -216,7 +216,7 @@ pub fn disk_preview(ui: &mut egui::Ui, disk: &DiskInfo, highlight: Option<Select
             body.min + vec2(3.0, 8.0),
             Align2::LEFT_TOP,
             label,
-            FontId::proportional(11.0),
+            FontId::proportional(crate::theme::TEXT_SMALL),
             c.text,
         );
         if Some(seg.sel) == highlight {

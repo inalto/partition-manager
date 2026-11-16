@@ -6,7 +6,31 @@ project is pre-1.0 (minor bumps may change behaviour).
 
 ## [Unreleased]
 
+### Added
+- Create Image: the progress bar is a map of the source. Each stretch of the bar shows
+  what happened to that part of the disk: copied, skipped because unused, not read yet,
+  read error still being retried (orange) or damaged (red). A damaged area stays visible
+  however small it is, the tooltip names the state under the pointer, and a legend appears
+  once something failed. Without "Continue on read errors" the bar shows where the read
+  error that stopped the copy is.
+
 ### Changed
+- The side panel follows the selection: it names the selected disk, partition or
+  unallocated space and lists only the actions meant for it, instead of every action
+  greyed out. An action that cannot run stays listed, disabled, with a tooltip saying why
+  (for example "The disk is already GPT"). With nothing selected it says to select a disk
+  or a partition.
+- Apply stands out while operations are pending: a filled button showing how many it will
+  run ("Apply 3"). Apply, Undo and Discard also appear next to the pending operations.
+- Disk map: a label that does not fit a narrow partition is shortened by whole words (the
+  drive letter alone, the size alone) or left out, never cut mid-word; the tooltip has it in
+  full. Partition kinds use different hues (blue, green, vermilion, purple, grey) on a
+  taller strip, and the legend explains the "Used" and "Free" fill.
+- Table: sizes are right-aligned; partitions read "C: Windows", or the label alone when
+  there is no drive letter (no more "*:"); unknown usage and "no status" are empty cells
+  instead of "-" and "None"; on Windows the disk row no longer repeats the device path
+  (it is in the tooltip).
+- Partition Recovery and Surface Test appear once in the side panel, under Tools.
 - The side panel has a "Tools" group listing every tool on its own row (Data Recovery,
   Partition Recovery, Disk Benchmark, Space Analyzer, Create Image, Restore Image, Rescue
   Copy, Surface Test, SMART); the toolbar is unchanged.

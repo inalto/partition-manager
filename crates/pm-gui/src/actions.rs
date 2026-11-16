@@ -167,6 +167,71 @@ impl Action {
         }
     }
 
+    /// Whether the action is meant for this kind of selection (a disk, a partition, free
+    /// space), whatever the state of the disk.
+    fn for_kind(self, sel: &Selected) -> bool {
+        use Action::*;
+        let (disk, part, free) = (
+            matches!(sel, Selected::Disk(_)),
+            matches!(sel, Selected::Partition(..)),
+            matches!(sel, Selected::Free(..)),
+        );
+        match self {
+            MigrateOs => true,
+            CopyDisk | ConvertMbrToGpt | ConvertGptToMbr | InitializeDisk | WipeDisk | DeleteAllPartitions
+            | AlignAllPartitions | RebuildMbr => disk,
+            PartitionRecovery => disk || free,
+            SurfaceTest => disk || part,
+            DiskProperties => disk || part || free,
+            CreatePartition => free,
+            CopyPartition | DeletePartition | FormatPartition | ResizeMove | SetActive | ChangeLabel
+            | ChangeLetter | ChangeType | WipePartition | Mount | Unmount | Explore => part,
+        }
+    }
+
+    /// Whether the sidebar lists the action for `sel`: the ones meant for that kind of
+    /// selection (disabled when they cannot run), plus any other that can run.
+    pub fn shown(self, sel: &Selected, model: &Model) -> bool {
+        self.for_kind(sel) || self.enabled(sel, model)
+    }
+
+    /// Why a listed action cannot run on `sel`, for its tooltip; `None` when it can.
+    pub fn blocked(self, sel: &Selected, model: &Model) -> Option<&'static str> {
+        use Action::*;
+        if self.enabled(sel, model) {
+            return None;
+        }
+        let disk = sel.disk_in(model);
+        let table = disk.map(|d| d.table);
+        let part = sel.partition_in(model);
+        if let (Some(d), Some(p)) = (disk, part) {
+            if is_container(d, p) && !matches!(self, SurfaceTest | DiskProperties | MigrateOs) {
+                return Some("An extended partition only holds logical partitions");
+            }
+        }
+        Some(match self {
+            MigrateOs => "No disks found",
+            ConvertMbrToGpt if table == Some(TableKind::Gpt) => "The disk is already GPT",
+            ConvertGptToMbr if table == Some(TableKind::Mbr) => "The disk is already MBR",
+            ConvertMbrToGpt | ConvertGptToMbr | RebuildMbr | CreatePartition
+                if matches!(table, Some(TableKind::None | TableKind::Unknown)) =>
+            {
+                "Initialize the disk first"
+            }
+            InitializeDisk => "The disk already has a partition table",
+            CopyDisk | DeleteAllPartitions | AlignAllPartitions => "The disk has no partitions",
+            SetActive if table != Some(TableKind::Mbr) => "Only MBR disks have an active partition",
+            SetActive if part.map_or(false, |p| p.flags.active) => "Already the active partition",
+            SetActive => "A logical partition cannot be active",
+            ChangeLabel => "No file system to label",
+            Mount if part.map_or(false, |p| p.letter().is_some()) => "Already has a drive letter",
+            Mount | Unmount if part.map_or(false, |p| p.volume.is_none()) => "The system sees no volume here",
+            Unmount => "Not mounted",
+            Explore => "No drive letter",
+            _ => "Not available for this selection",
+        })
+    }
+
     /// What dispatching the action on `sel` does; `None` when it is not [`Action::enabled`].
     pub fn effect(self, sel: &Selected, model: &Model) -> Option<Effect> {
         use Action::*;
@@ -284,6 +349,89 @@ mod tests {
         // free space
         let free = disk_items(m.disk(1).unwrap()).last().unwrap().sel;
         assert_eq!(enabled_set(free, &m), vec![MigrateOs, PartitionRecovery, DiskProperties, CreatePartition]);
+    }
+
+    fn shown_set(sel: Selected, m: &Model) -> Vec<Action> {
+        GROUPS.iter().flat_map(|g| g.actions.iter().copied()).filter(|a| a.shown(&sel, m)).collect()
+    }
+
+    #[test]
+    fn sidebar_lists_what_the_selection_is_for() {
+        let m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
+        use Action::*;
+        assert_eq!(shown_set(Selected::None, &m), vec![MigrateOs]);
+        assert_eq!(
+            shown_set(Selected::Disk(1), &m),
+            vec![
+                MigrateOs,
+                CopyDisk,
+                PartitionRecovery,
+                ConvertMbrToGpt,
+                ConvertGptToMbr,
+                InitializeDisk,
+                WipeDisk,
+                DeleteAllPartitions,
+                AlignAllPartitions,
+                SurfaceTest,
+                RebuildMbr,
+                DiskProperties
+            ]
+        );
+        assert_eq!(
+            shown_set(Selected::Partition(1, 3), &m),
+            vec![
+                MigrateOs,
+                CopyPartition,
+                SurfaceTest,
+                DiskProperties,
+                DeletePartition,
+                FormatPartition,
+                ResizeMove,
+                SetActive,
+                ChangeLabel,
+                ChangeLetter,
+                ChangeType,
+                WipePartition,
+                Mount,
+                Unmount,
+                Explore
+            ]
+        );
+        let free = disk_items(m.disk(1).unwrap()).last().unwrap().sel;
+        assert_eq!(shown_set(free, &m), vec![MigrateOs, PartitionRecovery, DiskProperties, CreatePartition]);
+        // everything that can run is listed
+        for sel in [Selected::None, Selected::Disk(0), Selected::Partition(0, 2), Selected::Partition(0, 5), free] {
+            assert!(enabled_set(sel, &m).iter().all(|a| a.shown(&sel, &m)), "{sel:?}");
+        }
+    }
+
+    #[test]
+    fn blocked_actions_say_why() {
+        let m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
+        use Action::*;
+        assert_eq!(ConvertGptToMbr.blocked(&Selected::Disk(1), &m), None, "enabled");
+        assert_eq!(ConvertMbrToGpt.blocked(&Selected::Disk(1), &m), Some("The disk is already GPT"));
+        assert_eq!(InitializeDisk.blocked(&Selected::Disk(1), &m), Some("The disk already has a partition table"));
+        assert_eq!(SetActive.blocked(&Selected::Partition(1, 3), &m), Some("Only MBR disks have an active partition"));
+        assert_eq!(SetActive.blocked(&Selected::Partition(0, 1), &m), Some("Already the active partition"));
+        assert_eq!(SetActive.blocked(&Selected::Partition(0, 5), &m), Some("A logical partition cannot be active"));
+        assert_eq!(Mount.blocked(&Selected::Partition(1, 3), &m), Some("Already has a drive letter"));
+        assert_eq!(ChangeLabel.blocked(&Selected::Partition(1, 2), &m), Some("No file system to label"));
+        assert_eq!(
+            DeletePartition.blocked(&Selected::Partition(0, 2), &m),
+            Some("An extended partition only holds logical partitions")
+        );
+        // an uninitialized disk: initialize it before anything else
+        let mut raw = gpt_disk(2);
+        raw.partitions.clear();
+        raw.table = TableKind::None;
+        let m = model_of(vec![raw]);
+        assert_eq!(RebuildMbr.blocked(&Selected::Disk(2), &m), Some("Initialize the disk first"));
+        assert_eq!(CopyDisk.blocked(&Selected::Disk(2), &m), Some("The disk has no partitions"));
+        // whatever is listed and cannot run has a reason
+        for a in shown_set(Selected::Disk(2), &m) {
+            assert_eq!(a.blocked(&Selected::Disk(2), &m).is_none(), a.enabled(&Selected::Disk(2), &m), "{a:?}");
+        }
     }
 
     #[test]

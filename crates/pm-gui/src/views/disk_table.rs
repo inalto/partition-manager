@@ -3,12 +3,23 @@
 
 use super::context_menu;
 use crate::app::{AppState, Cmd};
-use crate::format_util::{disk_header, free_row, partition_row, COLUMNS};
+use crate::format_util::{disk_header, disk_title, free_row, partition_row, COLUMNS};
 use crate::items::disk_items;
 use crate::selection::Selected;
 use eframe::egui::{self, Align, Layout, RichText, Sense};
 use egui_extras::{Column, TableBuilder};
 use pm_ops::Model;
+
+/// Capacity, Used and Unused: sizes, right-aligned so they compare down the column.
+const SIZE_COLUMNS: std::ops::RangeInclusive<usize> = 1..=3;
+
+/// A cell of a size column: right-aligned, with a little room before the next column.
+fn size_cell(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(8.0);
+        add(ui);
+    });
+}
 
 /// One table row.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,7 +42,7 @@ impl Row {
 pub fn rows(model: &Model, elevation_hint: &str) -> Vec<Row> {
     let mut out = Vec::new();
     for d in &model.disks {
-        out.push(Row::Disk { sel: Selected::Disk(d.index), title: disk_header(d, elevation_hint) });
+        out.push(Row::Disk { sel: Selected::Disk(d.index), title: disk_title(d, elevation_hint) });
         for item in disk_items(d) {
             let cells = match item.sel {
                 Selected::Partition(_, n) => match d.partitions.iter().find(|p| p.number == n) {
@@ -72,9 +83,15 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
         .column(Column::remainder().at_least(80.0).clip(true))
         .auto_shrink([false, false])
         .header(row_h, |mut header| {
-            for c in COLUMNS {
+            for (i, c) in COLUMNS.iter().enumerate() {
                 header.col(|ui| {
-                    ui.strong(c);
+                    if SIZE_COLUMNS.contains(&i) {
+                        size_cell(ui, |ui| {
+                            ui.strong(*c);
+                        });
+                    } else {
+                        ui.strong(*c);
+                    }
                 });
             }
         })
@@ -85,8 +102,13 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
                 row.set_selected(s.selected == sel);
                 match r {
                     Row::Disk { title, .. } => {
+                        // the full header, device path included, is in the tooltip
+                        let full = sel.disk_in(s.preview()).map(|d| disk_header(d, s.platform.elevation_hint()));
                         row.col(|ui| {
-                            ui.label(RichText::new(title).strong());
+                            let resp = ui.label(RichText::new(title).strong());
+                            if let Some(full) = full {
+                                resp.on_hover_text(full);
+                            }
                         });
                         for _ in 1..COLUMNS.len() {
                             row.col(|_| {});
@@ -95,6 +117,12 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
                     Row::Item { cells, .. } => {
                         for (i, c) in cells.iter().enumerate() {
                             row.col(|ui| {
+                                if SIZE_COLUMNS.contains(&i) {
+                                    size_cell(ui, |ui| {
+                                        ui.label(c);
+                                    });
+                                    return;
+                                }
                                 if i == 0 {
                                     ui.add_space(14.0);
                                 }
@@ -128,7 +156,7 @@ mod tests {
         match &rows[3] {
             Row::Item { sel, cells } => {
                 assert_eq!(*sel, Selected::Partition(1, 3));
-                assert_eq!(cells[0], "E:Data");
+                assert_eq!(cells[0], "E: Data");
             }
             other => panic!("{other:?}"),
         }

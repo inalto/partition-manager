@@ -6,6 +6,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// What happened to one slice of the source of a copy: the worst case found in the slice,
+/// so a single bad sector shows however large the slice is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SliceState {
+    /// Nothing to copy here (unused space left out of the copy).
+    Skipped,
+    /// Read and written.
+    Done,
+    /// Not read yet.
+    Pending,
+    /// A read failed here; the area is still to be read again in smaller pieces.
+    Retrying,
+    /// Unreadable.
+    Bad,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProgressReport {
     pub phase: String,
@@ -15,6 +31,10 @@ pub struct ProgressReport {
     pub rate_bps: f64,
     pub eta_secs: Option<u64>,
     pub detail: String,
+    /// The source cut into equal slices, first to last, each with its [`SliceState`]: a map
+    /// of where the copy stands and where the source is damaged. `None` for a job that has
+    /// no such map (all but copies that read a device).
+    pub slices: Option<Arc<[SliceState]>>,
 }
 
 pub trait ProgressSink: Send + Sync {
@@ -73,6 +93,7 @@ pub struct ProgressTracker<'a> {
     sink: &'a dyn ProgressSink,
     phase: String,
     detail: String,
+    slices: Option<Arc<[SliceState]>>,
     total: u64,
     done: u64,
     last_report: Instant,
@@ -89,6 +110,7 @@ impl<'a> ProgressTracker<'a> {
             sink,
             phase: phase.to_string(),
             detail: String::new(),
+            slices: None,
             total,
             done: 0,
             last_report: now,
@@ -99,6 +121,11 @@ impl<'a> ProgressTracker<'a> {
     /// Set the free-form detail text included in subsequent reports.
     pub fn set_detail(&mut self, detail: &str) {
         self.detail = detail.to_string();
+    }
+
+    /// Set the slice map ([`ProgressReport::slices`]) included in subsequent reports.
+    pub fn set_slices(&mut self, slices: Vec<SliceState>) {
+        self.slices = Some(slices.into());
     }
 
     pub fn done(&self) -> u64 {
@@ -147,6 +174,7 @@ impl<'a> ProgressTracker<'a> {
             rate_bps,
             eta_secs,
             detail: self.detail.clone(),
+            slices: self.slices.clone(),
         });
     }
 }
@@ -199,6 +227,21 @@ mod tests {
         assert_eq!(p.done, 100_000);
         assert!(p.rate_bps > 0.0);
         assert!(p.eta_secs.is_some());
+    }
+
+    #[test]
+    fn tracker_reports_the_slices_set_last() {
+        let reports = Mutex::new(Vec::<ProgressReport>::new());
+        let sink = FnProgress(|p: &ProgressReport| reports.lock().unwrap().push(p.clone()));
+        let mut t = ProgressTracker::new(&sink, "copy", 10);
+        t.finish();
+        assert!(reports.lock().unwrap().last().unwrap().slices.is_none(), "no map unless set");
+        t.set_slices(vec![SliceState::Done, SliceState::Pending]);
+        t.set_slices(vec![SliceState::Done, SliceState::Bad]);
+        t.finish();
+        let r = reports.lock().unwrap();
+        assert_eq!(r.last().unwrap().slices.as_deref(), Some(&[SliceState::Done, SliceState::Bad][..]));
+        assert!(ProgressReport::default().slices.is_none());
     }
 
     #[test]

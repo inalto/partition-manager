@@ -341,7 +341,7 @@ fn treemap(ui: &mut egui::Ui, n: &Node) -> Option<usize> {
                 r.min + vec2(3.0, 2.0),
                 Align2::LEFT_TOP,
                 name,
-                FontId::proportional(11.0),
+                FontId::proportional(crate::theme::TEXT_SMALL),
                 Color32::WHITE,
             );
         }

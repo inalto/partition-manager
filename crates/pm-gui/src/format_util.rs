@@ -5,10 +5,14 @@ use pm_core::{format_size, DiskInfo, PartitionInfo, PartitionType, TableKind};
 /// Column titles of the disk table, in order.
 pub const COLUMNS: [&str; 7] = ["Partition", "Capacity", "Used", "Unused", "File system", "Type", "Status"];
 
-/// `"C:Windows"`, `"*:SYSTEM"` (no drive letter) or `"*:"`.
+/// `"C: Windows"`, `"E:"` (no label), `"SYSTEM"` (no drive letter) or `"(no letter)"`.
 pub fn partition_name(p: &PartitionInfo) -> String {
-    let letter = p.letter().unwrap_or('*');
-    format!("{letter}:{}", p.label)
+    match (p.letter(), p.label.is_empty()) {
+        (Some(letter), false) => format!("{letter}: {}", p.label),
+        (Some(letter), true) => format!("{letter}:"),
+        (None, false) => p.label.clone(),
+        (None, true) => "(no letter)".to_string(),
+    }
 }
 
 /// `"GPT (EFI system partition)"` on GPT disks, `"Primary"` / `"Logical"` on MBR disks.
@@ -31,13 +35,14 @@ pub fn fs_text(p: &PartitionInfo) -> String {
 }
 
 /// One row of the disk table: Partition | Capacity | Used | Unused | File system | Type | Status.
+/// A cell with nothing to say (unknown usage, no status) is empty.
 pub fn partition_row(p: &PartitionInfo) -> [String; 7] {
     let (used, unused) = match p.used {
         Some(u) => {
             let u = u.min(p.len);
             (format_size(u), format_size(p.len - u))
         }
-        None => ("-".to_string(), "-".to_string()),
+        None => (String::new(), String::new()),
     };
     [
         partition_name(p),
@@ -46,7 +51,7 @@ pub fn partition_row(p: &PartitionInfo) -> [String; 7] {
         unused,
         fs_text(p),
         type_text(p),
-        p.status_text(),
+        Some(p.status_text()).filter(|s| s != "None").unwrap_or_default(),
     ]
 }
 
@@ -59,7 +64,7 @@ pub fn free_row(len: u64) -> [String; 7] {
         format_size(len),
         "Unallocated".to_string(),
         String::new(),
-        "None".to_string(),
+        String::new(),
     ]
 }
 
@@ -77,6 +82,17 @@ pub fn disk_header(d: &DiskInfo, elevation_hint: &str) -> String {
         s.push_str(&format!("  [{}]", unreadable_table_note(elevation_hint)));
     }
     s
+}
+
+/// The disk row of the table: [`disk_header`] without a device path that only repeats the
+/// disk number (Windows: `\\.\PhysicalDrive1` for Disk 1). Elsewhere the path stays, it is
+/// what names the disk.
+pub fn disk_title(d: &DiskInfo, elevation_hint: &str) -> String {
+    if d.path.eq_ignore_ascii_case(&format!(r"\\.\PhysicalDrive{}", d.index)) {
+        disk_header(&DiskInfo { path: String::new(), ..d.clone() }, elevation_hint)
+    } else {
+        disk_header(d, elevation_hint)
+    }
 }
 
 /// What a disk with an unreadable partition table (`TableKind::Unknown`) shows.
@@ -142,7 +158,7 @@ mod tests {
         let d = gpt_disk(1);
         assert_eq!(
             partition_row(&d.partitions[2]),
-            ["E:Data", "684.00 MB", "342.00 MB", "342.00 MB", "NTFS", "GPT (basic data)", "None"]
+            ["E: Data", "684.00 MB", "342.00 MB", "342.00 MB", "NTFS", "GPT (basic data)", ""]
                 .map(String::from)
         );
     }
@@ -151,13 +167,13 @@ mod tests {
     fn partition_row_system_and_msr() {
         let d = gpt_disk(1);
         let efi = partition_row(&d.partitions[0]);
-        assert_eq!(efi[0], "*:");
+        assert_eq!(efi[0], "(no letter)");
         assert_eq!(efi[4], "FAT32");
         assert_eq!(efi[5], "GPT (EFI system partition)");
         assert_eq!(efi[6], "System");
         let msr = partition_row(&d.partitions[1]);
-        assert_eq!(msr[2], "-");
-        assert_eq!(msr[3], "-");
+        assert_eq!(msr[2], "");
+        assert_eq!(msr[3], "");
         assert_eq!(msr[4], "Other");
     }
 
@@ -183,7 +199,7 @@ mod tests {
     fn free_row_and_header() {
         assert_eq!(
             free_row(2 * MIB),
-            ["(Unallocated)", "2.00 MB", "0 B", "2.00 MB", "Unallocated", "", "None"].map(String::from)
+            ["(Unallocated)", "2.00 MB", "0 B", "2.00 MB", "Unallocated", "", ""].map(String::from)
         );
         let d = gpt_disk(1);
         assert_eq!(disk_header(&d, "HINT"), format!("Disk 1 (Test SSD, GPT, 1.00 GB)  {}", d.path));
@@ -192,6 +208,27 @@ mod tests {
         d.table = TableKind::Unknown;
         let h = disk_header(&d, "run with sudo (root)");
         assert!(h.ends_with("[partition table not readable, offsets approximate: run with sudo (root) for exact offsets]"), "{h}");
+    }
+
+    #[test]
+    fn names_and_disk_titles() {
+        let d = gpt_disk(1);
+        let mut p = d.partitions[2].clone();
+        assert_eq!(partition_name(&p), "E: Data");
+        p.label.clear();
+        assert_eq!(partition_name(&p), "E:");
+        let mut efi = d.partitions[0].clone();
+        assert_eq!(partition_name(&efi), "(no letter)");
+        efi.label = "SYSTEM".into();
+        assert_eq!(partition_name(&efi), "SYSTEM");
+        // a Windows device path only repeats the disk number; any other path stays
+        let win = DiskInfo { path: r"\\.\PHYSICALDRIVE1".into(), ..gpt_disk(1) };
+        assert_eq!(disk_title(&win, "HINT"), "Disk 1 (Test SSD, GPT, 1.00 GB)");
+        assert!(disk_header(&win, "HINT").ends_with("PHYSICALDRIVE1"));
+        let other = DiskInfo { path: r"\\.\PhysicalDrive7".into(), ..gpt_disk(1) };
+        assert_eq!(disk_title(&other, "HINT"), disk_header(&other, "HINT"));
+        let linux = DiskInfo { path: "/dev/sdb".into(), ..gpt_disk(1) };
+        assert_eq!(disk_title(&linux, "HINT"), "Disk 1 (Test SSD, GPT, 1.00 GB)  /dev/sdb");
     }
 
     #[test]

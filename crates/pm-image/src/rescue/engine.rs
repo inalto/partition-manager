@@ -5,9 +5,11 @@
 //! from a successful source read, except zero-filled unused areas (`zero_unused`). With
 //! `skip_zero_writes`, blocks read as all zeros are not written at all.
 
-use super::blockmap::BlockMap;
+use super::blockmap::{slice_status, BlockMap};
 use super::mapfile::{BlockStatus, MapFile};
-use pm_core::{format_size, BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result};
+use pm_core::{
+    format_size, BlockDevice, CancelToken, Error, ProgressSink, ProgressTracker, Result, SliceState,
+};
 use pm_fs::UsedMap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -172,6 +174,8 @@ struct Engine<'a> {
     block: u64,
     /// Bytes marked finished without reading (unused areas).
     unused: u64,
+    /// The same, per slice of the map (empty without a used map).
+    unused_slices: Vec<u64>,
     tracker: Option<ProgressTracker<'a>>,
     buf: Vec<u8>,
     start: Instant,
@@ -221,6 +225,33 @@ impl<'a> Engine<'a> {
         self.map.bytes(BlockStatus::Finished).saturating_sub(self.unused)
     }
 
+    /// The map as [`SliceState`]s for the progress report: per slice, the worst of what is
+    /// in it. A slice with nothing left to do is `Done`, or `Skipped` when all of it was
+    /// unused space. In clone mode a failed read is final, so it counts as bad at once.
+    fn slices(&self) -> Vec<SliceState> {
+        use BlockStatus::*;
+        let failed = if self.opts.abort_on_error { SliceState::Bad } else { SliceState::Retrying };
+        self.map
+            .slice_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let (lo, hi) = self.map.slice_range(i);
+                if slice_status(b, Bad) > 0 {
+                    SliceState::Bad
+                } else if slice_status(b, NonTrimmed) + slice_status(b, NonScraped) > 0 {
+                    failed
+                } else if slice_status(b, NonTried) > 0 {
+                    SliceState::Pending
+                } else if self.unused_slices.get(i).is_some_and(|u| *u >= hi - lo) {
+                    SliceState::Skipped
+                } else {
+                    SliceState::Done
+                }
+            })
+            .collect()
+    }
+
     fn start_phase(&mut self, name: &str, status: char, pass: u32) -> Result<()> {
         if let Some(t) = self.tracker.as_mut() {
             t.finish();
@@ -229,6 +260,7 @@ impl<'a> Engine<'a> {
         self.cur_pass = pass;
         let mut t = ProgressTracker::new(self.progress, name, self.total());
         t.set_detail(&self.detail());
+        t.set_slices(self.slices());
         t.add(self.done());
         self.tracker = Some(t);
         self.last_detail = Instant::now();
@@ -255,13 +287,14 @@ impl<'a> Engine<'a> {
         let refresh = force_detail || self.last_detail.elapsed() >= DETAIL_INTERVAL;
         let detail = if refresh {
             self.last_detail = Instant::now();
-            Some(self.detail())
+            Some((self.detail(), self.slices()))
         } else {
             None
         };
         if let Some(t) = self.tracker.as_mut() {
-            if let Some(d) = detail {
+            if let Some((d, slices)) = detail {
                 t.set_detail(&d);
+                t.set_slices(slices);
             }
             t.add(n);
         }
@@ -325,6 +358,22 @@ impl<'a> Engine<'a> {
             tracker.finish();
         }
         self.map = BlockMap::from_map(&map);
+        // how much of each slice is unused space, to tell "skipped" from "copied"
+        let mut per_slice = vec![0u64; self.map.slice_bytes().len()];
+        let mut i = 0;
+        for &(s, l) in &unused {
+            let end = s + l;
+            while i < per_slice.len() && self.map.slice_range(i).1 <= s {
+                i += 1;
+            }
+            let mut j = i;
+            while j < per_slice.len() && self.map.slice_range(j).0 < end {
+                let (lo, hi) = self.map.slice_range(j);
+                per_slice[j] += hi.min(end) - lo.max(s);
+                j += 1;
+            }
+        }
+        self.unused_slices = per_slice;
         Ok(())
     }
 
@@ -628,6 +677,7 @@ pub fn rescue(
         sector,
         block,
         unused: 0,
+        unused_slices: Vec::new(),
         tracker: None,
         buf: vec![0u8; block.min(len) as usize],
         start,
@@ -640,7 +690,10 @@ pub fn rescue(
         copy_read_bytes: 0,
     };
     if let Err(e) = eng.run() {
+        let slices = eng.slices();
         if let Some(t) = eng.tracker.as_mut() {
+            // where it stopped: in clone mode, the slice of the read error
+            t.set_slices(slices);
             t.finish();
         }
         // best effort: the original error matters more than a failure to save
@@ -649,6 +702,7 @@ pub fn rescue(
     }
     eng.cur_status = '+';
     let d = final_detail(&eng.map, eng.read_errors);
+    let slices = eng.slices();
     // nothing left to do (e.g. a finished mapfile): still report the outcome once
     let (total, done) = (eng.total(), eng.done());
     let t = eng.tracker.get_or_insert_with(|| {
@@ -657,6 +711,7 @@ pub fn rescue(
         t
     });
     t.set_detail(&d);
+    t.set_slices(slices);
     t.finish();
     eng.dst.flush()?;
     eng.save()?;
@@ -746,5 +801,63 @@ mod tests {
         );
         assert_eq!(complement(&[(0, 1024), (4608, 1536)], 8192), vec![(1024, 3584), (6144, 2048)]);
         assert_eq!(complement(&[], 10), vec![(0, 10)]);
+    }
+
+    use super::super::faulty::FaultyDevice;
+    use pm_core::{FnProgress, MemDevice, ProgressReport};
+    use std::sync::Mutex;
+
+    const LEN: u64 = 512 * 1024; // 512 slices of 1 KiB
+
+    /// Run `rescue` over a `LEN`-byte source with the given bad sectors; the outcome and
+    /// the slices of the last report.
+    fn run(bad: Vec<u64>, opts: RescueOpts) -> (Result<RescueStats>, Vec<SliceState>) {
+        let mut src = FaultyDevice::new(MemDevice::new(LEN), bad, Default::default());
+        let mut dst = MemDevice::new(LEN);
+        let last = Mutex::new(None);
+        let sink = FnProgress(|p: &ProgressReport| *last.lock().unwrap() = p.slices.clone());
+        let r = rescue(&mut src, &mut dst, 0, &opts, &sink, &CancelToken::new());
+        let slices = last.lock().unwrap().clone().expect("the reports carry a slice map");
+        (r, slices.to_vec())
+    }
+
+    fn where_is(slices: &[SliceState], st: SliceState) -> Vec<usize> {
+        slices.iter().enumerate().filter(|(_, s)| **s == st).map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn slices_show_bad_sectors_where_they_are() {
+        // bad sectors in slices 100 and 300 (1 KiB slices, 512-byte sectors)
+        let (r, slices) = run(vec![100 * 1024, 300 * 1024 + 512], RescueOpts::default());
+        assert_eq!(r.unwrap().bad_bytes, 1024);
+        assert_eq!(slices.len(), 512);
+        assert_eq!(where_is(&slices, SliceState::Bad), [100, 300]);
+        assert_eq!(where_is(&slices, SliceState::Done).len(), 510, "everything else was copied");
+    }
+
+    #[test]
+    fn a_clean_source_ends_all_done_and_unused_space_is_skipped() {
+        let (r, slices) = run(vec![], RescueOpts::default());
+        assert_eq!(r.unwrap().bad_bytes, 0);
+        assert!(slices.iter().all(|s| *s == SliceState::Done));
+        // only the first half is used: the second half is never read
+        let mut used = UsedMap::new(LEN, 1024);
+        used.set(0, LEN / 2);
+        let (r, slices) = run(vec![], RescueOpts { used_map: Some(used), ..Default::default() });
+        r.unwrap();
+        assert!(slices[..256].iter().all(|s| *s == SliceState::Done));
+        assert!(slices[256..].iter().all(|s| *s == SliceState::Skipped), "{:?}", &slices[250..262]);
+    }
+
+    #[test]
+    fn clone_mode_reports_the_slice_of_the_error_it_stops_at() {
+        let opts = RescueOpts { abort_on_error: true, block_size: 4096, ..Default::default() };
+        let (r, slices) = run(vec![200 * 1024], opts);
+        assert!(matches!(r, Err(Error::Io { .. })));
+        // the failed 4 KiB read covers slices 200..204; nothing after it was read
+        assert_eq!(where_is(&slices, SliceState::Bad), [200, 201, 202, 203]);
+        assert!(slices[..200].iter().all(|s| *s == SliceState::Done));
+        assert!(slices[204..].iter().all(|s| *s == SliceState::Pending));
+        assert!(where_is(&slices, SliceState::Retrying).is_empty());
     }
 }

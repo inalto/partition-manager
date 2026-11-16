@@ -18,8 +18,8 @@ pub const SIZES: [u32; 9] = [4 << 10, 8 << 10, 16 << 10, 32 << 10, 64 << 10, 128
 /// Total lengths offered.
 pub const LENGTHS: [u64; 4] = [100 * MIB, 200 * MIB, 500 * MIB, GIB];
 
-pub const READ_COLOR: Color32 = Color32::from_rgb(0x3C, 0x78, 0xC8);
-pub const WRITE_COLOR: Color32 = Color32::from_rgb(0xE0, 0x80, 0x10);
+pub const READ_COLOR: Color32 = crate::theme::ACCENT;
+pub const WRITE_COLOR: Color32 = crate::theme::WARN;
 
 /// The transfer sizes from index `from` to index `to` of [`SIZES`] (either order).
 pub fn sizes_between(from: usize, to: usize) -> Vec<u32> {
@@ -314,27 +314,27 @@ fn bar_chart(ui: &mut egui::Ui, planned: &[u32], points: &[BenchPoint]) {
         let v = max * i as f64 / 4.0;
         let y = plot.max.y - plot.height() * i as f32 / 4.0;
         painter.line_segment([pos2(plot.min.x, y), pos2(plot.max.x, y)], Stroke::new(1.0_f32, grid));
-        painter.text(pos2(plot.min.x - 4.0, y), Align2::RIGHT_CENTER, format!("{v:.0}"), FontId::proportional(10.0), text);
+        painter.text(pos2(plot.min.x - 4.0, y), Align2::RIGHT_CENTER, format!("{v:.0}"), FontId::proportional(crate::theme::TEXT_SMALL), text);
     }
-    painter.text(pos2(rect.min.x, rect.min.y), Align2::LEFT_TOP, "MB/s", FontId::proportional(10.0), text);
+    painter.text(pos2(rect.min.x, rect.min.y), Align2::LEFT_TOP, "MB/s", FontId::proportional(crate::theme::TEXT_SMALL), text);
     for (k, (name, color)) in [("Read", READ_COLOR), ("Write", WRITE_COLOR)].into_iter().enumerate() {
         let x = plot.max.x - 120.0 + 60.0 * k as f32;
         painter.rect_filled(Rect::from_min_size(pos2(x, rect.min.y + 2.0), vec2(9.0, 9.0)), 1.0, color);
-        painter.text(pos2(x + 12.0, rect.min.y), Align2::LEFT_TOP, name, FontId::proportional(11.0), text);
+        painter.text(pos2(x + 12.0, rect.min.y), Align2::LEFT_TOP, name, FontId::proportional(crate::theme::TEXT_SMALL), text);
     }
     let n = planned.len().max(1);
     let group = plot.width() / n as f32;
     let bar = (group * 0.35).min(40.0);
     for (i, size) in planned.iter().enumerate() {
         let cx = plot.min.x + group * (i as f32 + 0.5);
-        painter.text(pos2(cx, plot.max.y + 4.0), Align2::CENTER_TOP, size_text(*size), FontId::proportional(10.0), text);
+        painter.text(pos2(cx, plot.max.y + 4.0), Align2::CENTER_TOP, size_text(*size), FontId::proportional(crate::theme::TEXT_SMALL), text);
         let Some(p) = points.iter().find(|p| p.size == *size) else { continue };
         for (k, (v, color)) in [(p.read_mbps, READ_COLOR), (p.write_mbps, WRITE_COLOR)].into_iter().enumerate() {
             let h = (v / max) as f32 * plot.height();
             let x0 = cx - bar + bar * k as f32;
             let r = Rect::from_min_max(pos2(x0, plot.max.y - h), pos2(x0 + bar - 2.0, plot.max.y));
             painter.rect_filled(r, 1.0, color);
-            painter.text(pos2(r.center().x, r.min.y - 2.0), Align2::CENTER_BOTTOM, format!("{v:.0}"), FontId::proportional(9.0), text);
+            painter.text(pos2(r.center().x, r.min.y - 2.0), Align2::CENTER_BOTTOM, format!("{v:.0}"), FontId::proportional(crate::theme::TEXT_SMALL), text);
         }
     }
 }

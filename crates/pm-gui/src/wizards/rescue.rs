@@ -208,10 +208,10 @@ pub fn map_bar(map: &MapFile, buckets: usize) -> Vec<BlockStatus> {
 
 pub fn status_color(s: BlockStatus) -> Color32 {
     match s {
-        BlockStatus::Finished => Color32::from_rgb(0x4C, 0xAF, 0x50),
+        BlockStatus::Finished => crate::theme::OK,
         BlockStatus::NonTried => Color32::from_gray(150),
         BlockStatus::NonTrimmed => Color32::from_rgb(0xE0, 0xC0, 0x10),
-        BlockStatus::NonScraped => Color32::from_rgb(0xE0, 0x80, 0x10),
+        BlockStatus::NonScraped => crate::theme::WARN,
         BlockStatus::Bad => crate::theme::DANGER,
     }
 }

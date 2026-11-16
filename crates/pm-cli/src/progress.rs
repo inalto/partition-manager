@@ -87,6 +87,7 @@ mod tests {
             rate_bps: (100 * MIB) as f64,
             eta_secs: Some(65),
             detail: String::new(),
+            slices: None,
         };
         assert_eq!(format_line(&p), "Copying  512.00 MB/1.00 GB  100.00 MB/s  ETA 1:05");
         let q = ProgressReport {

@@ -74,7 +74,7 @@ mod tests {
     fn build_delete_op() {
         let m = model_of(vec![gpt_disk(1), mbr_disk(0)]);
         let s = DeleteState::initial(&WizardCtx::new(&m, vec![], Selected::Partition(1, 3))).unwrap();
-        assert_eq!(s.details[0].1, "E:Data (number 3) on Disk 1");
+        assert_eq!(s.details[0].1, "E: Data (number 3) on Disk 1");
         assert_eq!(s.build().unwrap(), vec![Operation::DeletePartition { disk: 1, number: 3 }]);
         assert_eq!(wizard(s).build_ops().unwrap(), vec![Operation::DeletePartition { disk: 1, number: 3 }]);
         // the extended container is not offered

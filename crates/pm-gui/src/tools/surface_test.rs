@@ -175,8 +175,8 @@ impl SurfaceTestWindow {
         let cs = cells(blocks, MAX_CELLS, done_bytes / block.max(1), report);
         let count = |c: Cell| cs.iter().filter(|x| **x == c).count();
         ui.horizontal(|ui| {
-            legend(ui, Color32::from_rgb(0x4C, 0xAF, 0x50), format!("OK ({})", count(Cell::Ok)));
-            legend(ui, Color32::from_rgb(0xE0, 0x80, 0x10), format!("Slow ({})", count(Cell::Slow)));
+            legend(ui, crate::theme::OK, format!("OK ({})", count(Cell::Ok)));
+            legend(ui, crate::theme::WARN, format!("Slow ({})", count(Cell::Slow)));
             legend(ui, crate::theme::DANGER, format!("Bad ({})", count(Cell::Bad)));
             ui.label(format!(
                 "{} blocks of {}, {} per square",
@@ -192,8 +192,8 @@ impl SurfaceTestWindow {
 fn color(c: Cell, ui: &egui::Ui) -> Color32 {
     match c {
         Cell::Untested => ui.visuals().widgets.inactive.bg_fill,
-        Cell::Ok => Color32::from_rgb(0x4C, 0xAF, 0x50),
-        Cell::Slow => Color32::from_rgb(0xE0, 0x80, 0x10),
+        Cell::Ok => crate::theme::OK,
+        Cell::Slow => crate::theme::WARN,
         Cell::Bad => crate::theme::DANGER,
     }
 }

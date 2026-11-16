@@ -349,7 +349,7 @@ pub fn danger(ui: &mut egui::Ui, text: impl Into<String>) {
 }
 
 /// Orange (warning) text.
-pub const WARN: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x80, 0x10);
+pub const WARN: egui::Color32 = crate::theme::WARN;
 
 /// The buttons under a [`wizard_window`] page.
 #[derive(Clone, Debug, Default)]

@@ -6,7 +6,7 @@ use crate::theme::{map_colors, DANGER};
 use eframe::egui::{self, RichText};
 
 pub const ENTRIES: [(ItemKind, &str); 5] = [
-    (ItemKind::Primary, "GPT/Primary"),
+    (ItemKind::Primary, "Primary"),
     (ItemKind::Logical, "Logical"),
     (ItemKind::Unallocated, "Unallocated"),
     (ItemKind::System, "EFI/System"),
@@ -19,6 +19,15 @@ pub fn show(ui: &mut egui::Ui, s: &AppState) {
         for (kind, label) in ENTRIES {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 2.0, colors.of(kind));
+            ui.label(label);
+            ui.add_space(8.0);
+        }
+        // what the fill inside a segment means
+        ui.separator();
+        for (fill, label) in [(colors.used_fill(ItemKind::Primary), "Used"), (colors.body, "Free")] {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, fill);
+            ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, colors.border));
             ui.label(label);
             ui.add_space(8.0);
         }

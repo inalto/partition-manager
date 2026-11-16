@@ -13,6 +13,8 @@ pub use device::{copy_range, BlockDevice, FileDevice, MemDevice, ReadOnly, Slice
 pub use error::{Error, Result};
 pub use fs_kind::FsKind;
 pub use model::*;
-pub use progress::{CancelToken, FnProgress, NullProgress, ProgressReport, ProgressSink, ProgressTracker};
+pub use progress::{
+    CancelToken, FnProgress, NullProgress, ProgressReport, ProgressSink, ProgressTracker, SliceState,
+};
 pub use ptype::*;
 pub use units::{align_down, align_up, format_size, parse_size, GIB, MIB};
