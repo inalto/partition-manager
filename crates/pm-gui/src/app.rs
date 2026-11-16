@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 /// How long a toast stays on screen.
 const TOAST_TIME: Duration = Duration::from_secs(3);
 
-/// Tools opened from the toolbar: tool windows and wizards that are not sidebar actions.
+/// Tools opened from the toolbar and the sidebar's "Tools" group: tool windows and wizards that
+/// do not act on the selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     DataRecovery,
@@ -43,6 +44,19 @@ impl Tool {
     pub const IMAGE_MENU: [Tool; 3] = [Tool::CreateImage, Tool::RestoreImage, Tool::RescueCopy];
     /// The "Disk tools" menu.
     pub const MORE: [Tool; 2] = [Tool::SurfaceTest, Tool::Smart];
+    /// The sidebar's "Tools" group: every tool the toolbar reaches, each on its own row (the
+    /// toolbar keeps two of its buttons as menus).
+    pub const SIDEBAR: [Tool; 9] = [
+        Tool::DataRecovery,
+        Tool::PartitionRecovery,
+        Tool::DiskBenchmark,
+        Tool::SpaceAnalyzer,
+        Tool::CreateImage,
+        Tool::RestoreImage,
+        Tool::RescueCopy,
+        Tool::SurfaceTest,
+        Tool::Smart,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -830,6 +844,17 @@ mod tests {
         s.handle(Cmd::FinishWizard(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
         assert!(s.job.is_none() && s.dialog.is_none());
         assert_eq!(s.queue.len(), 1);
+    }
+
+    #[test]
+    fn sidebar_tools_are_exactly_what_the_toolbar_reaches() {
+        let mut toolbar: Vec<Tool> = Tool::ALL.iter().copied().filter(|t| *t != Tool::BackupImage).collect();
+        toolbar.extend(Tool::IMAGE_MENU);
+        toolbar.extend(Tool::MORE);
+        assert_eq!(Tool::SIDEBAR.to_vec(), toolbar);
+        for (i, t) in Tool::SIDEBAR.iter().enumerate() {
+            assert!(!Tool::SIDEBAR[..i].contains(t), "{t:?} twice");
+        }
     }
 
     #[test]

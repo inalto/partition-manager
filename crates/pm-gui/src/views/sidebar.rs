@@ -1,8 +1,9 @@
-//! Left sidebar: the action groups (enabled by the selection) and the pending operations.
+//! Left sidebar: the action groups (enabled by the selection), the tools, and the pending
+//! operations.
 
 use super::pending;
 use crate::actions::GROUPS;
-use crate::app::{AppState, Cmd};
+use crate::app::{AppState, Cmd, Tool};
 use eframe::egui::{self, Button, CollapsingHeader, RichText};
 
 pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
@@ -24,5 +25,13 @@ pub fn show(ui: &mut egui::Ui, s: &AppState, out: &mut Vec<Cmd>) {
                     }
                 });
         }
+        // the same tools as the toolbar, each on its own row (two of them sit in menus there)
+        CollapsingHeader::new(RichText::new("Tools").strong()).default_open(true).show(ui, |ui| {
+            for t in Tool::SIDEBAR {
+                if ui.add(Button::new(t.label()).frame(false)).clicked() {
+                    out.push(Cmd::OpenTool(t));
+                }
+            }
+        });
     });
 }

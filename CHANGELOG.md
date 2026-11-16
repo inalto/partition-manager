@@ -4,6 +4,13 @@ All notable changes to Partition Manager. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver while the
 project is pre-1.0 (minor bumps may change behaviour).
 
+## [Unreleased]
+
+### Changed
+- The side panel has a "Tools" group listing every tool on its own row (Data Recovery,
+  Partition Recovery, Disk Benchmark, Space Analyzer, Create Image, Restore Image, Rescue
+  Copy, Surface Test, SMART); the toolbar is unchanged.
+
 ## [0.3.0] - 2026-11-15
 
 ### Added
