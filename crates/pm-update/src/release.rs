@@ -57,6 +57,9 @@ pub struct Release {
     pub page_url: String,
     /// The archive for the requested target, if the release has one.
     pub archive: Option<Asset>,
+    /// The installer for the requested target (`...-setup.exe`, Windows only), if the
+    /// release has one: what an installed copy updates with.
+    pub installer: Option<Asset>,
     /// URL of `SHA256SUMS.txt`, if the release has one.
     pub sums_url: Option<String>,
 }
@@ -96,15 +99,18 @@ pub fn parse_release(json: &str, target: Option<&str>) -> Result<Option<Release>
     let Some(version) = Version::parse(&raw.tag_name) else {
         return Ok(None);
     };
-    let archive = target.and_then(|t| {
-        let ext = if t.starts_with("windows-") { "zip" } else { "tar.gz" };
-        let want = format!("partition-manager-{version}-{t}.{ext}");
+    let asset = |want: String| {
         raw.assets
             .iter()
             .find(|a| a.name == want)
             .filter(|a| is_release_download(&a.browser_download_url))
             .map(|a| Asset { name: a.name.clone(), url: a.browser_download_url.clone(), size: a.size })
+    };
+    let archive = target.and_then(|t| {
+        let ext = if t.starts_with("windows-") { "zip" } else { "tar.gz" };
+        asset(format!("partition-manager-{version}-{t}.{ext}"))
     });
+    let installer = target.filter(|t| t.starts_with("windows-")).and_then(|t| asset(installer_name(version, t)));
     let sums_url = raw
         .assets
         .iter()
@@ -116,8 +122,15 @@ pub fn parse_release(json: &str, target: Option<&str>) -> Result<Option<Release>
         notes: raw.body.unwrap_or_default(),
         page_url: release_page(raw.html_url.as_deref().unwrap_or_default()),
         archive,
+        installer,
         sums_url,
     }))
+}
+
+/// Name of the installer asset of `version` for `target`:
+/// `partition-manager-0.4.0-windows-x86_64-setup.exe`.
+pub fn installer_name(version: Version, target: &str) -> String {
+    format!("partition-manager-{version}-{target}-setup.exe")
 }
 
 /// Whether `url` may be requested: `https` on `github.com`, `api.github.com`
@@ -169,6 +182,20 @@ mod tests {
             parse_release(SAMPLE, Some("windows-x86_64")).unwrap().unwrap().archive.unwrap().name,
             "partition-manager-0.2.3-windows-x86_64.zip"
         );
+    }
+
+    #[test]
+    fn the_installer_is_a_windows_asset_of_this_repository() {
+        let (_, rel) = crate::testing::installer_fixture("0.9.0", true);
+        let json = crate::testing::release_json(&rel);
+        let win = parse_release(&json, Some("windows-x86_64")).unwrap().unwrap();
+        assert_eq!(win.installer, rel.installer);
+        assert_eq!(win.installer.unwrap().name, "partition-manager-0.9.0-windows-x86_64-setup.exe");
+        assert_eq!(parse_release(&json, Some("linux-x86_64")).unwrap().unwrap().installer, None);
+        // an installer hosted anywhere else is not offered
+        let elsewhere = json.replace(&format!("{DOWNLOAD_PREFIX}v0.9.0/partition-manager-0.9.0-windows-x86_64-setup.exe"), "https://example.com/setup.exe");
+        assert_ne!(elsewhere, json);
+        assert_eq!(parse_release(&elsewhere, Some("windows-x86_64")).unwrap().unwrap().installer, None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Status bar: color legend of the disk map, the disk source and the elevation status.
 
-use crate::app::{AppState, JobKind};
+use crate::app::{AppState, JobKind, Tab};
 use crate::items::ItemKind;
 use crate::theme::{map_colors, DANGER};
 use eframe::egui::{self, RichText};
@@ -16,15 +16,19 @@ pub const ENTRIES: [(ItemKind, &str); 5] = [
 pub fn show(ui: &mut egui::Ui, s: &AppState) {
     let colors = map_colors(s.theme);
     ui.horizontal(|ui| {
-        for (kind, label) in ENTRIES {
+        // the legend of the disk map, where the map is
+        for (kind, label) in ENTRIES.into_iter().filter(|_| s.tab == Tab::Disks) {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 2.0, colors.of(kind));
             ui.label(label);
             ui.add_space(8.0);
         }
         // what the fill inside a segment means
-        ui.separator();
-        for (fill, label) in [(colors.used_fill(ItemKind::Primary), "Used"), (colors.body, "Free")] {
+        let fills = [(colors.used_fill(ItemKind::Primary), "Used"), (colors.body, "Free")];
+        if s.tab == Tab::Disks {
+            ui.separator();
+        }
+        for (fill, label) in fills.into_iter().filter(|_| s.tab == Tab::Disks) {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 2.0, fill);
             ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, colors.border));

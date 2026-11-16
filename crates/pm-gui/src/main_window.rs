@@ -1,14 +1,14 @@
 //! The eframe application: lays the panels out, shows the dialogs and applies the commands
 //! they emit, once per frame.
 
-use crate::app::{AppState, Cmd, JobKind, StartOptions};
+use crate::app::{AppState, Cmd, JobKind, StartOptions, Tab};
 use crate::args::Args;
 use crate::dialogs::{self, progress, properties, update as update_dialogs};
 use crate::settings::settings_dir;
 use crate::theme::{self, Theme, DANGER};
 use crate::update::UpdateState;
 use crate::views::{disk_map, disk_table, icons, legend, sidebar, toolbar};
-use crate::tools::WindowOutcome;
+use crate::tools::{Dock, WindowOutcome};
 use crate::wizard::WizardOutcome;
 use eframe::egui::{self, Color32, RichText};
 use pm_platform::Platform;
@@ -73,6 +73,13 @@ impl PartitionApp {
 
         let mut cmds: Vec<Cmd> = Vec::new();
         let enabled = !s.modal();
+        // a tab whose tool is gone (closed, or never opened) gives the screen back to the disks
+        if s.tab != Tab::Disks && !s.active_tool().is_some_and(|t| s.tool_open(t)) {
+            s.tab = Tab::Disks;
+        }
+        let active = s.active_tool();
+        // while a tool writes to a disk, the disks can be looked at but not changed
+        let disks_enabled = enabled && !s.disks_locked();
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(3.0);
             ui.add_enabled_ui(enabled, |ui| toolbar::show(ui, s, &mut cmds));
@@ -82,24 +89,26 @@ impl PartitionApp {
         egui::SidePanel::left("sidebar").resizable(true).default_width(230.0).show(ctx, |ui| {
             ui.add_enabled_ui(enabled, |ui| sidebar::show(ui, s, &mut cmds));
         });
-        egui::TopBottomPanel::bottom("disk_map")
-            .resizable(true)
-            .default_height(280.0)
-            .min_height(80.0)
-            .show(ctx, |ui| {
-                ui.add_enabled_ui(enabled, |ui| disk_map::show(ui, s, &mut cmds));
-            });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(enabled, |ui| {
+        if active.is_none() {
+            egui::TopBottomPanel::bottom("disk_map")
+                .resizable(true)
+                .default_height(280.0)
+                .min_height(80.0)
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(disks_enabled, |ui| disk_map::show(ui, s, &mut cmds));
+                });
+            egui::CentralPanel::default().show(ctx, |ui| {
                 // inside the enabled scope: Retry must not start a refresh under a modal (nor
                 // the notice's buttons open a dialog)
-                update_dialogs::notice(ui, &s.update, &mut cmds);
-                if let Some(b) = &s.banner {
-                    banner(ui, b, &mut cmds);
-                }
-                disk_table::show(ui, s, &mut cmds)
+                ui.add_enabled_ui(enabled, |ui| {
+                    update_dialogs::notice(ui, &s.update, &mut cmds);
+                    if let Some(b) = &s.banner {
+                        banner(ui, b, &mut cmds);
+                    }
+                });
+                ui.add_enabled_ui(disks_enabled, |ui| disk_table::show(ui, s, &mut cmds));
             });
-        });
+        }
 
         if s.modal() {
             let dim = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("modal_dim")));
@@ -111,17 +120,27 @@ impl PartitionApp {
                 None => cmds.push(Cmd::CloseProperties),
             }
         }
+        // the tool of the tab on screen fills the main area; the others wait, with their
+        // state and their running jobs, until their tab is shown again
+        let active_kind = active.and_then(|t| t.kind());
         let mut windows = std::mem::take(&mut s.windows);
         {
             let env = s.tool_env();
-            windows.retain_mut(|w| match w.show(ctx, &env) {
-                WindowOutcome::Open => true,
-                WindowOutcome::Close => false,
-                WindowOutcome::Refresh => {
-                    cmds.push(Cmd::Refresh);
-                    true
+            crate::tools::set_dock(ctx, Some(Dock { enabled }));
+            windows.retain_mut(|w| {
+                if Some(w.kind()) != active_kind {
+                    return true;
+                }
+                match w.show(ctx, &env) {
+                    WindowOutcome::Open => true,
+                    WindowOutcome::Close => false,
+                    WindowOutcome::Refresh => {
+                        cmds.push(Cmd::Refresh);
+                        true
+                    }
                 }
             });
+            crate::tools::set_dock(ctx, None);
         }
         windows.append(&mut s.windows);
         s.windows = windows;
@@ -133,12 +152,18 @@ impl PartitionApp {
         if let Some(task) = &s.update.downloading {
             update_dialogs::download(ctx, task, s.update.release().map(|r| r.version), &mut cmds);
         }
+        // the wizard of an action is a dialog; the one of a tool fills its tab, and is only
+        // drawn while that tab is on screen
         if let Some(mut w) = s.wizard.take() {
-            let wctx = s.wizard_ctx(&w);
-            match w.wizard.show(ctx, &wctx) {
-                WizardOutcome::Open => {}
-                WizardOutcome::Cancelled => cmds.push(Cmd::CloseWizard),
-                WizardOutcome::Finished(ops) => cmds.push(Cmd::FinishWizard(ops)),
+            if w.tool.is_none() || w.tool == active {
+                let wctx = s.wizard_ctx(&w);
+                crate::tools::set_dock(ctx, w.tool.map(|_| Dock { enabled }));
+                match w.wizard.show(ctx, &wctx) {
+                    WizardOutcome::Open => {}
+                    WizardOutcome::Cancelled => cmds.push(Cmd::CloseWizard),
+                    WizardOutcome::Finished(ops) => cmds.push(Cmd::FinishWizard(ops)),
+                }
+                crate::tools::set_dock(ctx, None);
             }
             s.wizard = Some(w);
         }
@@ -241,17 +266,34 @@ fn start_update(state: &mut AppState, args: &Args) {
     }
 }
 
+/// The window and taskbar icon: the logo (`assets/icon-256.rgba`, written by
+/// `scripts/make-icon.py`).
+fn window_icon() -> egui::IconData {
+    use crate::dialogs::about::{LOGO_RGBA, LOGO_SIDE};
+    egui::IconData { rgba: LOGO_RGBA.to_vec(), width: LOGO_SIDE, height: LOGO_SIDE }
+}
+
 /// Open the main window and run until it is closed.
 pub fn run(args: Args) -> Result<(), String> {
     let (platform, source) = platform_for(&args)?;
     let opts = StartOptions { dry_run: args.dry_run, source };
     let mut state = AppState::new(platform, opts);
     start_update(&mut state, &args);
+    // debug builds only: start on a tab, by its label (`PM_TAB="Disk tools"`), for screenshots
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PM_ABOUT").is_some() {
+        state.handle(Cmd::About);
+    }
+    #[cfg(debug_assertions)]
+    if let Some(tab) = std::env::var("PM_TAB").ok().and_then(|l| Tab::ALL.into_iter().find(|t| t.label() == l)) {
+        state.open_tab(tab);
+    }
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Partition Manager")
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([900.0, 560.0]),
+            .with_min_inner_size([900.0, 560.0])
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -310,13 +352,27 @@ mod tests {
         frame(&mut app);
         assert!(app.state.wizard.is_some());
         app.state.handle(Cmd::CloseWizard);
-        // tool windows and job wizards draw over it too
-        for t in [crate::app::Tool::SpaceAnalyzer, crate::app::Tool::Smart, crate::app::Tool::DataRecovery] {
-            app.state.handle(Cmd::OpenTool(t));
+        // every tab draws: its tool fills the main area
+        for tab in Tab::ALL {
+            app.state.handle(Cmd::OpenTab(tab));
+            frame(&mut app);
+            assert_eq!(app.state.tab, tab);
         }
+        for t in crate::app::Tool::IMAGE_MENU.into_iter().chain(crate::app::Tool::MORE) {
+            app.state.handle(Cmd::OpenTool(t));
+            frame(&mut app);
+            assert_eq!(app.state.active_tool(), Some(t));
+        }
+        assert_eq!(app.state.windows.len(), 7, "one of each window tool, kept across tabs");
+        // the About window draws, with its logo
+        app.state.handle(Cmd::About);
         frame(&mut app);
-        assert_eq!(app.state.windows.len(), 3);
+        assert!(matches!(app.state.dialog, Some(crate::app::Dialog::About)));
+        app.state.handle(Cmd::CloseDialog);
+        // a tab whose tool is gone goes back to the disks
         app.state.windows.clear();
+        frame(&mut app);
+        assert_eq!(app.state.tab, Tab::Disks);
         app.state.handle(Cmd::Push(vec![pm_ops::Operation::DeletePartition { disk: 1, number: 3 }]));
         app.state.handle(Cmd::Apply);
         app.state.handle(Cmd::SetTheme(Theme::Dark));

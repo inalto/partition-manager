@@ -11,7 +11,10 @@ You need a Rust toolchain from <https://rustup.rs>. Get the source from
 [Releases page](https://github.com/inalto/partition-manager/releases) for Windows x86_64,
 Linux x86_64 (built against glibc 2.35, runs on AlmaLinux 9's 2.34 too) and macOS on Apple Silicon and Intel (unsigned: run
 `xattr -d com.apple.quarantine pm partition-manager` after downloading), with
-`SHA256SUMS.txt`. The rest of this page is for building from source.
+`SHA256SUMS.txt`. On Windows there is also an installer (`...-setup.exe`, from version 0.4.0):
+Start menu entry, uninstaller, optional desktop shortcut and `pm` on the PATH; it is unsigned,
+so SmartScreen asks for **More info**, **Run anyway**. The rest of this page is for building
+from source.
 
 The desktop application checks for a newer release at startup (when the last successful
 check is more than 24 hours old; a failed check is tried again at the next start) and can

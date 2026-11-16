@@ -8,7 +8,7 @@ use crate::actions::{Action, Effect};
 use crate::jobs::{spawn_job, JobHandle, JobOutput};
 use crate::selection::Selected;
 use crate::theme::Theme;
-use crate::tools::{Device, ToolEnv, ToolWindow};
+use crate::tools::{Device, ToolEnv, ToolWindow, WindowKind};
 use crate::update::UpdateState;
 use crate::wizard::{Wizard, WizardCtx};
 use pm_ops::{execute_queued, ExecOpts, ExecReport, Model, OpQueue, Operation};
@@ -20,16 +20,69 @@ use std::time::{Duration, Instant};
 /// How long a toast stays on screen.
 const TOAST_TIME: Duration = Duration::from_secs(3);
 
-/// Tools opened from the toolbar and the sidebar's "Tools" group: tool windows and wizards that
-/// do not act on the selection.
+/// The tabs of the main window: the disks, and one per tool or family of tools. The content
+/// of a tab fills the main area; the side panel shows what belongs to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Disks,
+    DataRecovery,
+    PartitionRecovery,
+    DiskBenchmark,
+    SpaceAnalyzer,
+    /// Create Image, Restore Image, Rescue Copy.
+    Image,
+    /// Surface Test, SMART.
+    DiskTools,
+}
+
+impl Tab {
+    /// In the order they are shown.
+    pub const ALL: [Tab; 7] = [
+        Tab::Disks,
+        Tab::DataRecovery,
+        Tab::PartitionRecovery,
+        Tab::DiskBenchmark,
+        Tab::SpaceAnalyzer,
+        Tab::Image,
+        Tab::DiskTools,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Disks => "Disks",
+            Tab::Image => "Backup / Image",
+            Tab::DiskTools => "Disk tools",
+            other => other.tools()[0].label(),
+        }
+    }
+
+    /// The tools of the tab (none for the disks). A tab with several lists them in the side
+    /// panel.
+    pub fn tools(self) -> &'static [Tool] {
+        match self {
+            Tab::Disks => &[],
+            Tab::DataRecovery => &[Tool::DataRecovery],
+            Tab::PartitionRecovery => &[Tool::PartitionRecovery],
+            Tab::DiskBenchmark => &[Tool::DiskBenchmark],
+            Tab::SpaceAnalyzer => &[Tool::SpaceAnalyzer],
+            Tab::Image => &Tool::IMAGE_MENU,
+            Tab::DiskTools => &Tool::MORE,
+        }
+    }
+
+    /// The tab `t` lives in.
+    pub fn of(t: Tool) -> Tab {
+        Tab::ALL.into_iter().find(|tab| tab.tools().contains(&t)).unwrap_or(Tab::Disks)
+    }
+}
+
+/// The tools of the tabs: tool windows and wizards that do not need a selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     DataRecovery,
     PartitionRecovery,
     DiskBenchmark,
     SpaceAnalyzer,
-    /// The "Backup / Image" menu ([`Tool::IMAGE_MENU`]).
-    BackupImage,
     CreateImage,
     RestoreImage,
     RescueCopy,
@@ -38,25 +91,10 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// The toolbar buttons (Backup / Image is a menu of [`Tool::IMAGE_MENU`]).
-    pub const ALL: [Tool; 5] =
-        [Tool::DataRecovery, Tool::PartitionRecovery, Tool::DiskBenchmark, Tool::SpaceAnalyzer, Tool::BackupImage];
+    /// The tools of the "Backup / Image" tab.
     pub const IMAGE_MENU: [Tool; 3] = [Tool::CreateImage, Tool::RestoreImage, Tool::RescueCopy];
-    /// The "Disk tools" menu.
+    /// The tools of the "Disk tools" tab.
     pub const MORE: [Tool; 2] = [Tool::SurfaceTest, Tool::Smart];
-    /// The sidebar's "Tools" group: every tool the toolbar reaches, each on its own row (the
-    /// toolbar keeps two of its buttons as menus).
-    pub const SIDEBAR: [Tool; 9] = [
-        Tool::DataRecovery,
-        Tool::PartitionRecovery,
-        Tool::DiskBenchmark,
-        Tool::SpaceAnalyzer,
-        Tool::CreateImage,
-        Tool::RestoreImage,
-        Tool::RescueCopy,
-        Tool::SurfaceTest,
-        Tool::Smart,
-    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -64,13 +102,42 @@ impl Tool {
             Tool::PartitionRecovery => "Partition Recovery",
             Tool::DiskBenchmark => "Disk Benchmark",
             Tool::SpaceAnalyzer => "Space Analyzer",
-            Tool::BackupImage => "Backup / Image",
             Tool::CreateImage => "Create Image",
             Tool::RestoreImage => "Restore Image",
             Tool::RescueCopy => "Rescue Copy (ddrescue)",
             Tool::SurfaceTest => "Surface Test",
             Tool::Smart => "SMART",
         }
+    }
+
+    /// One or two sentences for the side panel: what the tool does and what it touches.
+    pub fn about(self) -> &'static str {
+        match self {
+            Tool::DataRecovery => "Finds files on a damaged, formatted or deleted file system and copies them to another disk. The source is only read.",
+            Tool::PartitionRecovery => "Searches a disk for lost partitions and writes the ones you choose back to its partition table.",
+            Tool::DiskBenchmark => "Measures read and write speed on a volume, with a test file it creates and removes.",
+            Tool::SpaceAnalyzer => "Shows which folders and files take the space on a volume. Reads only.",
+            Tool::CreateImage => "Copies a disk or a partition into an image file. It becomes a pending operation and runs on Apply.",
+            Tool::RestoreImage => "Writes an image file back to a disk or a partition. It becomes a pending operation and runs on Apply.",
+            Tool::RescueCopy => "Copies a failing disk, skipping unreadable areas and coming back to them, like ddrescue. Starts at once, not on Apply.",
+            Tool::SurfaceTest => "Reads every sector of a disk or partition and maps the slow and the unreadable ones. Reads only.",
+            Tool::Smart => "The health attributes a drive reports about itself.",
+        }
+    }
+
+    /// The window of the tool; `None` for the two that are operation wizards (Create Image,
+    /// Restore Image).
+    pub fn kind(self) -> Option<WindowKind> {
+        Some(match self {
+            Tool::CreateImage | Tool::RestoreImage => return None,
+            Tool::DataRecovery => WindowKind::DataRecovery,
+            Tool::PartitionRecovery => WindowKind::PartitionRecovery,
+            Tool::DiskBenchmark => WindowKind::Benchmark,
+            Tool::SpaceAnalyzer => WindowKind::SpaceAnalyzer,
+            Tool::RescueCopy => WindowKind::RescueCopy,
+            Tool::SurfaceTest => WindowKind::SurfaceTest,
+            Tool::Smart => WindowKind::Smart,
+        })
     }
 }
 
@@ -90,6 +157,8 @@ pub enum Dialog {
     UpdateConfirm { release: Release },
     /// `version` was installed; offers the restart.
     Updated { version: Version },
+    /// The About window.
+    About,
 }
 
 /// Everything a view or dialog can ask for.
@@ -109,7 +178,12 @@ pub enum Cmd {
     Refresh,
     CancelJob,
     CloseDialog,
+    /// Show a tool in its tab.
     OpenTool(Tool),
+    /// Show a tab.
+    OpenTab(Tab),
+    /// Open the About window.
+    About,
     CloseProperties,
     SetTheme(Theme),
     SetDryRun(bool),
@@ -147,6 +221,9 @@ pub struct OpenWizard {
     pub selection: Selected,
     /// Free drive letters of the platform, read once when the wizard opened.
     pub free_letters: Vec<char>,
+    /// The tool it is, when it was opened from a tab: it then fills that tab instead of
+    /// being a dialog. `None` for the wizard of an action on the selection.
+    pub tool: Option<Tool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,9 +269,16 @@ pub struct AppState {
     pub dialog: Option<Dialog>,
     /// Disk whose properties window is open.
     pub properties: Option<u32>,
-    /// Open tool windows and job wizards (drawn in order; modal ones disable the main window).
+    /// The tab on screen.
+    pub tab: Tab,
+    /// The tool last used in the "Backup / Image" tab, and in the "Disk tools" tab.
+    pub image_tool: Tool,
+    pub disk_tool: Tool,
+    /// The tools that have been opened, one of each kind. Only the one of the active tab is
+    /// drawn; the others keep their state (and their running jobs) until their tab is back.
     pub windows: Vec<Box<dyn ToolWindow>>,
-    /// The open wizard (modal).
+    /// The open wizard: a dialog for an action on the selection, or the content of the
+    /// "Backup / Image" tab (see [`OpenWizard::tool`]).
     pub wizard: Option<OpenWizard>,
     /// The next successful refresh drops the pending operations instead of rebasing them
     /// (set after a failed Apply, when some of them may already have been written).
@@ -224,6 +308,9 @@ impl AppState {
             toast: None,
             dialog: None,
             properties: None,
+            tab: Tab::Disks,
+            image_tool: Tool::CreateImage,
+            disk_tool: Tool::SurfaceTest,
             windows: Vec::new(),
             wizard: None,
             reset_on_refresh: false,
@@ -243,13 +330,42 @@ impl AppState {
         self.job.is_some()
     }
 
-    /// A modal dialog, a wizard or Apply is in progress: the main window does not take input.
+    /// A dialog, the wizard of an action or Apply is in progress: nothing else takes input.
+    /// A tool in its tab is not a dialog, whatever it is doing.
     pub fn modal(&self) -> bool {
         self.dialog.is_some()
-            || self.wizard.is_some()
-            || self.windows.iter().any(|w| w.modal())
+            || self.wizard.as_ref().is_some_and(|w| w.tool.is_none())
             || matches!(self.job, Some(RunningJob { kind: JobKind::Apply { .. }, .. }))
             || self.update.downloading.is_some()
+    }
+
+    /// A tool is writing to a disk (a rescue, a partition recovery, a file restore): the
+    /// disks tab is read-only until it finishes, so that nothing is queued or applied under it.
+    pub fn disks_locked(&self) -> bool {
+        self.windows.iter().any(|w| w.writing())
+    }
+
+    /// The tool of the tab on screen (`None` on the disks).
+    pub fn active_tool(&self) -> Option<Tool> {
+        match self.tab {
+            Tab::Disks => None,
+            Tab::Image => Some(self.image_tool),
+            Tab::DiskTools => Some(self.disk_tool),
+            other => other.tools().first().copied(),
+        }
+    }
+
+    /// Whether tool `t` has been opened and not closed since.
+    pub fn tool_open(&self, t: Tool) -> bool {
+        match t.kind() {
+            Some(kind) => self.windows.iter().any(|w| w.kind() == kind),
+            None => self.wizard.as_ref().is_some_and(|w| w.tool == Some(t)),
+        }
+    }
+
+    /// Whether a job of tool `t` is running (shown on its tab).
+    pub fn tool_running(&self, t: Tool) -> bool {
+        t.kind().is_some_and(|kind| self.windows.iter().any(|w| w.kind() == kind && w.running()))
     }
 
     /// Work is running that an update or a restart must not interrupt: a job (refresh,
@@ -400,9 +516,9 @@ impl AppState {
         let ctx = WizardCtx::new(self.queue.preview(), free_letters.clone(), sel).with_platform(self.platform.clone());
         let wizard = crate::wizards::for_action(action, &ctx).or_else(|| crate::wizards::clone_for_action(action, &ctx));
         match wizard {
-            Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters }),
-            None if action == Action::PartitionRecovery => self.open_tool(Tool::PartitionRecovery),
-            None if action == Action::SurfaceTest => self.open_tool(Tool::SurfaceTest),
+            Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters, tool: None }),
+            None if action == Action::PartitionRecovery => self.open_tool_on_selection(Tool::PartitionRecovery),
+            None if action == Action::SurfaceTest => self.open_tool_on_selection(Tool::SurfaceTest),
             None if crate::wizards::ACTIONS.contains(&action) || crate::wizards::CLONE_ACTIONS.contains(&action) => {
                 self.toast(format!("{}: not available for this selection", action.label()))
             }
@@ -413,9 +529,40 @@ impl AppState {
         }
     }
 
-    /// Open tool `t` on the current selection: an operation wizard (images), a job wizard or a
-    /// tool window (one of each kind; an open one stays as it is).
+    /// Show the tab `tab`, opening its tool if it is not open yet.
+    pub fn open_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        if let Some(t) = self.active_tool() {
+            self.ensure_tool(t);
+        }
+    }
+
+    /// Show tool `t` in its tab. A tool that is already open stays as it is, with what was
+    /// entered in it and whatever it is running.
     pub fn open_tool(&mut self, t: Tool) {
+        match Tab::of(t) {
+            Tab::Image => self.image_tool = t,
+            Tab::DiskTools => self.disk_tool = t,
+            _ => {}
+        }
+        self.open_tab(Tab::of(t));
+    }
+
+    /// [`AppState::open_tool`] for an action on the selection: the tool starts over on that
+    /// selection, unless a job of it is running.
+    fn open_tool_on_selection(&mut self, t: Tool) {
+        if let Some(kind) = t.kind() {
+            self.windows.retain(|w| w.kind() != kind || w.running() || w.writing());
+        }
+        self.open_tool(t);
+    }
+
+    /// Create tool `t` on the current selection, if it is not open: an operation wizard
+    /// (images), a job wizard or a tool window, one of each kind.
+    fn ensure_tool(&mut self, t: Tool) {
+        if self.tool_open(t) {
+            return;
+        }
         let sel = self.selected;
         let live = self.queue.base();
         let device = Device::from_selection(sel).filter(|d| d.range(live).is_some());
@@ -429,12 +576,14 @@ impl AppState {
                     crate::wizards::image_restore::new(&ctx)
                 };
                 match w {
-                    Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters }),
-                    None => self.toast(format!("{}: there is no disk", t.label())),
+                    Some(wizard) => self.wizard = Some(OpenWizard { wizard, selection: sel, free_letters, tool: Some(t) }),
+                    None => {
+                        self.tab = Tab::Disks;
+                        self.toast(format!("{}: there is no disk", t.label()));
+                    }
                 }
                 return;
             }
-            Tool::BackupImage => return,
             Tool::DataRecovery => Box::new(crate::wizards::data_recovery::DataRecoveryWizard::new(device)),
             Tool::PartitionRecovery => Box::new(crate::wizards::partition_recovery::PartitionRecoveryWizard::new(
                 device.map(|d| d.disk()),
@@ -451,6 +600,15 @@ impl AppState {
         };
         if !self.windows.iter().any(|w| w.kind() == window.kind()) {
             self.windows.push(window);
+        }
+    }
+
+    /// Close the wizard; one that filled a tab gives the screen back to the disks.
+    fn close_wizard(&mut self) {
+        if let Some(w) = self.wizard.take() {
+            if w.tool.is_some() && self.tab == Tab::Image {
+                self.tab = Tab::Disks;
+            }
         }
     }
 
@@ -525,6 +683,12 @@ impl AppState {
             }
             Cmd::CloseDialog => self.dialog = None,
             Cmd::OpenTool(t) => self.open_tool(t),
+            Cmd::OpenTab(tab) => self.open_tab(tab),
+            Cmd::About => {
+                if self.dialog.is_none() {
+                    self.dialog = Some(Dialog::About);
+                }
+            }
             Cmd::CloseProperties => self.properties = None,
             Cmd::SetTheme(t) => self.theme = t,
             Cmd::SetDryRun(d) => self.dry_run = d,
@@ -541,7 +705,7 @@ impl AppState {
             Cmd::DismissBanner => self.banner = None,
             Cmd::FinishWizard(ops) => match self.try_push_ops(ops.clone()) {
                 Ok(()) => {
-                    self.wizard = None;
+                    self.close_wizard();
                     self.run_finished_images(&ops);
                 }
                 Err(e) => match &mut self.wizard {
@@ -549,7 +713,7 @@ impl AppState {
                     None => self.error(e),
                 },
             },
-            Cmd::CloseWizard => self.wizard = None,
+            Cmd::CloseWizard => self.close_wizard(),
             Cmd::CheckUpdates
             | Cmd::SetCheckUpdates(_)
             | Cmd::UpdateWhatsNew
@@ -759,7 +923,8 @@ mod tests {
         }
         s.handle(Cmd::Action(Action::PartitionRecovery, Selected::Disk(1)));
         assert_eq!(s.windows.len(), 1);
-        assert!(s.modal(), "job wizards are modal");
+        assert!(!s.modal(), "a tool in its tab is not a dialog");
+        assert_eq!(s.tab, Tab::PartitionRecovery);
         s.windows.clear();
         s.handle(Cmd::Action(Action::SurfaceTest, Selected::Partition(1, 3)));
         for t in [Tool::DiskBenchmark, Tool::SpaceAnalyzer, Tool::Smart, Tool::Smart] {
@@ -777,6 +942,52 @@ mod tests {
         s.handle(Cmd::CloseWizard);
         s.handle(Cmd::OpenTool(Tool::RestoreImage));
         assert!(s.wizard.is_some());
+    }
+
+    #[test]
+    fn tabs_open_their_tool_and_keep_it() {
+        let mut s = mock_state();
+        assert_eq!((s.tab, s.active_tool()), (Tab::Disks, None));
+        // every tool has exactly one tab, and every tab but the disks has tools
+        for t in Tool::IMAGE_MENU.into_iter().chain(Tool::MORE) {
+            assert!(matches!(Tab::of(t), Tab::Image | Tab::DiskTools), "{t:?}");
+        }
+        for tab in Tab::ALL {
+            assert_eq!(tab.tools().is_empty(), tab == Tab::Disks);
+            assert!(tab.tools().iter().all(|t| Tab::of(*t) == tab && !t.about().is_empty()));
+        }
+        // a single-tool tab opens its tool
+        s.handle(Cmd::OpenTab(Tab::DiskBenchmark));
+        assert_eq!(s.active_tool(), Some(Tool::DiskBenchmark));
+        assert!(s.tool_open(Tool::DiskBenchmark) && !s.modal());
+        // a family tab opens the tool used last in it (the first one at the start)
+        s.handle(Cmd::OpenTab(Tab::DiskTools));
+        assert_eq!(s.active_tool(), Some(Tool::SurfaceTest));
+        s.handle(Cmd::OpenTool(Tool::Smart));
+        assert_eq!((s.tab, s.active_tool()), (Tab::DiskTools, Some(Tool::Smart)));
+        s.handle(Cmd::OpenTab(Tab::Disks));
+        s.handle(Cmd::OpenTab(Tab::DiskTools));
+        assert_eq!(s.active_tool(), Some(Tool::Smart), "remembered");
+        // leaving a tab closes nothing
+        assert_eq!(s.windows.len(), 3);
+        // Create Image fills the image tab; it is not a dialog, and closing it goes back
+        s.handle(Cmd::OpenTab(Tab::Image));
+        assert_eq!(s.active_tool(), Some(Tool::CreateImage));
+        assert!(s.tool_open(Tool::CreateImage) && !s.modal());
+        s.handle(Cmd::OpenTab(Tab::Disks));
+        assert!(s.tool_open(Tool::CreateImage), "kept while another tab is shown");
+        s.handle(Cmd::OpenTab(Tab::Image));
+        s.handle(Cmd::CloseWizard);
+        assert_eq!(s.tab, Tab::Disks);
+        // the wizard of an action is still a dialog
+        s.handle(Cmd::Action(Action::CopyDisk, Selected::Disk(1)));
+        assert!(s.modal());
+        s.handle(Cmd::CloseWizard);
+        // an action on a selection starts its tool over on that selection
+        s.handle(Cmd::Action(Action::SurfaceTest, Selected::Partition(1, 3)));
+        assert_eq!((s.tab, s.active_tool()), (Tab::DiskTools, Some(Tool::SurfaceTest)));
+        assert_eq!(s.windows.len(), 3);
+        assert!(!s.disks_locked());
     }
 
     #[test]
@@ -844,17 +1055,6 @@ mod tests {
         s.handle(Cmd::FinishWizard(vec![Operation::DeletePartition { disk: 0, number: 6 }]));
         assert!(s.job.is_none() && s.dialog.is_none());
         assert_eq!(s.queue.len(), 1);
-    }
-
-    #[test]
-    fn sidebar_tools_are_exactly_what_the_toolbar_reaches() {
-        let mut toolbar: Vec<Tool> = Tool::ALL.iter().copied().filter(|t| *t != Tool::BackupImage).collect();
-        toolbar.extend(Tool::IMAGE_MENU);
-        toolbar.extend(Tool::MORE);
-        assert_eq!(Tool::SIDEBAR.to_vec(), toolbar);
-        for (i, t) in Tool::SIDEBAR.iter().enumerate() {
-            assert!(!Tool::SIDEBAR[..i].contains(t), "{t:?} twice");
-        }
     }
 
     #[test]

@@ -199,7 +199,7 @@ impl UpdateState {
             .get_or_insert_with(|| match dir {
                 None => Some("the folder of the application is unknown".to_string()),
                 Some(dir) => match pm_update::install_kind(dir) {
-                    InstallKind::Portable => None,
+                    InstallKind::Portable | InstallKind::Installed => None,
                     InstallKind::Unavailable(why) => Some(why),
                 },
             })
@@ -700,11 +700,12 @@ mod tests {
             assert!(matches!(s.dialog, Some(Dialog::UpdateConfirm { .. } | Dialog::WhatsNew { .. })));
         }
 
-        // a modal window, not a dialog, is on screen: the request is dropped as well
+        // the wizard of an action, not a dialog, is on screen: the request is dropped as well
         let u = UpdateState::new(Arc::new(fake_release("0.9.0")), Some(path.clone()), None, v("0.2.2"));
         let mut s = mock_state().with_update(u);
         s.handle(Cmd::UpdateWhatsNew);
-        s.windows.push(Box::new(Modal));
+        s.handle(Cmd::Action(crate::actions::Action::CopyDisk, crate::selection::Selected::Disk(1)));
+        assert!(s.wizard.is_some() && s.modal());
         wait_update(&mut s);
         assert!(s.dialog.is_none());
 
@@ -716,24 +717,6 @@ mod tests {
         assert!(is_apply(&s.dialog), "{:?}", s.dialog);
         assert!(toast(&s).contains("Cannot check for updates"), "{}", toast(&s));
         assert!(toast(&s).contains(LATEST_URL), "{}", toast(&s));
-    }
-
-    /// A modal window without a worker.
-    struct Modal;
-
-    impl ToolWindow for Modal {
-        fn kind(&self) -> WindowKind {
-            WindowKind::Benchmark
-        }
-        fn modal(&self) -> bool {
-            true
-        }
-        fn running(&self) -> bool {
-            false
-        }
-        fn show(&mut self, _ctx: &eframe::egui::Context, _env: &ToolEnv) -> WindowOutcome {
-            WindowOutcome::Open
-        }
     }
 
     #[test]

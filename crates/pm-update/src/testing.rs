@@ -266,8 +266,25 @@ pub fn release_fixture(version: &str, good_sum: bool) -> (MapFetch, Release) {
         notes: format!("What is new in {version}"),
         page_url: format!("https://github.com/inalto/partition-manager/releases/tag/v{version}"),
         archive: Some(Asset { name: name.clone(), url: format!("{base}/{name}"), size: bytes.len() as u64 }),
+        installer: None,
         sums_url: Some(format!("{base}/SHA256SUMS.txt")),
     };
+    (fetch, release)
+}
+
+/// [`release_fixture`] that also has an installer (whatever the platform): a file with
+/// the contents `setup:<version>`, listed in the `SHA256SUMS.txt` the fetch serves (with a
+/// wrong checksum unless `good_sum`).
+pub fn installer_fixture(version: &str, good_sum: bool) -> (MapFetch, Release) {
+    let (_, mut release) = release_fixture(version, true);
+    let bytes = format!("setup:{version}").into_bytes();
+    let name = crate::release::installer_name(release.version, "windows-x86_64");
+    let base = format!("{DOWNLOAD_PREFIX}v{version}");
+    let digest = if good_sum { format!("{:x}", Sha256::digest(&bytes)) } else { "0".repeat(64) };
+    let fetch = MapFetch::new()
+        .with(&format!("{base}/SHA256SUMS.txt"), format!("{digest}  {name}\n"))
+        .with(&format!("{base}/{name}"), &bytes);
+    release.installer = Some(Asset { name: name.clone(), url: format!("{base}/{name}"), size: bytes.len() as u64 });
     (fetch, release)
 }
 
@@ -276,6 +293,9 @@ pub fn release_fixture(version: &str, good_sum: bool) -> (MapFetch, Release) {
 pub fn release_json(r: &Release) -> String {
     let mut assets = Vec::new();
     if let Some(a) = &r.archive {
+        assets.push(serde_json::json!({"name": a.name, "browser_download_url": a.url, "size": a.size}));
+    }
+    if let Some(a) = &r.installer {
         assets.push(serde_json::json!({"name": a.name, "browser_download_url": a.url, "size": a.size}));
     }
     if let Some(url) = &r.sums_url {

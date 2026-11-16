@@ -1,6 +1,7 @@
 name: Release
 
-# Builds the release binaries for every supported target when a `v*` tag is pushed and
+# Builds the release binaries for every supported target, and the Windows installer, when a
+# `v*` tag is pushed and
 # publishes them on the GitHub release of that tag, with the matching CHANGELOG section as
 # notes. `workflow_dispatch` builds the same archives as artifacts without publishing.
 
@@ -55,13 +56,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          .\scripts\build-release.ps1
+          # Inno Setup compiles the installer; a no-op where the runner image already has it
+          choco install innosetup --no-progress -y
+          .\scripts\build-release.ps1 -Installer
           $version = (.\dist\pm.exe --version).Split(' ')[1]
           $name = "partition-manager-$version-windows-x86_64"
           New-Item -ItemType Directory -Force -Path "dist\$name" | Out-Null
           Copy-Item dist\pm.exe, dist\partition-manager.exe, README.md, LICENSE, CHANGELOG.md "dist\$name\"
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
-          Get-Item "dist\$name.zip"
+          Get-Item "dist\$name.zip", "dist\$name-setup.exe"
 
       - name: Build and package (Linux, macOS)
         if: runner.os != 'Windows'
@@ -76,6 +79,7 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             dist/*.zip
+            dist/*-setup.exe
             dist/*.tar.gz
           if-no-files-found: error
 

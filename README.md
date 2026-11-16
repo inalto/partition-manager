@@ -19,12 +19,18 @@ can be practised risk-free on image files with `--disk-file`.
 
 Prebuilt binaries for every tagged version are on the
 [Releases page](https://github.com/inalto/partition-manager/releases): `pm` (CLI) and
-`partition-manager` (GUI) for Windows x86_64 (zip), Linux x86_64 (tar.gz, built on Ubuntu 22.04 against glibc 2.35 and verified to run on
+`partition-manager` (GUI) for Windows x86_64 (an installer, `...-setup.exe`, or a zip to unpack anywhere), Linux x86_64 (tar.gz, built on Ubuntu 22.04 against glibc 2.35 and verified to run on
 AlmaLinux 9 with glibc 2.34; older distributions build from source) and
 macOS on Apple Silicon and Intel (tar.gz, unsigned: after downloading run
 `xattr -d com.apple.quarantine pm partition-manager`). `SHA256SUMS.txt` lists the checksums.
 The release workflow (`.github/workflows/release.yml`) builds them from the tag with the
 `scripts/build-release.*` scripts; `CHANGELOG.md` has the notes.
+
+The Windows installer (from version 0.4.0) puts the application in `C:\Program Files\Partition
+Manager` for all users, adds a Start menu entry and an entry in "Installed apps" with an
+uninstaller, and can optionally create a desktop shortcut and add `pm` to the system PATH.
+It is not signed: Windows SmartScreen says "Unknown publisher" the first time; choose **More
+info**, then **Run anyway**. The zip is the same application without any of that.
 
 ## Updates
 
@@ -55,6 +61,14 @@ error message names them and where their previous versions are, so you can resto
 hand. When it is done, **Restart now** starts the new version with the same arguments;
 **Later** keeps the old one running (the new version is not offered again in that session:
 **Update** and **Check for updates now** show the restart message instead).
+
+A copy installed with the Windows installer updates differently: **Update** downloads the
+new installer and checks it in the same way, and nothing is replaced yet. **Restart now**
+then runs that installer without showing its windows; it replaces the files, updates the
+entry in "Installed apps" and starts the application again (without the arguments it was
+started with). If you close the application instead, the downloaded installer is discarded
+and the update is offered again at the next start. A release that has no installer (0.3.0
+and older) cannot update an installed copy: download it from the release page.
 
 The previous files are kept as `partition-manager.old` and `pm.old` (`.exe.old` on Windows)
 and removed at the next start, once the new version has opened its window. If the

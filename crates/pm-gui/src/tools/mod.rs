@@ -73,6 +73,45 @@ pub fn write_problem(live: &Model, pending: &[Operation], disk: u32) -> Option<S
     })
 }
 
+/// Where the tool being drawn goes: set by the main window around the `show` of the tool of
+/// the active tab, which then fills the main area (the central panel) instead of floating
+/// over it. Without it (tests, a tool drawn on its own) the frames below open a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dock {
+    /// `false` while a dialog or Apply has the application's attention.
+    pub enabled: bool,
+}
+
+fn dock_id() -> egui::Id {
+    egui::Id::new("pm_tool_dock")
+}
+
+/// Set (or with `None` clear) the [`Dock`] for the tools drawn next in this frame.
+pub fn set_dock(ctx: &egui::Context, dock: Option<Dock>) {
+    ctx.data_mut(|d| match dock {
+        Some(dock) => d.insert_temp(dock_id(), dock),
+        None => d.remove::<Dock>(dock_id()),
+    });
+}
+
+/// The [`Dock`] in force, if any.
+pub fn dock(ctx: &egui::Context) -> Option<Dock> {
+    ctx.data(|d| d.get_temp(dock_id()))
+}
+
+/// Draw `add` in the main area of the window, for a docked tool.
+pub fn docked(ctx: &egui::Context, dock: Dock, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        if !dock.enabled {
+            ui.disable();
+        }
+        add(ui);
+    });
+}
+
+/// Height the footer row of a docked wizard needs under its body.
+pub const DOCK_FOOTER: f32 = 48.0;
+
 /// What a window wants after a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowOutcome {
@@ -82,10 +121,12 @@ pub enum WindowOutcome {
     Refresh,
 }
 
-/// A window drawn over the main window once per frame.
+/// A tool drawn once per frame while its tab is the active one: in the main area of the
+/// window (see [`Dock`]), or as a window of its own when drawn without one.
 pub trait ToolWindow {
     fn kind(&self) -> WindowKind;
-    /// Modal windows (the job wizards) disable the main window while open.
+    /// A job wizard (as opposed to a plain tool). Nothing is disabled for it any more: it
+    /// lives in its tab.
     fn modal(&self) -> bool {
         false
     }
@@ -396,12 +437,76 @@ pub fn wizard_window(
     body: impl FnOnce(&mut egui::Ui) -> Footer,
 ) -> Nav {
     let mut nav = Nav::Stay;
+    // `body_h` bounds the body (a vertical separator in a horizontal layout would otherwise
+    // stretch to the bottom of what is available), `max_w` is the width there is
+    let draw = |ui: &mut egui::Ui, body_h: f32, max_w: f32, nav: &mut Nav| {
+        let scroll_h = crate::dialogs::wizard_scroll_height(body_h);
+        let mut footer = Footer::default();
+        ui.scope(|ui| {
+            ui.set_max_height(body_h);
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(150.0);
+                    for (i, t) in pages.iter().enumerate() {
+                        let text = format!("{}. {t}", i + 1);
+                        ui.label(match i.cmp(&idx) {
+                            std::cmp::Ordering::Equal => RichText::new(text).strong(),
+                            std::cmp::Ordering::Less => RichText::new(text),
+                            std::cmp::Ordering::Greater => RichText::new(text).weak(),
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_min_width(640.0_f32.min(max_w - 200.0));
+                    ui.set_min_height(body_h.min(380.0));
+                    ui.heading(pages.get(idx).copied().unwrap_or(""));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(scroll_h).auto_shrink([false, true]).show(ui, |ui| {
+                        footer = body(ui);
+                    });
+                    if let Some(p) = footer.problem.as_ref().filter(|p| !p.is_empty()) {
+                        ui.add_space(4.0);
+                        danger(ui, p.as_str());
+                    }
+                });
+            });
+        });
+        ui.separator();
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            match &footer.close {
+                Some(label) => {
+                    if ui.button(label.as_str()).clicked() {
+                        *nav = Nav::Close;
+                    }
+                }
+                None => {
+                    ui.add_enabled(false, egui::Button::new("Close"));
+                }
+            }
+            if let Some((label, enabled)) = &footer.next {
+                if ui.add_enabled(*enabled, egui::Button::new(label.as_str())).clicked() {
+                    *nav = Nav::Next;
+                }
+            }
+            if footer.back && ui.button("< Back").clicked() {
+                *nav = Nav::Back;
+            }
+        });
+    };
+    if let Some(dock) = dock(ctx) {
+        docked(ctx, dock, |ui| {
+            let body_h = (ui.available_height() - DOCK_FOOTER).max(200.0);
+            let max_w = ui.available_width();
+            draw(ui, body_h, max_w, &mut nav);
+        });
+        return nav;
+    }
     let screen = ctx.screen_rect();
     let center = screen.center();
-    // Keep the window inside the viewport: the body is height-bounded (a vertical separator
-    // in a horizontal layout would otherwise stretch to the bottom of the screen).
+    // Keep the window inside the viewport.
     let body_h = crate::dialogs::wizard_body_height(ctx, 560.0);
-    let scroll_h = crate::dialogs::wizard_scroll_height(body_h);
     let max_w = (screen.width() - 40.0).max(400.0);
     let max_h = (screen.height() - 40.0).max(260.0);
     egui::Window::new(title)
@@ -413,66 +518,17 @@ pub fn wizard_window(
         .default_size([880.0_f32.min(max_w), 560.0_f32.min(max_h)])
         .max_size([max_w, max_h])
         .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            let mut footer = Footer::default();
-            ui.scope(|ui| {
-                ui.set_max_height(body_h);
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(150.0);
-                        for (i, t) in pages.iter().enumerate() {
-                            let text = format!("{}. {t}", i + 1);
-                            ui.label(match i.cmp(&idx) {
-                                std::cmp::Ordering::Equal => RichText::new(text).strong(),
-                                std::cmp::Ordering::Less => RichText::new(text),
-                                std::cmp::Ordering::Greater => RichText::new(text).weak(),
-                            });
-                            ui.add_space(2.0);
-                        }
-                    });
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.set_min_width(640.0_f32.min(max_w - 200.0));
-                        ui.set_min_height(body_h.min(380.0));
-                        ui.heading(pages.get(idx).copied().unwrap_or(""));
-                        ui.add_space(6.0);
-                        egui::ScrollArea::vertical().max_height(scroll_h).auto_shrink([false, true]).show(ui, |ui| {
-                            footer = body(ui);
-                        });
-                        if let Some(p) = footer.problem.as_ref().filter(|p| !p.is_empty()) {
-                            ui.add_space(4.0);
-                            danger(ui, p.as_str());
-                        }
-                    });
-                });
-            });
-            ui.separator();
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                match &footer.close {
-                    Some(label) => {
-                        if ui.button(label.as_str()).clicked() {
-                            nav = Nav::Close;
-                        }
-                    }
-                    None => {
-                        ui.add_enabled(false, egui::Button::new("Close"));
-                    }
-                }
-                if let Some((label, enabled)) = &footer.next {
-                    if ui.add_enabled(*enabled, egui::Button::new(label.as_str())).clicked() {
-                        nav = Nav::Next;
-                    }
-                }
-                if footer.back && ui.button("< Back").clicked() {
-                    nav = Nav::Back;
-                }
-            });
-        });
+        .show(ctx, |ui| draw(ui, body_h, max_w, &mut nav));
     nav
 }
 
-/// A non-modal tool window; returns `false` when the user closed it.
+/// The frame of a plain tool: the main area when docked (it is then left through the tabs,
+/// so this returns `true`), else a window, and `false` when the user closed it.
 pub fn tool_frame(ctx: &egui::Context, title: &str, size: [f32; 2], add: impl FnOnce(&mut egui::Ui)) -> bool {
+    if let Some(dock) = dock(ctx) {
+        docked(ctx, dock, add);
+        return true;
+    }
     let mut open = true;
     egui::Window::new(title)
         .id(egui::Id::new(("tool_window", title)))

@@ -6,9 +6,12 @@
   partition-manager.exe from target/release to dist/, prints their sizes, the
   `pm.exe --version` output, and whether partition-manager.exe embeds the
   requireAdministrator manifest. dist/ is gitignored.
+.PARAMETER Installer
+  Also build the Windows installer, dist/partition-manager-<version>-windows-x86_64-setup.exe,
+  with Inno Setup 6 (ISCC.exe on PATH or in its default folder; `choco install innosetup`).
 #>
 [CmdletBinding()]
-param()
+param([switch]$Installer)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -52,6 +55,22 @@ try {
     Write-Host ('requireAdministrator in pm.exe: {0} (expected 0)' -f $cliCount)
     if ($guiCount -ne 1) { throw "partition-manager.exe must embed exactly one requireAdministrator manifest (found $guiCount)" }
     if ($cliCount -ne 0) { throw "pm.exe must not embed an elevation manifest (found $cliCount)" }
+
+    if ($Installer) {
+        $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+        if (-not $iscc) {
+            $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+        }
+        if (-not (Test-Path $iscc)) { throw "Inno Setup 6 not found (ISCC.exe): install it with 'choco install innosetup'" }
+        # "pm 0.4.0" -> 0.4.0
+        $version = (& (Join-Path $dist 'pm.exe') --version).Split(' ')[1]
+        & $iscc "/DAppVersion=$version" (Join-Path $root 'installer\partition-manager.iss')
+        if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed (exit $LASTEXITCODE)" }
+        $setup = Join-Path $dist "partition-manager-$version-windows-x86_64-setup.exe"
+        if (-not (Test-Path $setup)) { throw "missing installer: $setup" }
+        Write-Host ''
+        '{0} {1:N0} bytes' -f (Split-Path -Leaf $setup), (Get-Item $setup).Length
+    }
 }
 finally {
     Pop-Location

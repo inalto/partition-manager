@@ -7,7 +7,7 @@
 //! renamed to `<name>.old` (a running `.exe` cannot be overwritten or deleted
 //! on Windows, but it can be renamed) and put back when anything fails.
 
-use crate::download::download;
+use crate::download::{download, download_installer};
 use crate::fetch::Fetch;
 use crate::release::Release;
 use crate::unpack::{exe_name, unpack, DOCUMENTS, EXECUTABLES};
@@ -51,10 +51,40 @@ fn strip_verbatim(path: &Path) -> PathBuf {
 /// Start of the name of the file `install_kind` creates to test the folder.
 const PROBE: &str = ".pm-update-probe-";
 
+/// The uninstaller the Windows installer (Inno Setup) puts next to the executables: its
+/// presence is what tells an installed copy from an unpacked archive.
+pub const UNINSTALLER: &str = "unins000.exe";
+
+/// What the installer is started with to update an installed copy: no windows, no
+/// questions, no reboot, close the running application, start it again when done (the
+/// installer script starts it only on `/RELAUNCH=1`).
+pub const INSTALLER_ARGS: [&str; 5] =
+    ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/RELAUNCH=1"];
+
+/// Whether `dir` was put there by the Windows installer.
+fn is_installed(dir: &Path) -> bool {
+    dir.join(UNINSTALLER).is_file()
+}
+
+/// The verified installer an update left in the staging folder of the installed copy in
+/// `dir`, if there is one.
+fn staged_installer(dir: &Path) -> Option<PathBuf> {
+    if !is_installed(dir) {
+        return None;
+    }
+    std::fs::read_dir(dir.join(STAGING)).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        name.starts_with("partition-manager-") && name.ends_with("-setup.exe") && p.is_file()
+    })
+}
+
 /// Whether this installation can update itself.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstallKind {
+    /// An unpacked archive: the files are replaced in place.
     Portable,
+    /// Put there by the Windows installer: updated by running the new installer.
+    Installed,
     /// Not possible, with a one-line reason.
     Unavailable(String),
 }
@@ -75,7 +105,11 @@ pub fn install_kind(dir: &Path) -> InstallKind {
         Ok(file) => {
             drop(file);
             let _ = std::fs::remove_file(&probe);
-            InstallKind::Portable
+            if is_installed(dir) {
+                InstallKind::Installed
+            } else {
+                InstallKind::Portable
+            }
         }
         Err(e) => InstallKind::Unavailable(format!(
             "{} is not writable ({})",
@@ -269,6 +303,10 @@ fn remove_staging(dir: &Path) {
 /// Downloads `release`, verifies and unpacks it in `dir/.pm-update` and swaps
 /// it in. The staging folder is removed on success and on every failure; on
 /// failure the installed files are untouched.
+///
+/// A copy put there by the Windows installer ([`InstallKind::Installed`]) is not swapped:
+/// the release's installer is downloaded and verified, and stays in the staging folder for
+/// [`restart`] to run. Nothing is replaced until then.
 pub fn update(
     fetch: &dyn Fetch,
     release: &Release,
@@ -293,6 +331,14 @@ fn update_with(
         return Err(Error::Invalid(format!("cannot remove the old {}", staging.display())));
     }
     std::fs::create_dir(&staging).map_err(|e| io_error("create", &staging, e))?;
+    if is_installed(dir) {
+        // the last point where giving up is free is after the download: `restart` runs it
+        let staged = download_installer(fetch, release, &staging, progress, cancel).and_then(|_| cancel.check());
+        if staged.is_err() {
+            remove_staging(dir);
+        }
+        return staged;
+    }
     let result = stage_and_swap(fetch, release, dir, &staging, progress, cancel, rename);
     // After a failed rollback the staging folder holds the only other copy of
     // the new files: it stays.
@@ -320,12 +366,23 @@ fn stage_and_swap(
     swap_with(&unpacked, dir, rename)
 }
 
-/// Starts `dir/partition-manager[.exe]` with `args`, detached: the new
-/// process outlives this one and is not waited for.
+/// What [`restart`] starts: the application in `dir` with `args`, or, when an update left
+/// a verified installer in the staging folder of an installed copy, that installer with
+/// [`INSTALLER_ARGS`] (it replaces the files and starts the application again, without
+/// `args`).
+pub fn restart_command(dir: &Path, args: &[OsString]) -> (PathBuf, Vec<OsString>) {
+    match staged_installer(dir) {
+        Some(setup) => (setup, INSTALLER_ARGS.iter().map(OsString::from).collect()),
+        None => (dir.join(exe_name("partition-manager", cfg!(windows))), args.to_vec()),
+    }
+}
+
+/// Starts [`restart_command`], detached: the new process outlives this one and is not
+/// waited for.
 pub fn restart(dir: &Path, args: &[OsString]) -> Result<()> {
-    let exe = dir.join(exe_name("partition-manager", cfg!(windows)));
+    let (exe, args) = restart_command(dir, args);
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(args)
+    cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -390,6 +447,55 @@ mod tests {
         put(dir.path(), "LICENSE", "new license");
         put(dir.path(), "CHANGELOG.md", "new changelog");
         dir
+    }
+
+    #[test]
+    fn an_installed_copy_stages_the_installer_and_restart_runs_it() {
+        use crate::testing::installer_fixture;
+        let dir = installed(true);
+        let args = [OsString::from("--dry-run")];
+        // an unpacked archive: restart starts the application with its arguments
+        assert_eq!(install_kind(dir.path()), InstallKind::Portable);
+        assert_eq!(restart_command(dir.path(), &args), (dir.path().join(EXE_GUI), args.to_vec()));
+
+        put(dir.path(), UNINSTALLER, "uninstaller");
+        assert_eq!(install_kind(dir.path()), InstallKind::Installed);
+        let (fetch, release) = installer_fixture("0.9.0", true);
+        update(&fetch, &release, dir.path(), &NullProgress, &CancelToken::new()).unwrap();
+        // nothing was replaced; the verified installer waits in the staging folder
+        assert_eq!(read(&dir, EXE_GUI), "old gui");
+        assert_eq!(read(&dir, EXE_PM), "old pm");
+        let setup = dir.path().join(STAGING).join("partition-manager-0.9.0-windows-x86_64-setup.exe");
+        assert_eq!(fs::read_to_string(&setup).unwrap(), "setup:0.9.0");
+        let (exe, with) = restart_command(dir.path(), &args);
+        assert_eq!(exe, setup);
+        assert_eq!(with, INSTALLER_ARGS.map(OsString::from).to_vec());
+        // the next start clears the staging folder: restart is then the plain one again
+        clean_up(dir.path());
+        assert_eq!(restart_command(dir.path(), &args).0, dir.path().join(EXE_GUI));
+    }
+
+    #[test]
+    fn an_installed_copy_refuses_a_bad_or_missing_installer() {
+        use crate::testing::{installer_fixture, release_fixture};
+        let dir = installed(true);
+        put(dir.path(), UNINSTALLER, "uninstaller");
+        // wrong checksum: nothing is left to run
+        let (fetch, release) = installer_fixture("0.9.0", false);
+        let e = update(&fetch, &release, dir.path(), &NullProgress, &CancelToken::new()).unwrap_err();
+        assert!(e.to_string().contains("checksum mismatch"), "{e}");
+        assert!(!dir.path().join(STAGING).exists());
+        assert_eq!(restart_command(dir.path(), &[]).0, dir.path().join(EXE_GUI));
+        // a release without an installer (0.3.0 and older) is not swapped in instead
+        let (fetch, release) = release_fixture("0.9.0", true);
+        let e = update(&fetch, &release, dir.path(), &NullProgress, &CancelToken::new()).unwrap_err();
+        assert!(e.to_string().contains("no installer"), "{e}");
+        assert_eq!(read(&dir, EXE_GUI), "old gui");
+        assert!(!dir.path().join(STAGING).exists());
+        // a staged file with another name is never run
+        fs::create_dir(dir.path().join(STAGING)).unwrap();
+        put(&dir.path().join(STAGING), "evil.exe", "x");
+        assert_eq!(restart_command(dir.path(), &[]).0, dir.path().join(EXE_GUI));
     }
 
     #[test]

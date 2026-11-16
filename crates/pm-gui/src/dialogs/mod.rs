@@ -3,6 +3,7 @@
 //! Like the views, dialogs read the state and push [`Cmd`]s; the only thing they mutate is
 //! their own [`Dialog`] (the user's choice in a radio list, a checkbox).
 
+pub mod about;
 pub mod confirm;
 pub mod progress;
 pub mod properties;
@@ -82,6 +83,7 @@ pub fn show(ctx: &egui::Context, s: &AppState, dlg: &mut Dialog, out: &mut Vec<C
         Dialog::WhatsNew { release } => update::whats_new(ctx, release, out),
         Dialog::UpdateConfirm { release } => update::confirm(ctx, s, release, out),
         Dialog::Updated { version } => update::updated(ctx, *version, out),
+        Dialog::About => about::show(ctx, s, out),
         Dialog::Report { report, dry_run, note } => {
             let mut keep = true;
             let title = match (report.failed.is_some(), *dry_run) {

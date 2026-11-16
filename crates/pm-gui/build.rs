@@ -1,5 +1,5 @@
-//! Embeds `partition-manager.manifest` (requireAdministrator, per-monitor DPI awareness) into
-//! the `partition-manager` executable, in release builds only.
+//! Embeds `partition-manager.manifest` (requireAdministrator, per-monitor DPI awareness) and
+//! the application icon into the `partition-manager` executable, in release builds only.
 //!
 //! Debug builds skip the manifest so `cargo run -p pm-gui` does not raise a UAC prompt during
 //! development (the app then runs unelevated and shows "Not elevated: read-only", or use
@@ -12,6 +12,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=partition-manager.rc");
     println!("cargo:rerun-if-changed=partition-manager.manifest");
+    println!("cargo:rerun-if-changed=assets/partition-manager.ico");
     println!("cargo:rerun-if-env-changed=PM_GUI_MANIFEST");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

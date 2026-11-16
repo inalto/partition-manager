@@ -7,6 +7,16 @@ project is pre-1.0 (minor bumps may change behaviour).
 ## [Unreleased]
 
 ### Added
+- Windows installer: `partition-manager-<version>-windows-x86_64-setup.exe`, next to the
+  zip. Installs for all users into Program Files with a Start menu entry and an
+  uninstaller; optionally a desktop shortcut and `pm` on the system PATH. Unsigned.
+- An installed copy updates itself by downloading the new installer, verifying it against
+  `SHA256SUMS.txt` and running it silently on **Restart now**.
+- The application has its logo (`assets/logo.png`) as icon of the executable, the window,
+  the installer and the shortcuts (`scripts/make-icon.py` builds the icon files from it).
+- **Settings > About Partition Manager**: the logo, the version and platform, how and where
+  this copy is installed, what the last update check found, and buttons for the notes of
+  this release, the project page and a new update check.
 - Create Image: the progress bar is a map of the source. Each stretch of the bar shows
   what happened to that part of the disk: copied, skipped because unused, not read yet,
   read error still being retried (orange) or damaged (red). A damaged area stays visible
@@ -15,6 +25,14 @@ project is pre-1.0 (minor bumps may change behaviour).
   error that stopped the copy is.
 
 ### Changed
+- The tools are tabs. The top bar starts with Disks, Data Recovery, Partition Recovery,
+  Disk Benchmark, Space Analyzer, Backup / Image and Disk tools; a tab shows its content in
+  the main area of the window instead of opening a window or a dialog over it. The two
+  former menus are lists in the side panel (Create Image, Restore Image, Rescue Copy;
+  Surface Test, SMART), which also says what the tool on screen does. A tool keeps its
+  state and its running job while another tab is shown, and its tab shows a dot meanwhile.
+  While a tool writes to a disk, the Disks tab is read-only. The wizards of the actions on
+  a selection (Create, Format, Resize...) are still dialogs.
 - The side panel follows the selection: it names the selected disk, partition or
   unallocated space and lists only the actions meant for it, instead of every action
   greyed out. An action that cannot run stays listed, disabled, with a tooltip saying why
@@ -30,10 +48,6 @@ project is pre-1.0 (minor bumps may change behaviour).
   there is no drive letter (no more "*:"); unknown usage and "no status" are empty cells
   instead of "-" and "None"; on Windows the disk row no longer repeats the device path
   (it is in the tooltip).
-- Partition Recovery and Surface Test appear once in the side panel, under Tools.
-- The side panel has a "Tools" group listing every tool on its own row (Data Recovery,
-  Partition Recovery, Disk Benchmark, Space Analyzer, Create Image, Restore Image, Rescue
-  Copy, Surface Test, SMART); the toolbar is unchanged.
 
 ## [0.3.0] - 2026-11-15
 

@@ -1,2 +1,4 @@
 // 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
 1 24 "partition-manager.manifest"
+// the application icon (the first icon of the executable is the one Explorer shows)
+1 ICON "assets/partition-manager.ico"

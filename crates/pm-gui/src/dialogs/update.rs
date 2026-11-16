@@ -185,6 +185,7 @@ mod tests {
             notes: String::new(),
             page_url: format!("https://github.com/inalto/partition-manager/releases/tag/v{s}"),
             archive: None,
+            installer: None,
             sums_url: None,
         }
     }

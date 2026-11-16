@@ -331,16 +331,15 @@ impl Wizard {
     /// Draw the wizard window for one frame.
     pub fn show(&mut self, ctx: &egui::Context, wctx: &WizardCtx) -> WizardOutcome {
         let mut outcome = WizardOutcome::Open;
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // docked in a tab (see `crate::tools::Dock`) it is not a dialog: Escape leaves it be
+        let dock = crate::tools::dock(ctx);
+        if dock.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             return WizardOutcome::Cancelled;
         }
         let titles = self.page_titles();
-        // Bound the body to the viewport: columns and vertical separators would otherwise
-        // stretch to the bottom of the screen and push the footer off it.
-        let body_h = crate::dialogs::wizard_body_height(ctx, 520.0);
-        let scroll_h = crate::dialogs::wizard_scroll_height(body_h);
-        let max_w = (ctx.screen_rect().width() - 40.0).max(400.0);
-        crate::dialogs::modal_window(self.title.clone()).min_width(660.0_f32.min(max_w)).max_width(max_w).show(ctx, |ui| {
+        let title = self.title.clone();
+        let mut draw = |ui: &mut egui::Ui, body_h: f32, max_w: f32| {
+            let scroll_h = crate::dialogs::wizard_scroll_height(body_h);
             ui.scope(|ui| {
                 ui.set_max_height(body_h);
                 ui.horizontal_top(|ui| {
@@ -402,7 +401,24 @@ impl Wizard {
                     self.back();
                 }
             });
-        });
+        };
+        match dock {
+            Some(dock) => crate::tools::docked(ctx, dock, |ui| {
+                let body_h = (ui.available_height() - crate::tools::DOCK_FOOTER).max(200.0);
+                let max_w = ui.available_width();
+                draw(ui, body_h, max_w);
+            }),
+            None => {
+                // Bound the body to the viewport: columns and vertical separators would
+                // otherwise stretch to the bottom of the screen and push the footer off it.
+                let body_h = crate::dialogs::wizard_body_height(ctx, 520.0);
+                let max_w = (ctx.screen_rect().width() - 40.0).max(400.0);
+                crate::dialogs::modal_window(title)
+                    .min_width(660.0_f32.min(max_w))
+                    .max_width(max_w)
+                    .show(ctx, |ui| draw(ui, body_h, max_w));
+            }
+        }
         outcome
     }
 

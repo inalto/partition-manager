@@ -12,13 +12,22 @@ as a disk, with no elevation and no physical disk touched.
 
 ## The main window
 
-- **Toolbar.** Apply, Undo and Discard on the left; then the big tools (Data Recovery,
-  Partition Recovery, Disk Benchmark, Space Analyzer, Image/Backup); then Settings.
-- **Sidebar.** Names the selected item and lists the actions meant for it, grouped as
+- **Tabs.** The top bar starts with the tabs: Disks, Data Recovery, Partition Recovery,
+  Disk Benchmark, Space Analyzer, Backup / Image and Disk tools. A tab fills the main area
+  of the window with its content; nothing opens in a window of its own. A tool keeps what
+  you entered, and goes on with a running job, while another tab is shown; a dot on its tab
+  says a job is running. After the tabs come Apply, Undo and Discard, Refresh and Settings.
+  **Settings > About Partition Manager** shows the version and platform, how and where this
+  copy is installed and what the last update check found, with links to the release notes
+  and the project page.
+- **Sidebar.** Shows what belongs to the tab. On Backup / Image it lists Create Image,
+  Restore Image and Rescue Copy; on Disk tools, Surface Test and SMART; on every tool tab it
+  says what the tool does. On the Disks tab it names the selected item and lists the actions meant for it, grouped as
   Wizards, Convert, Clean, Check and Manage: disk actions for a disk, partition actions for
   a partition, Create for unallocated space. An action that cannot run on that item stays
   listed, disabled, and its tooltip says why. With nothing selected it asks you to select a
-  disk or a partition. Below the actions, a Tools group opens every tool. A "Pending
+  disk or a partition. While a tool is writing to a disk (a rescue copy, a partition
+  recovery, a file restore) the Disks tab can be looked at but not changed. A "Pending
   operations: N" counter sits at the bottom of the sidebar; while operations are pending,
   Apply (filled, with their count), Undo and Discard appear there as well as in the toolbar.
 - **Table.** One block per disk listing Partition, Capacity, Used, Unused, File system, Type

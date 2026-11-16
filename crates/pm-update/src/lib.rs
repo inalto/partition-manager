@@ -12,9 +12,14 @@ mod version;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use download::{download, sha256_hex, sum_for};
+pub use download::{download, download_installer, sha256_hex, sum_for};
 pub use fetch::{check, read_limited, Check, Fetch, HttpFetch, LATEST_URL};
-pub use install::{clean_up, install_dir, install_kind, restart, rollback_failed, swap, update, InstallKind, STAGING};
-pub use release::{parse_release, release_page, url_allowed, Asset, Release, DOWNLOAD_PREFIX, RELEASES_PAGE};
+pub use install::{
+    clean_up, install_dir, install_kind, restart, restart_command, rollback_failed, swap, update, InstallKind,
+    INSTALLER_ARGS, STAGING, UNINSTALLER,
+};
+pub use release::{
+    installer_name, parse_release, release_page, url_allowed, Asset, Release, DOWNLOAD_PREFIX, RELEASES_PAGE,
+};
 pub use unpack::{exe_name, unpack, DOCUMENTS, EXECUTABLES};
 pub use version::{Version, TARGET};

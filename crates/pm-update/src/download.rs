@@ -5,7 +5,7 @@
 //! never leaves a file behind.
 
 use crate::fetch::{read_limited, Fetch};
-use crate::release::Release;
+use crate::release::{Asset, Release};
 use pm_core::{CancelToken, Error, ProgressSink, ProgressTracker, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -62,6 +62,32 @@ pub fn download(
         .archive
         .as_ref()
         .ok_or_else(|| Error::Unsupported("this release has no archive for this system".into()))?;
+    download_asset(fetch, release, asset, staging, progress, cancel)
+}
+
+/// [`download`] for the release's installer (`...-setup.exe`): what an installed copy
+/// updates with. Verified against `SHA256SUMS.txt` in the same way.
+pub fn download_installer(
+    fetch: &dyn Fetch,
+    release: &Release,
+    staging: &Path,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<PathBuf> {
+    let asset = release.installer.as_ref().ok_or_else(|| {
+        Error::Unsupported("this release has no installer; download it from the release page".into())
+    })?;
+    download_asset(fetch, release, asset, staging, progress, cancel)
+}
+
+fn download_asset(
+    fetch: &dyn Fetch,
+    release: &Release,
+    asset: &Asset,
+    staging: &Path,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<PathBuf> {
     let sums_url = release
         .sums_url
         .as_deref()
@@ -187,6 +213,7 @@ mod tests {
             notes: String::new(),
             page_url: String::new(),
             archive: Some(Asset { name: NAME.into(), url: ARCHIVE_URL.into(), size: announced }),
+            installer: None,
             sums_url: Some(SUMS_URL.into()),
         }
     }
