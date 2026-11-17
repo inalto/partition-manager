@@ -324,6 +324,47 @@ fn image_rescue_resume_continues_partial() {
 }
 
 #[test]
+fn image_rescue_finished_early_keeps_the_image_and_retries_in_place_later() {
+    let len = 4 * MIB;
+    let src = gpt_source(len);
+    // one bad sector inside a 64 KiB stretch: the copy phase gives up the whole chunk
+    let bad = 3 * MIB + 5 * 512;
+    let dev = FaultyDevice::new(MemDevice::from_vec(src.clone()), vec![bad], HashMap::new());
+    let p = platform_with(Box::new(dev));
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.qcow2");
+    let map_path = with_suffix(&img, ".map");
+    let op = image_disk(&img, ImageFormat::Qcow2, Some(RescueSettings { retries: 1, ..Default::default() }));
+
+    // run 1: "Finish now" as soon as the damaged areas are all that is left
+    let cancel = CancelToken::new();
+    let c = cancel.clone();
+    let sink = FnProgress(move |p: &ProgressReport| {
+        if p.can_finish {
+            c.finish_early();
+        }
+    });
+    let r = run_with(&p, &op, &sink, &cancel);
+    assert_eq!(r.failed, None, "finishing early is not a failure: {:#?}", r.log);
+    assert!(img.exists() && !with_suffix(&img, ".partial").exists(), "the image is renamed into place");
+    assert!(r.rescue_stats[0].finished_early);
+    assert!(r.log.iter().any(|l| l.contains("finished early")), "{:#?}", r.log);
+    let left: u64 = len - mapfile(&map_path).ranges(BlockStatus::Finished).iter().map(|r| r.1).sum::<u64>();
+    assert!(left > 512, "the damaged chunk was not gone through: {left}");
+    let got = image_bytes(&img);
+    assert!(got[..3 * MIB as usize] == src[..3 * MIB as usize], "what was read is in the image");
+
+    // run 2: the same operation retries what is left, in place
+    let r = run(&p, &op);
+    assert_eq!(r.failed, None, "{:#?}", r.log);
+    assert!(!r.rescue_stats[0].finished_early);
+    let mut expected = src;
+    expected[bad as usize..bad as usize + 512].fill(0);
+    assert!(image_bytes(&img) == expected);
+    assert_eq!(mapfile(&map_path).ranges(BlockStatus::Bad), vec![(bad, 512)]);
+}
+
+#[test]
 fn image_rescue_all_bad_source_terminates() {
     let len = 2 * MIB;
     let every_sector: Vec<u64> = (0..len).step_by(512).collect();

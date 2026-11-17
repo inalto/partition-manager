@@ -93,6 +93,11 @@ pub struct RescueStats {
     /// The mapfile of the run (`RescueOpts::mapfile`), if any.
     #[serde(default)]
     pub mapfile: Option<PathBuf>,
+    /// The run was ended on request ([`CancelToken::finish_early`]) with damaged areas
+    /// still to go through: `bad_bytes` counts them, and another run with the same mapfile
+    /// goes on with them.
+    #[serde(default)]
+    pub finished_early: bool,
 }
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -187,6 +192,8 @@ struct Engine<'a> {
     /// `(time, bytes read)` samples of the copy phase, for `min_read_rate`.
     rate_window: VecDeque<(Instant, u64)>,
     copy_read_bytes: u64,
+    /// Ended on request with work left (see [`Engine::finish_now`]).
+    stopped: bool,
 }
 
 impl<'a> Engine<'a> {
@@ -261,7 +268,12 @@ impl<'a> Engine<'a> {
         let mut t = ProgressTracker::new(self.progress, name, self.total());
         t.set_detail(&self.detail());
         t.set_slices(self.slices());
+        // after the copy phase every area was tried once: what follows only goes through
+        // the damaged areas again, sector by sector, and may be cut short
+        t.set_can_finish(status != '?');
         t.add(self.done());
+        // show the new phase at once: its first read may take a drive's whole timeout
+        t.finish();
         self.tracker = Some(t);
         self.last_detail = Instant::now();
         self.save()
@@ -330,6 +342,16 @@ impl<'a> Engine<'a> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// True once the controller asked to finish early. Checked before every read of the
+    /// trim, scrape and retry phases, never in the copy phase: a request made during the
+    /// copy phase takes effect when every area was tried once.
+    fn finish_now(&mut self) -> bool {
+        if self.cancel.finish_requested() {
+            self.stopped = true;
+        }
+        self.stopped
     }
 
     /// Mark unused areas finished (writing zeros for them first with `zero_unused`, so a
@@ -480,6 +502,9 @@ impl<'a> Engine<'a> {
             let count = self.sectors(start, end);
             let mut front_bad = None;
             for k in 0..count {
+                if self.finish_now() {
+                    return Ok(());
+                }
                 let (p, n) = self.sector_at(start, end, k);
                 if let Read::Bad = self.try_read(p, n, BlockStatus::Bad)? {
                     front_bad = Some(k);
@@ -489,6 +514,10 @@ impl<'a> Engine<'a> {
             let Some(fb) = front_bad else { continue };
             let mut back_bad = None;
             for k in (fb + 1..count).rev() {
+                if self.finish_now() {
+                    // the part between the two edges stays non-trimmed
+                    return Ok(());
+                }
                 let (p, n) = self.sector_at(start, end, k);
                 if let Read::Bad = self.try_read(p, n, BlockStatus::Bad)? {
                     back_bad = Some(k);
@@ -521,6 +550,9 @@ impl<'a> Engine<'a> {
                 Box::new(0..count)
             };
             for k in ks {
+                if self.finish_now() {
+                    return Ok(());
+                }
                 let (p, n) = self.sector_at(start, end, k);
                 self.try_read(p, n, BlockStatus::Bad)?;
             }
@@ -554,19 +586,21 @@ impl<'a> Engine<'a> {
             self.start_phase("Trimming", '*', 1)?;
             self.trim()?;
         }
-        if !self.opts.no_scrape && self.has(BlockStatus::NonScraped) {
+        if !self.stopped && !self.opts.no_scrape && self.has(BlockStatus::NonScraped) {
             self.start_phase("Scraping", '/', 1)?;
             self.sweep_sectors(BlockStatus::NonScraped, rev)?;
         }
         for pass in 1..=self.opts.max_retries {
-            if !self.has(BlockStatus::Bad) {
+            if self.stopped || !self.has(BlockStatus::Bad) {
                 break;
             }
             self.start_phase(&format!("Retrying (pass {pass})"), '-', pass)?;
             // the first retry pass runs against the copy direction, then alternate
             let backward = if pass % 2 == 1 { !rev } else { rev };
             self.sweep_sectors(BlockStatus::Bad, backward)?;
-            self.passes = pass;
+            if !self.stopped {
+                self.passes = pass;
+            }
         }
         Ok(())
     }
@@ -580,6 +614,7 @@ impl<'a> Engine<'a> {
             elapsed_secs: self.start.elapsed().as_secs_f64(),
             passes: self.passes,
             mapfile: self.opts.mapfile.clone(),
+            finished_early: self.stopped,
         }
     }
 }
@@ -600,6 +635,12 @@ impl<'a> Engine<'a> {
 /// read again; its size must equal `src.len()`), and the mapfile is saved every 30 s, at
 /// every phase change, on error, on cancel and at the end. Cancellation returns
 /// `Err(Cancelled)` after saving. The source is only read, never written.
+///
+/// [`CancelToken::finish_early`] ends the run with `Ok` once the copy phase is over, leaving
+/// the trim, scrape and retry phases where they are ([`RescueStats::finished_early`]): on a
+/// badly damaged source these read sector by sector, each failed read taking the drive's
+/// whole timeout, and can run for days. The reports of those phases set
+/// [`pm_core::ProgressReport::can_finish`].
 pub fn rescue(
     src: &mut dyn BlockDevice,
     dst: &mut dyn BlockDevice,
@@ -688,6 +729,7 @@ pub fn rescue(
         passes: 0,
         rate_window: VecDeque::new(),
         copy_read_bytes: 0,
+        stopped: false,
     };
     if let Err(e) = eng.run() {
         let slices = eng.slices();
@@ -700,8 +742,11 @@ pub fn rescue(
         let _ = eng.save();
         return Err(e);
     }
-    eng.cur_status = '+';
-    let d = final_detail(&eng.map, eng.read_errors);
+    if !eng.stopped {
+        // ended early, the mapfile keeps the phase it stopped in
+        eng.cur_status = '+';
+    }
+    let d = final_detail(&eng.map, eng.read_errors, eng.stopped);
     let slices = eng.slices();
     // nothing left to do (e.g. a finished mapfile): still report the outcome once
     let (total, done) = (eng.total(), eng.done());
@@ -712,6 +757,7 @@ pub fn rescue(
     });
     t.set_detail(&d);
     t.set_slices(slices);
+    t.set_can_finish(false);
     t.finish();
     eng.dst.flush()?;
     eng.save()?;
@@ -725,11 +771,12 @@ fn errsize(map: &BlockMap) -> u64 {
         + map.bytes(BlockStatus::Bad)
 }
 
-fn final_detail(map: &BlockMap, read_errors: u64) -> String {
+fn final_detail(map: &BlockMap, read_errors: u64, early: bool) -> String {
     format!(
-        "errsize {}, errors {}, read errors {read_errors}, finished",
+        "errsize {}, errors {}, read errors {read_errors}, {}",
         format_size(errsize(map)),
-        map.unrescued_areas()
+        map.unrescued_areas(),
+        if early { "finished early" } else { "finished" }
     )
 }
 
@@ -804,7 +851,7 @@ mod tests {
     }
 
     use super::super::faulty::FaultyDevice;
-    use pm_core::{FnProgress, MemDevice, ProgressReport};
+    use pm_core::{FnProgress, MemDevice, NullProgress, ProgressReport};
     use std::sync::Mutex;
 
     const LEN: u64 = 512 * 1024; // 512 slices of 1 KiB
@@ -847,6 +894,63 @@ mod tests {
         r.unwrap();
         assert!(slices[..256].iter().all(|s| *s == SliceState::Done));
         assert!(slices[256..].iter().all(|s| *s == SliceState::Skipped), "{:?}", &slices[250..262]);
+    }
+
+    /// A source whose slices 100..140 are unreadable, and a run that asks to finish early
+    /// as soon as the engine says it can.
+    fn finish_early_run(ask_at_start: bool) -> (RescueStats, Vec<SliceState>, u64, bool) {
+        let bad: Vec<u64> = (100 * 1024..140 * 1024).step_by(512).collect();
+        let mut src = FaultyDevice::new(MemDevice::new(LEN), bad, Default::default());
+        let mut dst = MemDevice::new(LEN);
+        let cancel = CancelToken::new();
+        if ask_at_start {
+            cancel.finish_early();
+        }
+        let seen = Mutex::new((None, false));
+        let sink = FnProgress(|p: &ProgressReport| {
+            let mut g = seen.lock().unwrap();
+            g.0 = p.slices.clone();
+            if p.can_finish {
+                assert_ne!(p.phase, "Copying", "not before everything was tried once");
+                g.1 = true;
+                cancel.finish_early();
+            }
+        });
+        let opts = RescueOpts { block_size: 4096, max_retries: 3, ..Default::default() };
+        let st = rescue(&mut src, &mut dst, 0, &opts, &sink, &cancel).expect("finishing early is a success");
+        let g = seen.lock().unwrap();
+        (st, g.0.clone().unwrap().to_vec(), src.read_count(), g.1)
+    }
+
+    #[test]
+    fn finishing_early_stops_the_slow_phases_and_succeeds() {
+        // a full run reads each of the 80 bad sectors at least 4 times (once, 3 retries)
+        let (st, slices, reads, offered) = finish_early_run(false);
+        assert!(offered, "the trim / scrape / retry phases report can_finish");
+        assert!(st.finished_early);
+        assert_eq!(st.passes, 0, "no retry pass was run");
+        // everything readable was copied in the copy phase; the damaged area stays unrescued
+        assert_eq!(st.rescued, LEN - 40 * 1024);
+        assert_eq!(st.bad_bytes, 40 * 1024);
+        assert!(slices[..100].iter().chain(&slices[140..]).all(|s| *s == SliceState::Done));
+        assert!(slices[100..140].iter().all(|s| matches!(s, SliceState::Bad | SliceState::Retrying)));
+        assert!(reads < 512 / 4 + 40, "stopped after a few sector reads, not {reads}");
+    }
+
+    #[test]
+    fn a_finish_request_during_the_copy_phase_waits_for_its_end() {
+        let (st, _, _, _) = finish_early_run(true);
+        assert!(st.finished_early);
+        assert_eq!(st.rescued, LEN - 40 * 1024, "every area was still tried once");
+    }
+
+    #[test]
+    fn a_run_with_nothing_left_is_not_finished_early() {
+        let cancel = CancelToken::new();
+        cancel.finish_early();
+        let (mut src, mut dst) = (MemDevice::new(LEN), MemDevice::new(LEN));
+        let st = rescue(&mut src, &mut dst, 0, &RescueOpts::default(), &NullProgress, &cancel).unwrap();
+        assert!(!st.finished_early);
     }
 
     #[test]

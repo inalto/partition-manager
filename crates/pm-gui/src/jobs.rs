@@ -66,6 +66,15 @@ impl JobHandle {
         self.cancel.is_cancelled()
     }
 
+    /// Ask the job to end now with what it has (see [`CancelToken::finish_early`]).
+    pub fn finish_early(&self) {
+        self.cancel.finish_early();
+    }
+
+    pub fn is_finishing(&self) -> bool {
+        self.cancel.finish_requested()
+    }
+
     /// The job's result once it has finished, without blocking. A job that panicked yields
     /// an error. Returns `None` while the job is still running (and after the result was
     /// taken).

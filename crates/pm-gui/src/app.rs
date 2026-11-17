@@ -177,6 +177,8 @@ pub enum Cmd {
     Discard,
     Refresh,
     CancelJob,
+    /// End the running job now, keeping its result (a rescue image with what was read).
+    FinishJob,
     CloseDialog,
     /// Show a tool in its tab.
     OpenTool(Tool),
@@ -679,6 +681,11 @@ impl AppState {
             Cmd::CancelJob => {
                 if let Some(j) = &self.job {
                     j.handle.cancel();
+                }
+            }
+            Cmd::FinishJob => {
+                if let Some(j) = &self.job {
+                    j.handle.finish_early();
                 }
             }
             Cmd::CloseDialog => self.dialog = None,

@@ -20,7 +20,10 @@ pub fn show(ctx: &egui::Context, job: &RunningJob, out: &mut Vec<Cmd>) {
             // show where they are
             slice_bar(ui, slices);
             if p.total > 0 {
-                ui.label(format!("{:.0}%", (p.done as f64 / p.total as f64).clamp(0.0, 1.0) * 100.0));
+                ui.label(percent(p.done, p.total));
+            }
+            if p.can_finish {
+                ui.label(FINISH_HINT);
             }
         } else if p.total > 0 {
             let frac = (p.done as f64 / p.total as f64).clamp(0.0, 1.0) as f32;
@@ -41,7 +44,9 @@ pub fn show(ctx: &egui::Context, job: &RunningJob, out: &mut Vec<Cmd>) {
                 ui.label(rate);
                 ui.end_row();
             }
-            if p.total > 0 {
+            // no estimate for the damaged areas: a sector takes a moment or the drive's
+            // whole timeout, and the rate counts only what was read
+            if p.total > 0 && !p.can_finish {
                 ui.label("Time left");
                 ui.label(format_eta(p.eta_secs));
                 ui.end_row();
@@ -56,10 +61,39 @@ pub fn show(ctx: &egui::Context, job: &RunningJob, out: &mut Vec<Cmd>) {
                 ui.spinner();
                 ui.label("Cancelling after the current step…");
             });
-        } else if ui.button("Cancel").clicked() {
-            out.push(Cmd::CancelJob);
+        } else if job.handle.is_finishing() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Finishing after the current read…");
+            });
+        } else {
+            ui.horizontal(|ui| {
+                if p.can_finish && ui.button("Finish now").on_hover_text(FINISH_TIP).clicked() {
+                    out.push(Cmd::FinishJob);
+                }
+                let cancel = ui.button("Cancel");
+                let cancel = if p.can_finish { cancel.on_hover_text(CANCEL_TIP) } else { cancel };
+                if cancel.clicked() {
+                    out.push(Cmd::CancelJob);
+                }
+            });
         }
     });
+}
+
+/// Shown while a rescue goes through the damaged areas, where it can sit for hours or days.
+const FINISH_HINT: &str = "Everything was read once. The damaged areas are now read again one sector at a time, which can take hours or days. Finish now keeps the image with what was read.";
+const FINISH_TIP: &str = "Stop reading the damaged areas and complete the image. What was not read is zeros in the image; run the same operation again to retry it.";
+const CANCEL_TIP: &str = "Stop without completing the image: the .partial file and the mapfile are kept, and the same operation resumes from them.";
+
+/// `done` of `total` as a percentage with one decimal, rounded down: "100.0%" only when all
+/// of it is done.
+pub fn percent(done: u64, total: u64) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let tenths = (done.min(total) as u128 * 1000 / total as u128) as u64;
+    format!("{}.{}%", tenths / 10, tenths % 10)
 }
 
 /// Consecutive slices in the same state, as `(state, start, end)` in fractions of the bar.
@@ -213,6 +247,18 @@ mod tests {
         assert_eq!(slice_legend(&[Done, Retrying, Pending]), [Retrying, Done, Pending]);
         assert_eq!(slice_legend(&[Skipped, Bad, Done, Bad]), [Bad, Done, Skipped]);
         assert_eq!(slice_name(Bad), "Damaged");
+    }
+
+    #[test]
+    fn percent_reaches_100_only_when_all_is_done() {
+        assert_eq!(percent(0, 1000), "0.0%");
+        assert_eq!(percent(505, 1000), "50.5%");
+        // 133.75 GB of 133.78 GB, with damaged areas left: not "100%"
+        assert_eq!(percent(133_750, 133_780), "99.9%");
+        assert_eq!(percent(999_999, 1_000_000), "99.9%");
+        assert_eq!(percent(7, 7), "100.0%");
+        assert_eq!(percent(9, 7), "100.0%");
+        assert_eq!(percent(1, 0), "");
     }
 
     #[test]

@@ -157,6 +157,11 @@ fn file_ui(s: &mut ImageRestoreState, ui: &mut egui::Ui, _ctx: &WizardCtx) -> St
         ui.label("Image file:");
         let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(400.0).hint_text(crate::format_util::example_path("Backups/disk1.vhd")));
         // read the header once the user is done typing, not on every keystroke
+        if ui.button("File…").on_hover_text("Choose the image file.").clicked() {
+            if let Some(f) = super::file_dialog(super::dialog_start(&s.path).as_deref()).pick_file() {
+                s.path = f.display().to_string();
+            }
+        }
         if !resp.has_focus() {
             s.refresh_info();
         }

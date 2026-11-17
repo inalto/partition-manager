@@ -101,6 +101,10 @@ the export and no image is left behind.
 - **Retry in place.** Running the same command again on a finished image, with its mapfile
   beside it, retries the unreadable areas in place instead of exporting from scratch. Give
   more retries with `-r` to try harder.
+- **Finish early (GUI).** Once everything was read once, the progress window of Create
+  Image offers **Finish now**: the damaged areas are not gone through any further, the image
+  is completed with what was read and the mapfile records what is left. Retry in place then
+  goes on from there.
 - **Start over.** To discard a previous export and begin again, delete the mapfile (and the
   old image). The mapfile is what makes the command resume rather than start fresh.
 

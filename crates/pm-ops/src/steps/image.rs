@@ -340,6 +340,9 @@ pub(crate) fn stats_line(st: &RescueStats, mapfile: &Path) -> String {
 ///   mapfile is replaced by a new one.
 /// * On cancel or error the image (partial or finished) and the mapfile are kept (when the
 ///   mapfile exists) so that running the same export again resumes.
+/// * A run ended with [`CancelToken::finish_early`] is a success like any other: the image is
+///   renamed into place with what was read, and the areas not gone through are retried in
+///   place by running the same operation again.
 /// * On success a new image is renamed into place and the mapfile stays next to it. Bad
 ///   sectors are not an error: `notes` gets `rescued X, errsize Y, errors N, mapfile <path>`.
 /// * Only a newly created sparse image skips writing all-zero blocks.
@@ -421,6 +424,13 @@ pub fn export_rescue_image(
                 partial.commit()?;
             }
             notes.push(stats_line(&stats, &mapfile));
+            if stats.finished_early {
+                notes.push(format!(
+                    "finished early on request: {} in damaged areas was not gone through and reads as zeros in {}; run the same operation again to retry it in place",
+                    format_size(stats.bad_bytes),
+                    path.display()
+                ));
+            }
             Ok(stats)
         }
         Err(e) if in_place => {

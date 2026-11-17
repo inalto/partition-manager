@@ -35,6 +35,9 @@ pub struct ProgressReport {
     /// of where the copy stands and where the source is damaged. `None` for a job that has
     /// no such map (all but copies that read a device).
     pub slices: Option<Arc<[SliceState]>>,
+    /// The job can be ended now with a usable result ([`CancelToken::finish_early`]): what
+    /// is left is optional extra work, such as reading damaged sectors again.
+    pub can_finish: bool,
 }
 
 pub trait ProgressSink: Send + Sync {
@@ -57,9 +60,10 @@ impl<F: Fn(&ProgressReport) + Send + Sync> ProgressSink for FnProgress<F> {
     }
 }
 
-/// Cooperative cancellation flag shared between a worker and its controller.
+/// Cooperative cancellation flag shared between a worker and its controller, with a second,
+/// milder request: finish early.
 #[derive(Clone, Debug, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken(Arc<(AtomicBool, AtomicBool)>);
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -67,11 +71,22 @@ impl CancelToken {
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0 .0.store(true, Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0 .0.load(Ordering::SeqCst)
+    }
+
+    /// Ask the job to end successfully with what it has, skipping the optional work that is
+    /// left. Only jobs that report [`ProgressReport::can_finish`] honour it; the others
+    /// run to their end.
+    pub fn finish_early(&self) {
+        self.0 .1.store(true, Ordering::SeqCst);
+    }
+
+    pub fn finish_requested(&self) -> bool {
+        self.0 .1.load(Ordering::SeqCst)
     }
 
     /// `Err(Error::Cancelled)` once cancelled; call this between work chunks.
@@ -94,6 +109,7 @@ pub struct ProgressTracker<'a> {
     phase: String,
     detail: String,
     slices: Option<Arc<[SliceState]>>,
+    can_finish: bool,
     total: u64,
     done: u64,
     last_report: Instant,
@@ -111,6 +127,7 @@ impl<'a> ProgressTracker<'a> {
             phase: phase.to_string(),
             detail: String::new(),
             slices: None,
+            can_finish: false,
             total,
             done: 0,
             last_report: now,
@@ -126,6 +143,11 @@ impl<'a> ProgressTracker<'a> {
     /// Set the slice map ([`ProgressReport::slices`]) included in subsequent reports.
     pub fn set_slices(&mut self, slices: Vec<SliceState>) {
         self.slices = Some(slices.into());
+    }
+
+    /// Set [`ProgressReport::can_finish`] for subsequent reports.
+    pub fn set_can_finish(&mut self, can: bool) {
+        self.can_finish = can;
     }
 
     pub fn done(&self) -> u64 {
@@ -175,6 +197,7 @@ impl<'a> ProgressTracker<'a> {
             eta_secs,
             detail: self.detail.clone(),
             slices: self.slices.clone(),
+            can_finish: self.can_finish,
         });
     }
 }
@@ -193,6 +216,10 @@ mod tests {
         t2.cancel();
         assert!(t.is_cancelled());
         assert!(matches!(t.check(), Err(crate::Error::Cancelled)));
+        // finishing early is a separate request and does not cancel
+        let f = CancelToken::new();
+        f.clone().finish_early();
+        assert!(f.finish_requested() && !f.is_cancelled() && !t.finish_requested());
     }
 
     #[test]

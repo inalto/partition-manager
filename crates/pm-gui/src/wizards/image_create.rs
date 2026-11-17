@@ -120,6 +120,58 @@ pub fn path_problem(path: &str) -> Option<String> {
     }
 }
 
+/// The image a file picked in the file dialog stands for: an interrupted export
+/// (`disk.qcow2.partial`) or its mapfile (`disk.qcow2.map`) names the image they belong to,
+/// any other file is the image itself.
+pub fn image_of_picked(file: &Path) -> PathBuf {
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    let is_image = |n: &str| Path::new(n).extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTS.contains(&e));
+    for suffix in [".partial", ".map"] {
+        if lower.ends_with(suffix) && is_image(&lower[..lower.len() - suffix.len()]) {
+            return file.with_file_name(&name[..name.len() - suffix.len()]);
+        }
+    }
+    file.to_path_buf()
+}
+
+/// The format the extension of `path` stands for, if it is one of an image: `current` when
+/// it already has that extension (`.vhd` keeps fixed or dynamic), else the first offered.
+pub fn format_of_path(path: &Path, current: ImageFormat) -> Option<ImageFormat> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if ext == current.extension() {
+        return Some(current);
+    }
+    if ext == "raw" || ext == "dd" {
+        return Some(ImageFormat::Raw);
+    }
+    FORMATS.into_iter().find(|f| f.extension() == ext)
+}
+
+/// What writing the image `path` does with the files already there, when rescue mode can go
+/// on from them: an interrupted export is resumed, a finished one is retried in place.
+pub fn resume_note(path: &str) -> Option<String> {
+    let t = path.trim();
+    if t.is_empty() || !Path::new(&format!("{t}.map")).is_file() {
+        return None;
+    }
+    let partial = format!("{t}.partial");
+    if Path::new(&partial).is_file() {
+        Some(format!(
+            "{partial} and its mapfile are there: with \"Continue on read errors\" (Damaged disk page) the interrupted \
+             image is continued, and what was already copied is not read again."
+        ))
+    } else if Path::new(t).is_file() {
+        Some(
+            "This image and its mapfile are there: with \"Continue on read errors\" (Damaged disk page) only its \
+             unreadable areas are read again, in place."
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
 pub struct ImageCreateState {
     pub source: Device,
     pub path: String,
@@ -127,6 +179,8 @@ pub struct ImageCreateState {
     pub mode: CloneMode,
     /// [`path_problem`] of the last checked path (checked when the text changes).
     checked: Option<(String, Option<String>)>,
+    /// [`resume_note`] of the last checked path.
+    resume: Option<(String, Option<String>)>,
     /// Mounted partitions of the model: the image may not be written onto the source (it
     /// would read what it writes). Updated from the model whenever a step is drawn.
     pub mounts: MountMap,
@@ -158,6 +212,7 @@ impl ImageCreateState {
             format: ImageFormat::VhdDynamic,
             mode: CloneMode::Smart,
             checked: None,
+            resume: None,
             mounts: ctx.mounts(),
             platform: ctx.platform.clone(),
             image_loc: PathLocation::default(),
@@ -208,6 +263,42 @@ impl ImageCreateState {
             reverse: self.reverse,
             mapfile: self.mapfile.as_ref().map(|m| PathBuf::from(m.trim())),
         })
+    }
+
+    /// A file was chosen in the file dialog: it becomes the image (see [`image_of_picked`]),
+    /// the format follows its extension, and a mapfile next to it turns rescue mode on, so
+    /// that an interrupted export is continued.
+    pub fn pick_file(&mut self, file: &Path) {
+        let image = image_of_picked(file);
+        if let Some(f) = format_of_path(&image, self.format) {
+            self.format = f;
+        }
+        self.path = fix_extension(&image.display().to_string(), self.format);
+        if Path::new(&format!("{}.map", self.path)).is_file() {
+            self.rescue = true;
+            self.mapfile = None;
+        }
+    }
+
+    /// A folder was chosen in the folder dialog: the image goes into it, under the file name
+    /// already typed, else one named after the source (`disk3.vhd`, `disk3-part2.vhd`).
+    pub fn pick_folder(&mut self, dir: &Path) {
+        let typed = self.path.trim();
+        let name = match Path::new(typed).file_name().and_then(|n| n.to_str()) {
+            Some(n) if !typed.ends_with(['\\', '/']) => n.to_string(),
+            _ => match self.source {
+                Device::Disk(d) => format!("disk{d}"),
+                Device::Partition(d, n) => format!("disk{d}-part{n}"),
+            },
+        };
+        self.path = fix_extension(&dir.join(name).display().to_string(), self.format);
+    }
+
+    fn resume_check(&mut self) -> Option<String> {
+        if self.resume.as_ref().map(|c| &c.0) != Some(&self.path) {
+            self.resume = Some((self.path.clone(), resume_note(&self.path)));
+        }
+        self.resume.as_ref().and_then(|c| c.1.clone())
     }
 
     fn path_check(&mut self) -> Option<String> {
@@ -271,14 +362,30 @@ fn source_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> St
     StepResult::Continue
 }
 
+const FILE_TIP: &str = "Choose an existing file: an image to replace, or the .partial file (or the mapfile) of an interrupted image to continue it.";
+const FOLDER_TIP: &str = "Choose the folder the image is written into.";
+
 fn file_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> StepResult {
     s.mounts = ctx.mounts();
     egui::Grid::new("image_file").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.label("Image file:");
-        let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(380.0).hint_text(crate::format_util::example_path("Backups/disk1.vhd")));
-        if resp.lost_focus() {
-            s.path = fix_extension(&s.path, s.format);
-        }
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(300.0).hint_text(crate::format_util::example_path("Backups/disk1.vhd")));
+            if resp.lost_focus() {
+                s.path = fix_extension(&s.path, s.format);
+            }
+            let start = super::dialog_start(&s.path);
+            if ui.button("File…").on_hover_text(FILE_TIP).clicked() {
+                if let Some(f) = super::file_dialog(start.as_deref()).pick_file() {
+                    s.pick_file(&f);
+                }
+            }
+            if ui.button("Folder…").on_hover_text(FOLDER_TIP).clicked() {
+                if let Some(d) = super::file_dialog(start.as_deref()).pick_folder() {
+                    s.pick_folder(&d);
+                }
+            }
+        });
         ui.end_row();
         ui.label("Format:");
         let before = s.format;
@@ -295,7 +402,10 @@ fn file_ui(s: &mut ImageCreateState, ui: &mut egui::Ui, ctx: &WizardCtx) -> Step
     if s.format.is_sparse() {
         ui.weak("Sparse format: unused areas take no space in the file.");
     }
-    ui.weak("An existing file of that name is replaced.");
+    match s.resume_check() {
+        Some(note) => ui.label(note),
+        None => ui.weak("An existing file of that name is replaced."),
+    };
     StepResult::from_problem(s.path_check().or_else(|| s.on_source_problem()))
 }
 
@@ -424,6 +534,68 @@ mod tests {
         assert_eq!(fix_extension("C:\\b\\disk.VMDK", ImageFormat::VmdkFlat), "C:\\b\\disk.VMDK");
         assert_eq!(fix_extension("C:\\b\\backup.2024", ImageFormat::Raw), "C:\\b\\backup.2024.img");
         assert_eq!(fix_extension("  ", ImageFormat::Raw), "");
+    }
+
+    #[test]
+    fn a_picked_partial_file_continues_its_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("farmac.qcow2");
+        let partial = dir.path().join("farmac.qcow2.partial");
+        let map = dir.path().join("farmac.qcow2.map");
+        assert_eq!(image_of_picked(&partial), image);
+        assert_eq!(image_of_picked(&map), image);
+        assert_eq!(image_of_picked(&image), image);
+        let notes = dir.path().join("notes.map");
+        assert_eq!(image_of_picked(&notes), notes, "not the mapfile of an image");
+        assert_eq!(format_of_path(&image, ImageFormat::Raw), Some(ImageFormat::Qcow2));
+        assert_eq!(format_of_path(Path::new("a.vhd"), ImageFormat::VhdFixed), Some(ImageFormat::VhdFixed));
+        assert_eq!(format_of_path(Path::new("a.vhd"), ImageFormat::Raw), Some(ImageFormat::VhdDynamic));
+        assert_eq!(format_of_path(Path::new("a.DD"), ImageFormat::Qcow2), Some(ImageFormat::Raw));
+        assert_eq!(format_of_path(Path::new("a.bin"), ImageFormat::Qcow2), None);
+
+        let m = model_of(vec![gpt_disk(1)]);
+        let ctx = WizardCtx::new(&m, vec![], Selected::Disk(1)).with_platform(platform_placing(dir.path()));
+        let mut s = ImageCreateState::initial(&ctx).unwrap();
+        let text = image.display().to_string();
+        assert_eq!(resume_note(&text), None);
+        std::fs::write(&partial, b"x").unwrap();
+        // no mapfile: nothing to go on from, rescue mode stays as it was
+        s.pick_file(&partial);
+        assert_eq!((s.path.as_str(), s.format, s.rescue), (text.as_str(), ImageFormat::Qcow2, false));
+        assert_eq!(resume_note(&text), None);
+        std::fs::write(&map, b"x").unwrap();
+        s.set_mapfile("elsewhere".into());
+        s.pick_file(&partial);
+        assert!(s.rescue, "the mapfile next to it turns rescue mode on");
+        assert_eq!(s.mapfile_path(), map.display().to_string());
+        assert!(resume_note(&text).unwrap().contains("continued"));
+        assert!(s.resume_check().is_some());
+        match &s.build().unwrap()[0] {
+            Operation::ImageDisk { path, format: ImageFormat::Qcow2, rescue: Some(_), .. } => assert_eq!(path, &image),
+            o => panic!("{o:?}"),
+        }
+        // a finished image with its mapfile is retried in place
+        std::fs::remove_file(&partial).unwrap();
+        std::fs::write(&image, b"x").unwrap();
+        assert!(resume_note(&text).unwrap().contains("in place"));
+    }
+
+    #[test]
+    fn a_picked_folder_keeps_the_file_name_or_names_it_after_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = model_of(vec![gpt_disk(1)]);
+        let ctx = WizardCtx::new(&m, vec![], Selected::Partition(1, 3)).with_platform(platform_placing(dir.path()));
+        let mut s = ImageCreateState::initial(&ctx).unwrap();
+        s.pick_folder(dir.path());
+        assert_eq!(s.path, dir.path().join("disk1-part3.vhd").display().to_string());
+        s.source = Device::Disk(1);
+        s.path = "  ".into();
+        s.pick_folder(dir.path());
+        assert_eq!(s.path, dir.path().join("disk1.vhd").display().to_string());
+        s.path = Path::new("elsewhere").join("backup.vhd").display().to_string();
+        s.pick_folder(dir.path());
+        assert_eq!(s.path, dir.path().join("backup.vhd").display().to_string());
+        assert_eq!(path_problem(&s.path), None);
     }
 
     #[test]

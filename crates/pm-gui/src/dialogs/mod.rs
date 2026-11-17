@@ -64,7 +64,12 @@ pub fn rescue_lines(stats: &[pm_image::RescueStats]) -> Vec<(String, bool)> {
                 line.push_str(&format!(", mapfile {}", m.display()));
             }
             let warn = st.bad_areas > 0;
-            if warn {
+            if st.finished_early {
+                line.push_str(
+                    " (finished early: the damaged areas not gone through are zeros in the image; run the \
+                     operation again to go on with them in place)",
+                );
+            } else if warn {
                 line.push_str(
                     " (unreadable areas are zeros in the image; run the operation again with more retries to retry \
                      the unreadable areas in place)",
@@ -155,6 +160,9 @@ mod tests {
             ..Default::default()
         };
         let rescued = RescueStats { mapfile: Some(PathBuf::from(r"D:\img\p.qcow2.map")), ..clean.clone() };
+        let early = RescueStats { finished_early: true, ..damaged.clone() };
+        let (line, warn) = rescue_lines(&[early]).remove(0);
+        assert!(warn && line.contains("finished early") && !line.contains("more retries"), "{line}");
         let lines = rescue_lines(&[clean, damaged, rescued]);
         // an image without a mapfile and without errors (plain mode) gets no line
         assert_eq!(lines.len(), 2);

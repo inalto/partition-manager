@@ -235,6 +235,21 @@ pub fn row(k: &str, v: impl Into<String>) -> (String, String) {
     (k.to_string(), v.into())
 }
 
+/// Where a file dialog opens for the path typed so far: its folder (the path itself when it
+/// is one), if there is such a folder.
+pub fn dialog_start(typed: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(typed.trim());
+    [Some(p), p.parent()].into_iter().flatten().find(|d| d.is_dir()).map(|d| d.to_path_buf())
+}
+
+/// A native file dialog opening in `start` (the last used folder without one).
+pub fn file_dialog(start: Option<&std::path::Path>) -> rfd::FileDialog {
+    match start {
+        Some(d) => rfd::FileDialog::new().set_directory(d),
+        None => rfd::FileDialog::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

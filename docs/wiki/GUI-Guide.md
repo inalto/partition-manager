@@ -52,6 +52,17 @@ slice of the source (1/512 of it) and takes the color of the worst thing in it, 
 means "something in here is damaged", not that the whole slice is lost; the line under the
 phase gives the real size (`errsize`). Hover the bar for the state under the pointer.
 
+With "Continue on read errors", once everything was read once the copy goes through the
+damaged areas again, one sector at a time (the phases Trimming, Scraping and Retrying). A
+failed read can take the drive many seconds, so this can last hours or days while the
+percentage stays just under 100. From then on the window has **Finish now** next to Cancel:
+
+- **Finish now** stops reading the damaged areas and completes the image with what was
+  read; what was not read is zeros in it. The mapfile stays next to the image, so applying
+  the same operation again goes on with the damaged areas in place.
+- **Cancel** stops without completing the image: the `.partial` file and the mapfile are
+  kept, and the same operation resumes from them.
+
 ## Pending operations: Apply, Undo, Discard
 
 Choosing an action never writes. It adds an operation to the **pending queue**, simulates
@@ -125,7 +136,10 @@ Smaller actions without a wizard: set active (MBR), set type, align all partitio
   Windows takes a disk with a duplicate id offline. Keeping ids needs the same table kind as
   the source. Read the migration notes in [[Safety Model]] and [[First Live Test]] first.
 - **Create Image.** Save a disk or partition to raw, VHD, VMDK or qcow2, in smart or sector
-  mode (see [[Imaging and VM Formats]]). A page named **Damaged disk** offers ddrescue-style
+  mode (see [[Imaging and VM Formats]]). Next to the image path, **File…** and **Folder…**
+  open the system dialogs; choosing the `.partial` file or the mapfile of an interrupted
+  image selects that image and turns "Continue on read errors" on, so that it is
+  continued. A page named **Damaged disk** offers ddrescue-style
   imaging of a failing source:
   - A checkbox "Continue on read errors (ddrescue mode)", with the note that unreadable
     blocks are retried, then written as zeros, and that a mapfile next to the image records

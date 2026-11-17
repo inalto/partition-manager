@@ -504,6 +504,7 @@ mod tests {
             eta_secs: Some(65),
             detail: detail.into(),
             slices: None,
+            can_finish: false,
         }
     }
 

@@ -4,6 +4,25 @@ All notable changes to Partition Manager. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver while the
 project is pre-1.0 (minor bumps may change behaviour).
 
+## [0.4.1] - 2026-11-17
+
+### Added
+- Create Image with "Continue on read errors": **Finish now** in the progress window, once
+  everything was read once and only the damaged areas are being read again sector by
+  sector (which can take hours or days). It completes the image with what was read
+  (`.partial` renamed into place, the mapfile kept); the same operation run again goes on
+  with the damaged areas in place. Cancel still keeps the `.partial` file for resuming.
+- Create Image and Restore Image: **File…** next to the image path opens the system file
+  dialog; Create Image also has **Folder…**. Choosing the `.partial` file (or the mapfile)
+  of an interrupted image selects that image, its format and "Continue on read errors", so
+  that it is continued; the page says when an image will be continued or retried in place.
+
+### Fixed
+- The progress window of a rescue image said "100%" while damaged areas were still being
+  read, with no way out but Cancel, which left the image as `.partial`. The percentage now
+  has one decimal and reaches 100.0% only at the end; the window says what the phase is
+  doing, and the time-left row is not shown while it has no estimate.
+
 ## [0.4.0] - 2026-11-16
 
 ### Added
@@ -151,6 +170,7 @@ a multi-step wizard GUI (egui/eframe) and the `pm` command line; a planner / pre
 executor pipeline with write sessions, identity checks and a dry run; `--disk-file`
 practice mode on image files.
 
+[0.4.1]: https://github.com/inalto/partition-manager/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/inalto/partition-manager/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/inalto/partition-manager/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/inalto/partition-manager/compare/v0.2.1...v0.2.2
